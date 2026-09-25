@@ -1,0 +1,31 @@
+{
+  "name": "pi-approval-mode",
+  "version": "1.0.0",
+  "description": "Multi-tiered tool execution approval, permission memory, and two-stage LLM safety classifier for Pi Coding Agent",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "approval-mode",
+    "security",
+    "permissions",
+    "two-stage-classifier"
+  ],
+  "author": "CNCSMonster",
+  "license": "MIT",
+  "type": "module",
+  "main": "extensions/approval-mode.ts",
+  "pi": {
+    "extensions": [
+      "./extensions/approval-mode.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/CNCSMonster/pi-approval-mode.git"
+  }
+}
