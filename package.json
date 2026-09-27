@@ -1,6 +1,6 @@
 {
   "name": "pi-approval-mode",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Multi-tiered tool execution approval, permission memory, and two-stage LLM safety classifier for Pi Coding Agent",
   "keywords": [
     "pi-package",
@@ -14,6 +14,9 @@
   "license": "MIT",
   "type": "module",
   "main": "extensions/approval-mode.ts",
+  "scripts": {
+    "test": "node --test --experimental-strip-types tests/*.ts"
+  },
   "pi": {
     "extensions": [
       "./extensions/approval-mode.ts"

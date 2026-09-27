@@ -1,43 +1,39 @@
 /**
  * Approval Mode Extension for Pi
  *
- * 为 Pi 提供类似千问 Code (Qwen Code) 的多级工具审批模式与权限记忆体系：
+ * 为 Pi 提供对齐千问 Code (Qwen Code) 的多级工具审批模式、权限规则体系与两阶段 LLM 安全分类器：
  *
  * 1. default   - 标准确认模式：文件修改 (edit/write) 与 Shell 命令 (bash) 执行前均需用户审批确认。
  * 2. auto-edit - 自动批准文件编辑：edit/write 自动放行，仅 Shell 命令 (bash) 需审批确认。
  * 3. auto      - 智能两阶段分类器模式（Qwen Code Auto 模式架构）：
  *                - Layer 1: 工作区常规文件修改免审（自身配置与敏感凭据除外）
- *                - Layer 2: 安全只读 Shell 命令 (ls, cat, git status 等) 免审
+ *                - Layer 2: 工业级 Shell 只读安全校验 (词法分词、操作符解析、重定向与管道守卫)
  *                - Layer 3: 【双阶段 LLM 安全分类器 (Two-Stage Classifier)】
- *                  • 默认模型优先自动选用本地代理中的 Gemini 3.8 Flash High LP
- *                    (llm-proxy-openai-chat/gemini-3.8-flash-high-lp)
- *                  • 支持通过配置文件持久化定制: ~/.pi/agent/approval-config.json 或 <cwd>/.pi/approval-config.json
- *                  • Stage 1 (Fast Path): 极速 JSON { shouldBlock: boolean } 研判
+ *                  • Stage 1 (Fast Path): ~300ms 快速研判 (带 1500ms 超时熔断)
  *                  • Stage 2 (Review Path): 仅当 Stage 1 标记可疑时触发深度推理，消除误报
- *                  • 降级容灾：若分类器离线/不可用，自动平滑回退至高危规则启发式风控
+ *                  • 降级容灾：若分类器离线/超时/不可用，自动平滑回退至高危规则启发式风控
  * 4. yolo      - 全自动模式：所有工具调用无条件直接执行（Pi 默认行为）。
  * 5. plan      - 只读规划模式：禁用 edit/write 工具，bash 仅放行只读白名单命令，动态注入只读规划提示词。
  *
- * 会话恢复与生命周期原则：
- * - CLI 参数绝对优先：本次输入的 --approval-mode 或 --yolo 压倒一切历史和配置。
- * - YOLO 防幽灵提权自动降级：当继续历史会话 (pi -c) 且未传 CLI 参数时，历史的 YOLO 自动安全降级为基线模式。
- * - 安全工作流模式无缝保持：历史若为 plan / auto / auto-edit / default 则原样恢复。
+ * 规则体系与优先状态机 (Qwen Code 对齐)：
+ * - Deny (3, 最高) > Ask (2) > Default (1) > Allow (0)
+ * - 支持 DSL 规则语法：ToolName(specifier)，如 Bash(git status), Read(/src/**), Edit(.env*)
+ * - 宏元分类支持：Read, Edit, Bash
+ * - 跨层级 Union 并集管理：Session、Project (.pi/approval-rules.json)、User (~/.pi/agent/approval-rules.json)
  *
  * 审批弹窗特性：
  * - 数字快捷键直选：直接按下数字键 1 - 5 即可瞬间完成审批确认，无需回车！
- * - 三级免审作用域：
- *   1. 单次放行 (Allow once)
- *   2. 会话级免审 (Session-level) - 仅当前会话有效
- *   3. 项目级免审 (Project-level) - 存入 <cwd>/.pi/approval-rules.json，以后在本目录均免审
- *   4. 用户级免审 (User/Global-level) - 存入 ~/.pi/agent/approval-rules.json，任何项目均免审
- *   5. 拒绝执行 (Block / Esc)
+ * - 四级免审作用域 (单次 / 会话 / 项目级持久化 / 用户级持久化 / 拒绝)
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolCallEventResult } from "@earendil-works/pi-coding-agent";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
-import { Key, matchesKey } from "@earendil-works/pi-tui";
+import { Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+
+import { analyzeShellCommand } from "./shell-analyzer.ts";
+import { PermissionManager, type DecisionType } from "./permission-engine.ts";
 
 export type ApprovalMode = "default" | "auto-edit" | "auto" | "yolo" | "plan";
 
@@ -107,6 +103,7 @@ const APPROVAL_OPTIONS: ApprovalOption[] = [
 export interface ApprovalConfigFile {
 	classifierModel?: string; // 审批分类器模型，例如 "llm-proxy-openai-chat/gemini-3.8-flash-high-lp"
 	defaultMode?: ApprovalMode; // 默认启动模式，例如 "auto" 或 "default"
+	classifierTimeoutMs?: number; // 分类器超时毫秒数 (默认 1500ms)
 	comment?: string;
 }
 
@@ -221,17 +218,7 @@ const PROTECTED_PATH_PATTERNS = [
 	/(^|\/)id_rsa(\.pub)?$/i,
 ];
 
-// 只读 Shell 命令规则
-const READ_ONLY_SHELL_PATTERNS = [
-	/^(ls|ll|pwd|cat|head|tail|more|less|grep|find|which|whoami|uname|wc|diff|file|stat|echo|tree|fd|rg)\b/,
-	/^git\s+(status|diff|log|branch|show|remote|rev-parse)\b/,
-	/^(npm|pnpm|yarn)\s+(list|outdated|view|why)\b/,
-	/^cargo\s+(check|metadata|tree)\b/,
-	/^python3?\s+-(V|-version)\b/,
-	/^node\s+-(v|-version)\b/,
-];
-
-// 离线/降级安全兜底规则 (启发式风控)
+// 启发式高危命令降级检查
 const HIGH_RISK_PATTERNS = [
 	/\brm\s+(-rf?|--recursive)/i,
 	/\bsudo\b/i,
@@ -250,62 +237,6 @@ const HIGH_RISK_PATTERNS = [
 function isProtectedPath(filePath: string): boolean {
 	const norm = filePath.replace(/\\/g, "/");
 	return PROTECTED_PATH_PATTERNS.some((p) => p.test(norm));
-}
-
-function isReadOnlyShell(command: string): boolean {
-	const cmd = command.trim();
-	return READ_ONLY_SHELL_PATTERNS.some((p) => p.test(cmd));
-}
-
-function loadRulesFromFile(filePath: string): Set<string> {
-	const rules = new Set<string>();
-	if (!existsSync(filePath)) return rules;
-	try {
-		const raw = readFileSync(filePath, "utf-8");
-		const data = JSON.parse(raw);
-		if (Array.isArray(data.allow)) {
-			for (const r of data.allow) {
-				if (typeof r === "string" && r.trim()) {
-					rules.add(r.trim());
-				}
-			}
-		}
-	} catch {
-		// 忽略读取错误
-	}
-	return rules;
-}
-
-function saveRuleToFile(filePath: string, ruleKey: string): void {
-	try {
-		const dir = dirname(filePath);
-		if (!existsSync(dir)) {
-			mkdirSync(dir, { recursive: true });
-		}
-		const rules = loadRulesFromFile(filePath);
-		rules.add(ruleKey);
-		const data = {
-			allow: Array.from(rules),
-			updatedAt: new Date().toISOString(),
-		};
-		writeFileSync(filePath, JSON.stringify(data, null, 2), "utf-8");
-	} catch (err) {
-		console.error(`[approval-mode] 保存规则失败 (${filePath}):`, err);
-	}
-}
-
-function clearRulesInFile(filePath: string): void {
-	try {
-		if (existsSync(filePath)) {
-			const data = {
-				allow: [],
-				updatedAt: new Date().toISOString(),
-			};
-			writeFileSync(filePath, JSON.stringify(data, null, 2), "utf-8");
-		}
-	} catch (err) {
-		console.error(`[approval-mode] 清除规则失败 (${filePath}):`, err);
-	}
 }
 
 function extractMessageText(content: unknown): string {
@@ -332,25 +263,28 @@ function parseClassifierJson(text: string): any {
 	return null;
 }
 
+/**
+ * Promise 超时封装，防止网络阻塞导致整个 Pi 挂起
+ */
+function withTimeout<T>(promise: Promise<T>, ms: number, onTimeoutValue: T): Promise<T> {
+	let timer: NodeJS.Timeout;
+	const timeoutPromise = new Promise<T>((resolve) => {
+		timer = setTimeout(() => resolve(onTimeoutValue), ms);
+	});
+	return Promise.race([promise, timeoutPromise]).finally(() => {
+		clearTimeout(timer);
+	});
+}
+
 export default function approvalModeExtension(pi: ExtensionAPI): void {
 	let currentMode: ApprovalMode = "default";
 	let previousModeBeforeToggle: ApprovalMode = "default";
 	let toolsBeforePlanMode: string[] | undefined;
 	let customClassifierModel: string | undefined;
+	let classifierTimeoutMs = 1500;
 
-	// 三级免审规则白名单缓存
-	const sessionAllowlist = new Set<string>(); // 1. 会话级（内存）
-	let projectAllowlist = new Set<string>(); // 2. 项目级（.pi/approval-rules.json）
-	let userAllowlist = new Set<string>(); // 3. 全局用户级 (~/.pi/agent/approval-rules.json)
-
-	// 重新加载项目级与用户级持久化规则
-	function reloadPersistentRules(cwd: string): void {
-		const projectConfigPath = join(cwd, CONFIG_DIR_NAME, "approval-rules.json");
-		projectAllowlist = loadRulesFromFile(projectConfigPath);
-
-		const userConfigPath = join(getAgentDir(), "approval-rules.json");
-		userAllowlist = loadRulesFromFile(userConfigPath);
-	}
+	// Qwen Code 三态权限规则管理器
+	let permissionManager: PermissionManager;
 
 	// 1. 注册 CLI 命令行启动参数
 	pi.registerFlag("approval-mode", {
@@ -422,22 +356,24 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 
 	// 2. 会话启动初始化与恢复 (包含生命周期安全降级与优先级裁决)
 	pi.on("session_start", async (_event, ctx) => {
-		sessionAllowlist.clear();
-		reloadPersistentRules(ctx.cwd);
+		permissionManager = new PermissionManager(ctx.cwd);
 
-		// 1. 读取配置文件
+		// 读取配置文件
 		const fileConfig = loadApprovalConfig(ctx.cwd);
 		if (fileConfig.classifierModel) {
 			customClassifierModel = fileConfig.classifierModel;
 		}
+		if (typeof fileConfig.classifierTimeoutMs === "number" && fileConfig.classifierTimeoutMs > 0) {
+			classifierTimeoutMs = fileConfig.classifierTimeoutMs;
+		}
 
-		// 基线默认模式 (优先使用配置文件中的 defaultMode，若无则为 default)
+		// 基线默认模式
 		const baselineMode: ApprovalMode =
 			fileConfig.defaultMode && ALL_MODES.includes(fileConfig.defaultMode)
 				? fileConfig.defaultMode
 				: "default";
 
-		// 2. 检查会话历史（针对 pi -c / pi -r 恢复旧会话场景）
+		// 检查会话历史（针对 pi -c / pi -r 恢复旧会话场景）
 		let historicalMode: ApprovalMode | undefined;
 		try {
 			const branch = ctx.sessionManager.getBranch();
@@ -462,14 +398,13 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 					"warning",
 				);
 			} else {
-				// 历史为安全模式（plan / auto / auto-edit / default）：无缝恢复，保持工作流意图
 				currentMode = historicalMode;
 			}
 		} else {
 			currentMode = baselineMode;
 		}
 
-		// 3. 显式 CLI 参数具有绝对最高裁决权（压倒配置文件和历史会话！）
+		// 显式 CLI 参数具有绝对最高裁决权
 		if (pi.getFlag("yolo")) {
 			currentMode = "yolo";
 		} else {
@@ -554,46 +489,55 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		},
 	});
 
-	// 管理与查看免审规则：/approval-rules
+	// 管理与查看三态权限规则：/approval-rules
 	pi.registerCommand("approval-rules", {
-		description: "查看或清空免审白名单规则 (/approval-rules [list|clear])",
+		description: "查看或清空权限规则 (/approval-rules [list|clear])",
 		handler: async (args, ctx) => {
-			reloadPersistentRules(ctx.cwd);
+			if (!permissionManager) {
+				permissionManager = new PermissionManager(ctx.cwd);
+			}
+			permissionManager.reloadAll();
 			const sub = args?.trim().toLowerCase();
 
 			if (sub === "clear") {
-				const choice = await ctx.ui.select("选择要清空的免审规则范围:", [
-					"1. 清空当前会话规则 (Session Allowlist)",
+				const choice = await ctx.ui.select("选择要清空的权限规则范围:", [
+					"1. 清空当前会话规则 (Session Rules)",
 					"2. 清空当前项目规则 (.pi/approval-rules.json)",
 					"3. 清空全局用户规则 (~/.pi/agent/approval-rules.json)",
 					"4. 取消",
 				]);
 				if (choice?.startsWith("1")) {
-					sessionAllowlist.clear();
-					ctx.ui.notify("已清空当前会话白名单", "info");
+					permissionManager.clearSessionRules();
+					ctx.ui.notify("已清空当前会话规则", "info");
 				} else if (choice?.startsWith("2")) {
-					clearRulesInFile(join(ctx.cwd, CONFIG_DIR_NAME, "approval-rules.json"));
-					projectAllowlist.clear();
-					ctx.ui.notify("已清空项目级免审规则", "info");
+					permissionManager.clearProjectRules();
+					ctx.ui.notify("已清空项目级权限规则", "info");
 				} else if (choice?.startsWith("3")) {
-					clearRulesInFile(join(getAgentDir(), "approval-rules.json"));
-					userAllowlist.clear();
-					ctx.ui.notify("已清空全局用户级免审规则", "info");
+					permissionManager.clearUserRules();
+					ctx.ui.notify("已清空全局用户级权限规则", "info");
 				}
 				return;
 			}
 
 			// 查看列表
-			const sessionList = Array.from(sessionAllowlist);
-			const projectList = Array.from(projectAllowlist);
-			const userList = Array.from(userAllowlist);
+			const session = permissionManager.getSessionRules();
+			const project = permissionManager.getProjectRules();
+			const user = permissionManager.getUserRules();
+
+			const formatRules = (title: string, r: { allow: string[]; ask: string[]; deny: string[] }) => {
+				const items: string[] = [];
+				if (r.deny.length) items.push(`  ⛔ deny: ${r.deny.join(", ")}`);
+				if (r.ask.length) items.push(`  ⚠️ ask:  ${r.ask.join(", ")}`);
+				if (r.allow.length) items.push(`  ✅ allow: ${r.allow.join(", ")}`);
+				return [title, items.length > 0 ? items.join("\n") : "  (无)"].join("\n");
+			};
 
 			const report = [
-				`📋 [当前免审白名单概览]`,
-				`• 会话级规则 (${sessionList.length}): ${sessionList.length > 0 ? sessionList.join(", ") : "(无)"}`,
-				`• 项目级规则 (${projectList.length}): ${projectList.length > 0 ? projectList.join(", ") : "(无)"}`,
-				`• 全局级规则 (${userList.length}): ${userList.length > 0 ? userList.join(", ") : "(无)"}`,
-			].join("\n");
+				`📋 [Qwen Code 风格工具权限规则概览]`,
+				formatRules(`• 会话级规则 (Session)`, session),
+				formatRules(`• 项目级规则 (Project: .pi/approval-rules.json)`, project),
+				formatRules(`• 全局用户级规则 (Global: ~/.pi/agent/approval-rules.json)`, user),
+			].join("\n\n");
 
 			ctx.ui.notify(report, "info");
 		},
@@ -655,32 +599,32 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 	});
 
 	/**
-	 * 获取近期对话摘要（用于分类器理解用户真实意图）
+	 * 获取近期对话与工具调用摘要（用于分类器理解用户真实意图与调用链）
 	 */
 	function getRecentConversationTranscript(ctx: ExtensionContext, maxTurns = 6): string {
 		try {
 			const entries = ctx.sessionManager.getBranch();
-			const messages: Array<{ role: string; text: string }> = [];
-			for (let i = entries.length - 1; i >= 0 && messages.length < maxTurns; i--) {
+			const items: string[] = [];
+
+			for (let i = entries.length - 1; i >= 0 && items.length < maxTurns; i--) {
 				const entry = entries[i];
 				if (entry.type === "message" && entry.message) {
 					const text = extractMessageText(entry.message.content).trim();
 					if (text) {
-						messages.unshift({ role: entry.message.role, text });
+						items.unshift(`[${entry.message.role.toUpperCase()}]: ${text}`);
 					}
+				} else if (entry.type === "tool_call" && (entry as any).toolName) {
+					items.unshift(`[TOOL_CALL]: ${(entry as any).toolName}(${JSON.stringify((entry as any).input || {})})`);
 				}
 			}
-			return messages.map((m) => `[${m.role.toUpperCase()}]: ${m.text}`).join("\n\n");
+			return items.join("\n\n");
 		} catch {
 			return "";
 		}
 	}
 
 	/**
-	 * 解析分类器模型：
-	 * 1. 显式指定的模型 (通过 CLI flag、approval-config.json、/classifier-model 设置)
-	 * 2. 默认优先模型：本地 gemini-3.8-flash-high-lp (llm-proxy-openai-chat)
-	 * 3. 回退为当前主会话模型 (ctx.model)
+	 * 解析分类器模型
 	 */
 	function resolveClassifierModel(ctx: ExtensionContext, targetModelPattern?: string): any {
 		if (targetModelPattern) {
@@ -716,6 +660,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 			}
 		}
 
+		// 安全策略：如果未配置专门分类器且当前模型为主模型，在非轻量场景避免无节制开销
 		return ctx.model;
 	}
 
@@ -742,7 +687,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 
 	/**
 	 * 【双阶段 LLM 安全分类器 (Two-Stage Classifier)】
-	 * Stage 1 (Fast Path): ~300ms 快速判决 { shouldBlock: boolean }
+	 * Stage 1 (Fast Path): 带超时熔断控制 (默认 1500ms)
 	 * Stage 2 (Review Path): 仅在 Stage 1 拦截时唤起思维链，消除误报并生成 reason
 	 */
 	async function runTwoStageClassifier(
@@ -761,9 +706,9 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		const pendingAction = `Tool: ${toolName}\nArguments:\n${JSON.stringify(toolInput, null, 2)}`;
 		const promptContent = `Conversation Transcript:\n${transcript}\n\nPending Action to evaluate:\n${pendingAction}`;
 
-		// === Stage 1: 极速初筛 (Fast Path) ===
+		// === Stage 1: 极速初筛 (带超时熔断保护) ===
 		try {
-			const stage1Response = await ctx.modelRegistry.complete(
+			const stage1Promise = ctx.modelRegistry.complete(
 				classifierModel,
 				{
 					systemPrompt: CLASSIFIER_BASE_PROMPT + STAGE1_SUFFIX,
@@ -780,23 +725,27 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 				},
 			);
 
-			const stage1Text = stage1Response.content
-				.filter((c): c is { type: "text"; text: string } => c.type === "text")
-				.map((c) => c.text)
-				.join("\n");
+			const stage1Response = await withTimeout(stage1Promise, classifierTimeoutMs, null);
 
-			const stage1Json = parseClassifierJson(stage1Text);
-			if (stage1Json && stage1Json.shouldBlock === false) {
-				return { shouldBlock: false, reason: "", stage: "fast" };
+			if (stage1Response) {
+				const stage1Text = stage1Response.content
+					.filter((c): c is { type: "text"; text: string } => c.type === "text")
+					.map((c) => c.text)
+					.join("\n");
+
+				const stage1Json = parseClassifierJson(stage1Text);
+				if (stage1Json && stage1Json.shouldBlock === false) {
+					return { shouldBlock: false, reason: "", stage: "fast" };
+				}
 			}
 		} catch (err) {
-			// Stage 1 发生异常（超时、断网等），平滑降级
+			// Stage 1 异常或网络挂起，平滑降级
 			return fallbackHeuristicCheck(toolName, toolInput);
 		}
 
-		// === Stage 2: 深度推理复核 (Review Path) ===
+		// === Stage 2: 深度推理复核 (带超时熔断保护) ===
 		try {
-			const stage2Response = await ctx.modelRegistry.complete(
+			const stage2Promise = ctx.modelRegistry.complete(
 				classifierModel,
 				{
 					systemPrompt: CLASSIFIER_BASE_PROMPT + STAGE2_SUFFIX,
@@ -813,18 +762,22 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 				},
 			);
 
-			const stage2Text = stage2Response.content
-				.filter((c): c is { type: "text"; text: string } => c.type === "text")
-				.map((c) => c.text)
-				.join("\n");
+			const stage2Response = await withTimeout(stage2Promise, classifierTimeoutMs * 2, null);
 
-			const stage2Json = parseClassifierJson(stage2Text);
-			if (stage2Json && typeof stage2Json.shouldBlock === "boolean") {
-				return {
-					shouldBlock: stage2Json.shouldBlock,
-					reason: stage2Json.reason || "安全分类器判定该操作存在风险",
-					stage: "thinking",
-				};
+			if (stage2Response) {
+				const stage2Text = stage2Response.content
+					.filter((c): c is { type: "text"; text: string } => c.type === "text")
+					.map((c) => c.text)
+					.join("\n");
+
+				const stage2Json = parseClassifierJson(stage2Text);
+				if (stage2Json && typeof stage2Json.shouldBlock === "boolean") {
+					return {
+						shouldBlock: stage2Json.shouldBlock,
+						reason: stage2Json.reason || "安全分类器判定该操作存在风险",
+						stage: "thinking",
+					};
+				}
 			}
 		} catch (err) {
 			return fallbackHeuristicCheck(toolName, toolInput);
@@ -844,10 +797,8 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		if (ctx.mode === "tui") {
 			const result = await ctx.ui.custom<ApprovalAction | null>((tui, theme, _kb, done) => {
 				let selectedIndex = 0;
-				let cachedLines: string[] | undefined;
 
 				function refresh() {
-					cachedLines = undefined;
 					tui.requestRender();
 				}
 
@@ -886,26 +837,29 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 					},
 
 					render(width: number): string[] {
-						if (cachedLines) return cachedLines;
-						const renderWidth = Math.max(30, width);
+						const safeWidth = Math.max(10, width);
 						const lines: string[] = [];
 
+						const addLine = (str: string) => {
+							lines.push(truncateToWidth(str, safeWidth));
+						};
+
 						// 顶部线条与标题
-						lines.push(theme.fg("accent", "─".repeat(renderWidth)));
-						lines.push(` ${theme.fg("accent", theme.bold(title))}`);
-						lines.push("");
+						addLine(theme.fg("accent", "─".repeat(safeWidth)));
+						addLine(` ${theme.fg("accent", theme.bold(title))}`);
+						addLine("");
 
 						// 详细信息展示区
 						for (const item of details) {
-							lines.push(`  ${theme.fg("muted", item.label)}:`);
+							addLine(`  ${theme.fg("muted", item.label)}:`);
 							for (const cl of item.content.split("\n")) {
-								lines.push(`    ${theme.fg("text", cl)}`);
+								addLine(`    ${theme.fg("text", cl)}`);
 							}
 						}
 
-						lines.push("");
-						lines.push(theme.fg("muted", "  请选择审批动作 (支持直接按下数字键 1-5 快速选择):"));
-						lines.push("");
+						addLine("");
+						addLine(theme.fg("muted", "  请选择审批动作 (支持直接按数字键 1-5 快速选择):"));
+						addLine("");
 
 						// 渲染 1-5 编号选项
 						for (let i = 0; i < APPROVAL_OPTIONS.length; i++) {
@@ -915,17 +869,16 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 							const numTag = theme.fg(isSelected ? "accent" : "muted", `${i + 1}. `);
 							const labelText = theme.fg(isSelected ? "accent" : "text", opt.label);
 
-							lines.push(`${prefix}${numTag}${labelText}`);
+							addLine(`${prefix}${numTag}${labelText}`);
 							if (opt.description) {
-								lines.push(`     ${theme.fg("dim", opt.description)}`);
+								addLine(`     ${theme.fg("dim", opt.description)}`);
 							}
 						}
 
-						lines.push("");
-						lines.push(theme.fg("muted", "  [快捷提示] 按 1-5 直接选择 | ↑/↓ 移动 | Enter 确认 | Esc 拒绝"));
-						lines.push(theme.fg("accent", "─".repeat(renderWidth)));
+						addLine("");
+						addLine(theme.fg("muted", "  [快捷提示] 按 1-5 直接选择 | ↑/↓ 移动 | Enter 确认 | Esc 拒绝"));
+						addLine(theme.fg("accent", "─".repeat(safeWidth)));
 
-						cachedLines = lines;
 						return lines;
 					},
 				};
@@ -951,11 +904,11 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 	}
 
 	/**
-	 * 处理用户的审批选择并应用三级免审持久化
+	 * 处理用户的审批选择并持久化为标准 Qwen Code DSL 规则
 	 */
 	async function handleOutcome(
 		action: ApprovalAction,
-		ruleKey: string,
+		dslRule: string,
 		ctx: ExtensionContext,
 		label: string,
 	): Promise<ToolCallEventResult | undefined> {
@@ -964,28 +917,19 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 				return undefined;
 
 			case "allow_session":
-				sessionAllowlist.add(ruleKey);
-				ctx.ui.notify(`已加入会话免审白名单: ${label}`, "info");
+				permissionManager.addRule("allow", dslRule, "session");
+				ctx.ui.notify(`已加入会话免审白名单: ${dslRule}`, "info");
 				return undefined;
 
-			case "allow_project": {
-				sessionAllowlist.add(ruleKey);
-				projectAllowlist.add(ruleKey);
-				const projectPath = join(ctx.cwd, CONFIG_DIR_NAME, "approval-rules.json");
-				saveRuleToFile(projectPath, ruleKey);
-				ctx.ui.notify(`已加入项目级免审白名单: ${label} (.pi/approval-rules.json)`, "info");
+			case "allow_project":
+				permissionManager.addRule("allow", dslRule, "project");
+				ctx.ui.notify(`已加入项目级免审白名单: ${dslRule} (.pi/approval-rules.json)`, "info");
 				return undefined;
-			}
 
-			case "allow_user": {
-				sessionAllowlist.add(ruleKey);
-				projectAllowlist.add(ruleKey);
-				userAllowlist.add(ruleKey);
-				const userPath = join(getAgentDir(), "approval-rules.json");
-				saveRuleToFile(userPath, ruleKey);
-				ctx.ui.notify(`已加入全局用户级免审白名单: ${label} (~/.pi/agent/approval-rules.json)`, "info");
+			case "allow_user":
+				permissionManager.addRule("allow", dslRule, "user");
+				ctx.ui.notify(`已加入全局用户级免审白名单: ${dslRule} (~/.pi/agent/approval-rules.json)`, "info");
 				return undefined;
-			}
 
 			case "block":
 			default:
@@ -993,24 +937,82 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		}
 	}
 
-	/**
-	 * 检查某条规则是否已被三级免审中的任一级放行
-	 */
-	function isRuleExempt(ruleKey: string): boolean {
-		return sessionAllowlist.has(ruleKey) || projectAllowlist.has(ruleKey) || userAllowlist.has(ruleKey);
-	}
-
 	// 6. 核心门禁控制：拦截 tool_call
 	pi.on("tool_call", async (event, ctx) => {
 		const { toolName } = event;
 		const input = (event.input ?? {}) as Record<string, any>;
+
+		if (!permissionManager) {
+			permissionManager = new PermissionManager(ctx.cwd);
+		}
+
+		// ==============================================================
+		// 步骤 0: Qwen Code 预设权限体系仲裁 (Deny > Ask > Allow > Default)
+		// ==============================================================
+		const permDecision = permissionManager.evaluate({
+			cwd: ctx.cwd,
+			toolName,
+			input,
+		});
+
+		// 1) 命中 Deny 规则：最高优先级硬性阻断，不弹窗，直接向模型反馈错误
+		if (permDecision.decision === "deny") {
+			return {
+				block: true,
+				reason: `[权限策略阻断 (Deny)] 该操作被预设规则严格禁止: ${permDecision.matchedRule}`,
+			};
+		}
+
+		// 2) 命中 Ask 规则：强制弹窗人工确认（压倒任何免审模式）
+		if (permDecision.decision === "ask") {
+			if (!ctx.hasUI) {
+				return {
+					block: true,
+					reason: `[权限策略阻断 (Ask)] 命中强制人工确认规则 (${permDecision.matchedRule})，但当前无交互 UI。`,
+				};
+			}
+
+			const label = toolName === "bash" ? input.command || "bash" : input.path || toolName;
+			const dslRule =
+				toolName === "bash"
+					? `Bash(${input.command})`
+					: `Edit(${relative(ctx.cwd, input.path || "").replace(/\\/g, "/")})`;
+
+			const action = await promptApprovalDialog(
+				ctx,
+				"⚠️ [预设权限人工核准 (Ask Rule)]",
+				[
+					{ label: "命中规则", content: permDecision.matchedRule || "" },
+					{ label: "调用目标", content: label },
+				],
+			);
+
+			return handleOutcome(action, dslRule, ctx, label);
+		}
+
+		// 3) 命中 Allow 规则：免审放行（在非受保护文件下直接通过）
+		if (permDecision.decision === "allow") {
+			// 如果是文件修改且命中了极端敏感路径，保留安全底线；其他一律放行
+			if (toolName === "edit" || toolName === "write") {
+				const filePath = (input.path || "").replace(/\\/g, "/");
+				if (!isProtectedPath(filePath)) {
+					return undefined;
+				}
+			} else {
+				return undefined;
+			}
+		}
+
+		// ==============================================================
+		// 步骤 1: 运行模式漏斗裁决 (Approval Mode State Machine)
+		// ==============================================================
 
 		// 1) yolo 模式：无条件直接放行
 		if (currentMode === "yolo") {
 			return undefined;
 		}
 
-		// 2) plan 模式：严格只读
+		// 2) plan 模式：严格只读，工业级 Shell 分析
 		if (currentMode === "plan") {
 			if (toolName === "edit" || toolName === "write") {
 				return {
@@ -1021,29 +1023,24 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 
 			if (toolName === "bash") {
 				const cmd = (input.command || "").trim();
-				const isAllowed = isReadOnlyShell(cmd);
-				if (!isAllowed) {
+				const analysis = analyzeShellCommand(cmd);
+				if (!analysis.isReadOnly) {
 					return {
 						block: true,
-						reason: `Plan 模式下禁止执行潜在变更/非只读命令: "${cmd}"。请使用 /approval-mode 切换至 default 或 yolo 模式。`,
+						reason: `Plan 模式下禁止执行潜在变更/非只读命令: "${cmd}" (${analysis.reason || "具有写或执行副作用"})。请使用 /approval-mode 切换至 default 或 yolo 模式。`,
 					};
 				}
 			}
 			return undefined;
 		}
 
-		// 3) auto 模式：Qwen Code 同款三层过滤 + 双阶段 LLM 安全分类器
+		// 3) auto 模式：Qwen Code 同款三层过滤 + 工业级 Shell 状态机 + 双阶段 LLM 安全分类器
 		if (currentMode === "auto") {
 			// 文件编辑与写入处理 (Layer 1)
 			if (toolName === "edit" || toolName === "write") {
 				const filePath = (input.path || "").replace(/\\/g, "/");
 				const relPath = relative(ctx.cwd, filePath).replace(/\\/g, "/");
-				const ruleKey = `file:${relPath}`;
-
-				// 白名单放行
-				if (isRuleExempt(ruleKey) || isRuleExempt(`file:${filePath}`)) {
-					return undefined;
-				}
+				const dslRule = `Edit(${relPath})`;
 
 				// 若修改的是受保护的核心配置或系统敏感文件，转入分类器研判
 				if (isProtectedPath(filePath) || isProtectedPath(relPath) || relPath.startsWith("..")) {
@@ -1068,7 +1065,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 						],
 					);
 
-					return handleOutcome(action, ruleKey, ctx, relPath);
+					return handleOutcome(action, dslRule, ctx, relPath);
 				}
 
 				// 常规工作区内部文件编辑/写入：快路径自动放行！
@@ -1078,13 +1075,11 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 			// Shell 命令处理 (Layer 2 & Layer 3)
 			if (toolName === "bash") {
 				const cmd = (input.command || "").trim();
-				const ruleKey = `bash:${cmd}`;
+				const dslRule = `Bash(${cmd})`;
 
-				// 白名单放行
-				if (isRuleExempt(ruleKey)) return undefined;
-
-				// Layer 2: 安全只读命令快路径直接放行
-				if (isReadOnlyShell(cmd)) {
+				// Layer 2: 工业级 Shell 状态机只读检测（彻底防御重定向、管道、复合注入）
+				const shellAnalysis = analyzeShellCommand(cmd);
+				if (shellAnalysis.isReadOnly) {
 					return undefined;
 				}
 
@@ -1107,10 +1102,11 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 					[
 						{ label: "准备执行命令", content: cmd },
 						{ label: "分类器研判风险", content: decision.reason },
+						{ label: "静态结构特征", content: shellAnalysis.reason || "非安全只读命令" },
 					],
 				);
 
-				return handleOutcome(action, ruleKey, ctx, cmd);
+				return handleOutcome(action, dslRule, ctx, cmd);
 			}
 
 			return undefined;
@@ -1120,8 +1116,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		if (currentMode === "auto-edit") {
 			if (toolName === "bash") {
 				const cmd = (input.command || "").trim();
-				const ruleKey = `bash:${cmd}`;
-				if (isRuleExempt(ruleKey)) return undefined;
+				const dslRule = `Bash(${cmd})`;
 
 				if (!ctx.hasUI) {
 					return {
@@ -1136,7 +1131,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 					[{ label: "准备执行命令", content: cmd }],
 				);
 
-				return handleOutcome(action, ruleKey, ctx, cmd);
+				return handleOutcome(action, dslRule, ctx, cmd);
 			}
 			return undefined;
 		}
@@ -1147,11 +1142,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 			if (toolName === "edit") {
 				const filePath = (input.path || "未知文件").replace(/\\/g, "/");
 				const relPath = relative(ctx.cwd, filePath).replace(/\\/g, "/");
-				const ruleKey = `file:${relPath}`;
-
-				if (isRuleExempt(ruleKey) || isRuleExempt(`file:${filePath}`)) {
-					return undefined;
-				}
+				const dslRule = `Edit(${relPath})`;
 
 				if (!ctx.hasUI) {
 					return {
@@ -1170,18 +1161,14 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 					],
 				);
 
-				return handleOutcome(action, ruleKey, ctx, relPath);
+				return handleOutcome(action, dslRule, ctx, relPath);
 			}
 
 			// 文件全量写入审批 (write)
 			if (toolName === "write") {
 				const filePath = (input.path || "未知文件").replace(/\\/g, "/");
 				const relPath = relative(ctx.cwd, filePath).replace(/\\/g, "/");
-				const ruleKey = `file:${relPath}`;
-
-				if (isRuleExempt(ruleKey) || isRuleExempt(`file:${filePath}`)) {
-					return undefined;
-				}
+				const dslRule = `Edit(${relPath})`;
 
 				if (!ctx.hasUI) {
 					return {
@@ -1200,14 +1187,13 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 					],
 				);
 
-				return handleOutcome(action, ruleKey, ctx, relPath);
+				return handleOutcome(action, dslRule, ctx, relPath);
 			}
 
 			// Shell 命令执行审批 (bash)
 			if (toolName === "bash") {
 				const cmd = (input.command || "").trim();
-				const ruleKey = `bash:${cmd}`;
-				if (isRuleExempt(ruleKey)) return undefined;
+				const dslRule = `Bash(${cmd})`;
 
 				if (!ctx.hasUI) {
 					return {
@@ -1222,7 +1208,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 					[{ label: "准备执行命令", content: cmd }],
 				);
 
-				return handleOutcome(action, ruleKey, ctx, cmd);
+				return handleOutcome(action, dslRule, ctx, cmd);
 			}
 		}
 
