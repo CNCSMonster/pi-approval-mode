@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { analyzeShellCommand } from "../extensions/shell-analyzer.ts";
 import { PermissionManager } from "../extensions/permission-engine.ts";
+import { LoopDetector } from "../extensions/loop-detector.ts";
 
 test("端到端集成 - 预设 Deny 规则优先于 Shell 只读快路径", () => {
 	const tmpDir = mkdtempSync(join(tmpdir(), "pi-perm-test-"));
@@ -95,4 +96,18 @@ test("端到端集成 - 三态规则覆盖敏感文件与提权防范", () => {
 	} finally {
 		rmSync(tmpDir, { recursive: true, force: true });
 	}
+});
+
+test("端到端集成 - 连续拒绝熔断器感知与无头模式阻断", () => {
+	const ld = new LoopDetector({ denialThreshold: 3 });
+
+	// 模拟在无头模式下连续被阻断 3 次
+	ld.recordDenial("bash", { command: "rm -rf /" });
+	ld.recordDenial("bash", { command: "rm -rf /home" });
+	ld.recordDenial("bash", { command: "rm -rf /var" });
+
+	const check = ld.checkBeforeExecution("bash", { command: "ls" });
+	assert.equal(check.isLoop, true);
+	assert.equal(check.loopType, "consecutive_denials");
+	assert.ok(check.warningMessage?.includes("已连续被拒绝 3 次"));
 });

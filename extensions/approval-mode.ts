@@ -34,6 +34,7 @@ import { Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/
 
 import { analyzeShellCommand } from "./shell-analyzer.ts";
 import { PermissionManager, type DecisionType } from "./permission-engine.ts";
+import { LoopDetector, type LoopCheckResult } from "./loop-detector.ts";
 
 export type ApprovalMode = "default" | "auto-edit" | "auto" | "yolo" | "plan";
 
@@ -285,6 +286,9 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 
 	// Qwen Code 三态权限规则管理器
 	let permissionManager: PermissionManager;
+
+	// 死循环与连续失败统计熔断器
+	const loopDetector = new LoopDetector();
 
 	// 1. 注册 CLI 命令行启动参数
 	pi.registerFlag("approval-mode", {
@@ -903,6 +907,16 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		return "block";
 	}
 
+	function allowCall(toolName: string, input: Record<string, any>): undefined {
+		loopDetector.recordSuccess(toolName, input);
+		return undefined;
+	}
+
+	function blockCall(toolName: string, input: Record<string, any>, reason: string): ToolCallEventResult {
+		loopDetector.recordDenial(toolName, input);
+		return { block: true, reason };
+	}
+
 	/**
 	 * 处理用户的审批选择并持久化为标准 Qwen Code DSL 规则
 	 */
@@ -911,29 +925,31 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		dslRule: string,
 		ctx: ExtensionContext,
 		label: string,
+		toolName: string,
+		input: Record<string, any>,
 	): Promise<ToolCallEventResult | undefined> {
 		switch (action) {
 			case "allow_once":
-				return undefined;
+				return allowCall(toolName, input);
 
 			case "allow_session":
 				permissionManager.addRule("allow", dslRule, "session");
 				ctx.ui.notify(`已加入会话免审白名单: ${dslRule}`, "info");
-				return undefined;
+				return allowCall(toolName, input);
 
 			case "allow_project":
 				permissionManager.addRule("allow", dslRule, "project");
 				ctx.ui.notify(`已加入项目级免审白名单: ${dslRule} (.pi/approval-rules.json)`, "info");
-				return undefined;
+				return allowCall(toolName, input);
 
 			case "allow_user":
 				permissionManager.addRule("allow", dslRule, "user");
 				ctx.ui.notify(`已加入全局用户级免审白名单: ${dslRule} (~/.pi/agent/approval-rules.json)`, "info");
-				return undefined;
+				return allowCall(toolName, input);
 
 			case "block":
 			default:
-				return { block: true, reason: `用户已拒绝该操作 (${label})。` };
+				return blockCall(toolName, input, `用户已拒绝该操作 (${label})。`);
 		}
 	}
 
@@ -947,6 +963,21 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		}
 
 		// ==============================================================
+		// 步骤 -1: 死循环与连续失败统计熔断器 (Loop & Stagnation Detection)
+		// ==============================================================
+		const loopCheck = loopDetector.checkBeforeExecution(toolName, input);
+		if (loopCheck.isLoop) {
+			// 在无头模式 (Headless / !ctx.hasUI) 下：直接快速失败，强制阻断死循环！
+			if (!ctx.hasUI) {
+				return blockCall(
+					toolName,
+					input,
+					`[死循环熔断 (Circuit Breaker)] ${loopCheck.warningMessage} 当前处于无头模式，已强制阻断执行，请勿再重试该操作。`,
+				);
+			}
+		}
+
+		// ==============================================================
 		// 步骤 0: Qwen Code 预设权限体系仲裁 (Deny > Ask > Allow > Default)
 		// ==============================================================
 		const permDecision = permissionManager.evaluate({
@@ -957,19 +988,21 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 
 		// 1) 命中 Deny 规则：最高优先级硬性阻断，不弹窗，直接向模型反馈错误
 		if (permDecision.decision === "deny") {
-			return {
-				block: true,
-				reason: `[权限策略阻断 (Deny)] 该操作被预设规则严格禁止: ${permDecision.matchedRule}`,
-			};
+			return blockCall(
+				toolName,
+				input,
+				`[权限策略阻断 (Deny)] 该操作被预设规则严格禁止: ${permDecision.matchedRule}`,
+			);
 		}
 
 		// 2) 命中 Ask 规则：强制弹窗人工确认（压倒任何免审模式）
 		if (permDecision.decision === "ask") {
 			if (!ctx.hasUI) {
-				return {
-					block: true,
-					reason: `[权限策略阻断 (Ask)] 命中强制人工确认规则 (${permDecision.matchedRule})，但当前无交互 UI。`,
-				};
+				return blockCall(
+					toolName,
+					input,
+					`[权限策略阻断 (Ask)] 命中强制人工确认规则 (${permDecision.matchedRule})，但当前无交互 UI。`,
+				);
 			}
 
 			const label = toolName === "bash" ? input.command || "bash" : input.path || toolName;
@@ -978,16 +1011,20 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 					? `Bash(${input.command})`
 					: `Edit(${relative(ctx.cwd, input.path || "").replace(/\\/g, "/")})`;
 
+			const dialogDetails: Array<{ label: string; content: string }> = [];
+			if (loopCheck.isLoop && loopCheck.warningMessage) {
+				dialogDetails.push({ label: "🚨 死循环预警", content: loopCheck.warningMessage });
+			}
+			dialogDetails.push({ label: "命中规则", content: permDecision.matchedRule || "" });
+			dialogDetails.push({ label: "调用目标", content: label });
+
 			const action = await promptApprovalDialog(
 				ctx,
-				"⚠️ [预设权限人工核准 (Ask Rule)]",
-				[
-					{ label: "命中规则", content: permDecision.matchedRule || "" },
-					{ label: "调用目标", content: label },
-				],
+				loopCheck.isLoop ? "🚨 [死循环高危预警 (Ask Rule)]" : "⚠️ [预设权限人工核准 (Ask Rule)]",
+				dialogDetails,
 			);
 
-			return handleOutcome(action, dslRule, ctx, label);
+			return handleOutcome(action, dslRule, ctx, label, toolName, input);
 		}
 
 		// 3) 命中 Allow 规则：免审放行（在非受保护文件下直接通过）
@@ -996,10 +1033,10 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 			if (toolName === "edit" || toolName === "write") {
 				const filePath = (input.path || "").replace(/\\/g, "/");
 				if (!isProtectedPath(filePath)) {
-					return undefined;
+					return allowCall(toolName, input);
 				}
 			} else {
-				return undefined;
+				return allowCall(toolName, input);
 			}
 		}
 
@@ -1009,29 +1046,31 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 
 		// 1) yolo 模式：无条件直接放行
 		if (currentMode === "yolo") {
-			return undefined;
+			return allowCall(toolName, input);
 		}
 
 		// 2) plan 模式：严格只读，工业级 Shell 分析
 		if (currentMode === "plan") {
 			if (toolName === "edit" || toolName === "write") {
-				return {
-					block: true,
-					reason: `Plan 模式为只读分析模式，已禁用文件写入工具 (${toolName})。如需修改文件，请运行 /approval-mode 切换模式。`,
-				};
+				return blockCall(
+					toolName,
+					input,
+					`Plan 模式为只读分析模式，已禁用文件写入工具 (${toolName})。如需修改文件，请运行 /approval-mode 切换模式。`,
+				);
 			}
 
 			if (toolName === "bash") {
 				const cmd = (input.command || "").trim();
 				const analysis = analyzeShellCommand(cmd);
 				if (!analysis.isReadOnly) {
-					return {
-						block: true,
-						reason: `Plan 模式下禁止执行潜在变更/非只读命令: "${cmd}" (${analysis.reason || "具有写或执行副作用"})。请使用 /approval-mode 切换至 default 或 yolo 模式。`,
-					};
+					return blockCall(
+						toolName,
+						input,
+						`Plan 模式下禁止执行潜在变更/非只读命令: "${cmd}" (${analysis.reason || "具有写或执行副作用"})。请使用 /approval-mode 切换至 default 或 yolo 模式。`,
+					);
 				}
 			}
-			return undefined;
+			return allowCall(toolName, input);
 		}
 
 		// 3) auto 模式：Qwen Code 同款三层过滤 + 工业级 Shell 状态机 + 双阶段 LLM 安全分类器
@@ -1046,30 +1085,37 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 				if (isProtectedPath(filePath) || isProtectedPath(relPath) || relPath.startsWith("..")) {
 					const decision = await runTwoStageClassifier(ctx, toolName, input);
 					if (!decision.shouldBlock) {
-						return undefined;
+						return allowCall(toolName, input);
 					}
 
 					if (!ctx.hasUI) {
-						return {
-							block: true,
-							reason: `[Auto 模式拦截] 修改受保护路径需用户确认: ${decision.reason}`,
-						};
+						return blockCall(
+							toolName,
+							input,
+							`[Auto 模式拦截] 修改受保护路径需用户确认: ${decision.reason}`,
+						);
 					}
+
+					const dialogDetails: Array<{ label: string; content: string }> = [];
+					if (loopCheck.isLoop && loopCheck.warningMessage) {
+						dialogDetails.push({ label: "🚨 死循环预警", content: loopCheck.warningMessage });
+					}
+					dialogDetails.push({ label: "目标文件", content: relPath });
+					dialogDetails.push({ label: "拦截原因", content: decision.reason });
 
 					const action = await promptApprovalDialog(
 						ctx,
-						"🤖 [受保护敏感路径修改审批 (Auto Mode)]",
-						[
-							{ label: "目标文件", content: relPath },
-							{ label: "拦截原因", content: decision.reason },
-						],
+						loopCheck.isLoop
+							? "🚨 [死循环高危: 敏感路径修改 (Auto)]"
+							: "🤖 [受保护敏感路径修改审批 (Auto Mode)]",
+						dialogDetails,
 					);
 
-					return handleOutcome(action, dslRule, ctx, relPath);
+					return handleOutcome(action, dslRule, ctx, relPath, toolName, input);
 				}
 
 				// 常规工作区内部文件编辑/写入：快路径自动放行！
-				return undefined;
+				return allowCall(toolName, input);
 			}
 
 			// Shell 命令处理 (Layer 2 & Layer 3)
@@ -1080,36 +1126,43 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 				// Layer 2: 工业级 Shell 状态机只读检测（彻底防御重定向、管道、复合注入）
 				const shellAnalysis = analyzeShellCommand(cmd);
 				if (shellAnalysis.isReadOnly) {
-					return undefined;
+					return allowCall(toolName, input);
 				}
 
 				// Layer 3: 双阶段 LLM 安全分类器研判
 				const decision = await runTwoStageClassifier(ctx, "bash", input);
 				if (!decision.shouldBlock) {
-					return undefined;
+					return allowCall(toolName, input);
 				}
 
 				if (!ctx.hasUI) {
-					return {
-						block: true,
-						reason: `[Auto 模式拦截] Shell 命令被分类器判定为存在风险: ${decision.reason} (${cmd})`,
-					};
+					return blockCall(
+						toolName,
+						input,
+						`[Auto 模式拦截] Shell 命令被分类器判定为存在风险: ${decision.reason} (${cmd})`,
+					);
 				}
+
+				const dialogDetails: Array<{ label: string; content: string }> = [];
+				if (loopCheck.isLoop && loopCheck.warningMessage) {
+					dialogDetails.push({ label: "🚨 死循环预警", content: loopCheck.warningMessage });
+				}
+				dialogDetails.push({ label: "准备执行命令", content: cmd });
+				dialogDetails.push({ label: "分类器研判风险", content: decision.reason });
+				dialogDetails.push({ label: "静态结构特征", content: shellAnalysis.reason || "非安全只读命令" });
 
 				const action = await promptApprovalDialog(
 					ctx,
-					"🤖 [安全分类器风险拦截 (Auto Mode)]",
-					[
-						{ label: "准备执行命令", content: cmd },
-						{ label: "分类器研判风险", content: decision.reason },
-						{ label: "静态结构特征", content: shellAnalysis.reason || "非安全只读命令" },
-					],
+					loopCheck.isLoop
+						? "🚨 [死循环高危: Shell 执行 (Auto)]"
+						: "🤖 [安全分类器风险拦截 (Auto Mode)]",
+					dialogDetails,
 				);
 
-				return handleOutcome(action, dslRule, ctx, cmd);
+				return handleOutcome(action, dslRule, ctx, cmd, toolName, input);
 			}
 
-			return undefined;
+			return allowCall(toolName, input);
 		}
 
 		// 4) auto-edit 模式：文件工具放行，仅审批 bash
@@ -1119,21 +1172,30 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 				const dslRule = `Bash(${cmd})`;
 
 				if (!ctx.hasUI) {
-					return {
-						block: true,
-						reason: `[auto-edit 模式] Shell 命令需审批，但当前无交互 UI，已拒绝: ${cmd}`,
-					};
+					return blockCall(
+						toolName,
+						input,
+						`[auto-edit 模式] Shell 命令需审批，但当前无交互 UI，已拒绝: ${cmd}`,
+					);
 				}
+
+				const dialogDetails: Array<{ label: string; content: string }> = [];
+				if (loopCheck.isLoop && loopCheck.warningMessage) {
+					dialogDetails.push({ label: "🚨 死循环预警", content: loopCheck.warningMessage });
+				}
+				dialogDetails.push({ label: "准备执行命令", content: cmd });
 
 				const action = await promptApprovalDialog(
 					ctx,
-					"📝 [Shell 命令执行审批 (auto-edit)]",
-					[{ label: "准备执行命令", content: cmd }],
+					loopCheck.isLoop
+						? "🚨 [死循环高危: Shell 命令 (auto-edit)]"
+						: "📝 [Shell 命令执行审批 (auto-edit)]",
+					dialogDetails,
 				);
 
-				return handleOutcome(action, dslRule, ctx, cmd);
+				return handleOutcome(action, dslRule, ctx, cmd, toolName, input);
 			}
-			return undefined;
+			return allowCall(toolName, input);
 		}
 
 		// 5) default 模式：文件修改与 bash 均需审批
@@ -1145,23 +1207,28 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 				const dslRule = `Edit(${relPath})`;
 
 				if (!ctx.hasUI) {
-					return {
-						block: true,
-						reason: `[default 模式] 文件修改需审批，但当前无交互 UI，已拒绝: ${relPath}`,
-					};
+					return blockCall(
+						toolName,
+						input,
+						`[default 模式] 文件修改需审批，但当前无交互 UI，已拒绝: ${relPath}`,
+					);
 				}
 
 				const editCount = Array.isArray(input.edits) ? input.edits.length : 1;
+				const dialogDetails: Array<{ label: string; content: string }> = [];
+				if (loopCheck.isLoop && loopCheck.warningMessage) {
+					dialogDetails.push({ label: "🚨 死循环预警", content: loopCheck.warningMessage });
+				}
+				dialogDetails.push({ label: "目标文件", content: relPath });
+				dialogDetails.push({ label: "修改详情", content: `共计 ${editCount} 处代码区块替换` });
+
 				const action = await promptApprovalDialog(
 					ctx,
-					"🛡️ [文件局部修改审批 (edit)]",
-					[
-						{ label: "目标文件", content: relPath },
-						{ label: "修改详情", content: `共计 ${editCount} 处代码区块替换` },
-					],
+					loopCheck.isLoop ? "🚨 [死循环高危: 文件修改 (edit)]" : "🛡️ [文件局部修改审批 (edit)]",
+					dialogDetails,
 				);
 
-				return handleOutcome(action, dslRule, ctx, relPath);
+				return handleOutcome(action, dslRule, ctx, relPath, toolName, input);
 			}
 
 			// 文件全量写入审批 (write)
@@ -1171,23 +1238,28 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 				const dslRule = `Edit(${relPath})`;
 
 				if (!ctx.hasUI) {
-					return {
-						block: true,
-						reason: `[default 模式] 文件全量写入需审批，但当前无交互 UI，已拒绝: ${relPath}`,
-					};
+					return blockCall(
+						toolName,
+						input,
+						`[default 模式] 文件全量写入需审批，但当前无交互 UI，已拒绝: ${relPath}`,
+					);
 				}
 
 				const bytes = typeof input.content === "string" ? input.content.length : 0;
+				const dialogDetails: Array<{ label: string; content: string }> = [];
+				if (loopCheck.isLoop && loopCheck.warningMessage) {
+					dialogDetails.push({ label: "🚨 死循环预警", content: loopCheck.warningMessage });
+				}
+				dialogDetails.push({ label: "目标文件", content: relPath });
+				dialogDetails.push({ label: "写入大小", content: `${bytes} 字节` });
+
 				const action = await promptApprovalDialog(
 					ctx,
-					"🛡️ [文件全量写入/创建审批 (write)]",
-					[
-						{ label: "目标文件", content: relPath },
-						{ label: "写入大小", content: `${bytes} 字节` },
-					],
+					loopCheck.isLoop ? "🚨 [死循环高危: 全量写入 (write)]" : "🛡️ [文件全量写入/创建审批 (write)]",
+					dialogDetails,
 				);
 
-				return handleOutcome(action, dslRule, ctx, relPath);
+				return handleOutcome(action, dslRule, ctx, relPath, toolName, input);
 			}
 
 			// Shell 命令执行审批 (bash)
@@ -1196,22 +1268,29 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 				const dslRule = `Bash(${cmd})`;
 
 				if (!ctx.hasUI) {
-					return {
-						block: true,
-						reason: `[default 模式] Shell 命令需审批，但当前无交互 UI，已拒绝: ${cmd}`,
-					};
+					return blockCall(
+						toolName,
+						input,
+						`[default 模式] Shell 命令需审批，但当前无交互 UI，已拒绝: ${cmd}`,
+					);
 				}
+
+				const dialogDetails: Array<{ label: string; content: string }> = [];
+				if (loopCheck.isLoop && loopCheck.warningMessage) {
+					dialogDetails.push({ label: "🚨 死循环预警", content: loopCheck.warningMessage });
+				}
+				dialogDetails.push({ label: "准备执行命令", content: cmd });
 
 				const action = await promptApprovalDialog(
 					ctx,
-					"🛡️ [Shell 命令执行审批 (default)]",
-					[{ label: "准备执行命令", content: cmd }],
+					loopCheck.isLoop ? "🚨 [死循环高危: Shell 命令 (default)]" : "🛡️ [Shell 命令执行审批 (default)]",
+					dialogDetails,
 				);
 
-				return handleOutcome(action, dslRule, ctx, cmd);
+				return handleOutcome(action, dslRule, ctx, cmd, toolName, input);
 			}
 		}
 
-		return undefined;
+		return allowCall(toolName, input);
 	});
 }
