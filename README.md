@@ -73,7 +73,7 @@ pi update
 ## ⚙️ Configuration
 
 ### 1. Mode & Classifier (`approval-config.json`)
-Configure the approval mode, classifier model, and timeout globally or per-project:
+Configure the approval mode, classifier model, timeout, and loop detection thresholds globally or per-project:
 - Global: `~/.pi/agent/approval-config.json`
 - Project: `<workspace>/.pi/approval-config.json`
 
@@ -81,7 +81,12 @@ Configure the approval mode, classifier model, and timeout globally or per-proje
 {
   "classifierModel": "llm-proxy-openai-chat/gemini-3.8-flash-high-lp",
   "defaultMode": "auto",
-  "classifierTimeoutMs": 1500
+  "classifierTimeoutMs": 1500,
+  "loopDetection": {
+    "identicalThreshold": 3,
+    "denialThreshold": 3,
+    "stagnationThreshold": 6
+  }
 }
 ```
 

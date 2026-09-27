@@ -65,3 +65,18 @@ test("LoopDetector - 参数颠簸停滞 (Parameter Thrashing)", () => {
 	assert.equal(res.loopType, "action_stagnation");
 	assert.equal(res.streak, 4);
 });
+
+test("LoopDetector - 支持动态从配置更新阈值偏好", () => {
+	const detector = new LoopDetector(); // 默认 identicalThreshold 为 3
+
+	// 更新为 2
+	detector.updateThresholds({ identicalThreshold: 2, denialThreshold: 5 });
+
+	const call = { toolName: "bash", input: { command: "git status" } };
+	detector.recordSuccess(call.toolName, call.input);
+
+	// 第 2 次即触顶
+	const res = detector.checkBeforeExecution(call.toolName, call.input);
+	assert.equal(res.isLoop, true);
+	assert.equal(res.streak, 2);
+});

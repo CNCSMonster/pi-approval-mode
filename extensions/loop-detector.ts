@@ -34,15 +34,15 @@ export class LoopDetector {
 
 	// 1. 同名同参连续计数
 	private identicalStreak = 0;
-	private readonly identicalThreshold: number;
+	private identicalThreshold: number;
 
 	// 2. 连续被拒计数
 	private consecutiveDenials = 0;
-	private readonly denialThreshold: number;
+	private denialThreshold: number;
 
 	// 3. 同工具连续停滞计数 (参数微调但工具相同)
 	private sameToolStreak = 0;
-	private readonly stagnationThreshold: number;
+	private stagnationThreshold: number;
 
 	constructor(options?: {
 		identicalThreshold?: number;
@@ -52,6 +52,25 @@ export class LoopDetector {
 		this.identicalThreshold = options?.identicalThreshold ?? 3;
 		this.denialThreshold = options?.denialThreshold ?? 3;
 		this.stagnationThreshold = options?.stagnationThreshold ?? 6;
+	}
+
+	/**
+	 * 动态更新熔断阈值（支持从配置文件加载自定义阈值）
+	 */
+	public updateThresholds(options?: {
+		identicalThreshold?: number;
+		denialThreshold?: number;
+		stagnationThreshold?: number;
+	}): void {
+		if (typeof options?.identicalThreshold === "number" && options.identicalThreshold > 0) {
+			this.identicalThreshold = options.identicalThreshold;
+		}
+		if (typeof options?.denialThreshold === "number" && options.denialThreshold > 0) {
+			this.denialThreshold = options.denialThreshold;
+		}
+		if (typeof options?.stagnationThreshold === "number" && options.stagnationThreshold > 0) {
+			this.stagnationThreshold = options.stagnationThreshold;
+		}
 	}
 
 	/**

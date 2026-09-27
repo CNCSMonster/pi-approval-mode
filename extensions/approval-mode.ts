@@ -101,10 +101,17 @@ const APPROVAL_OPTIONS: ApprovalOption[] = [
 // 配置文件格式定义 (~/.pi/agent/approval-config.json)
 // ==========================================
 
+export interface LoopDetectionConfig {
+	identicalThreshold?: number; // 连续同名同参熔断阈值（默认 3）
+	denialThreshold?: number; // 连续被拒熔断阈值（默认 3）
+	stagnationThreshold?: number; // 参数颠簸停滞熔断阈值（默认 6）
+}
+
 export interface ApprovalConfigFile {
 	classifierModel?: string; // 审批分类器模型，例如 "llm-proxy-openai-chat/gemini-3.8-flash-high-lp"
 	defaultMode?: ApprovalMode; // 默认启动模式，例如 "auto" 或 "default"
 	classifierTimeoutMs?: number; // 分类器超时毫秒数 (默认 1500ms)
+	loopDetection?: LoopDetectionConfig; // 死循环与连续失败统计熔断阈值用户偏好配置
 	comment?: string;
 }
 
@@ -344,6 +351,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		previousModeBeforeToggle = currentMode;
 		currentMode = newMode;
 
+		loopDetector.reset();
 		applyModeTools(newMode);
 		updateStatus(ctx);
 
@@ -369,6 +377,9 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		}
 		if (typeof fileConfig.classifierTimeoutMs === "number" && fileConfig.classifierTimeoutMs > 0) {
 			classifierTimeoutMs = fileConfig.classifierTimeoutMs;
+		}
+		if (fileConfig.loopDetection) {
+			loopDetector.updateThresholds(fileConfig.loopDetection);
 		}
 
 		// 基线默认模式
