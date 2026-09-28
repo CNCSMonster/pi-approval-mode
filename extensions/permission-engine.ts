@@ -315,23 +315,118 @@ export function matchesParsedRule(rule: ParsedRule, ctx: RuleMatchContext): bool
 	return inputStr.includes(spec);
 }
 
+export interface ConflictCheckResult {
+	hasConflict: boolean;
+	shadowedBy?: {
+		scope: "session" | "project" | "user";
+		verdict: "deny" | "ask";
+		rule: string;
+	};
+	shadowsExisting?: {
+		scope: "session" | "project" | "user";
+		verdict: "allow" | "ask";
+		rule: string;
+	};
+	warning?: string;
+}
+
+export function formatScopeName(scope: "session" | "project" | "user"): string {
+	switch (scope) {
+		case "session":
+			return "会话层";
+		case "project":
+			return "项目层";
+		case "user":
+			return "用户层";
+	}
+}
+
+/**
+ * 判断两条 DSL 规则在语义上是否覆盖或冲突
+ */
+export function rulesOverlap(ruleA: ParsedRule, ruleB: ParsedRule, cwd: string): boolean {
+	const toolsA = expandToolNames(ruleA.toolName);
+	const toolsB = expandToolNames(ruleB.toolName);
+	const commonTools = toolsA.filter((t) => toolsB.includes(t));
+	if (commonTools.length === 0) return false;
+
+	// 若某一条无 specifier 或为 *，则代表匹配该工具的所有操作
+	if (!ruleA.specifier || ruleA.specifier === "*" || !ruleB.specifier || ruleB.specifier === "*") {
+		return true;
+	}
+
+	const specA = ruleA.specifier.trim();
+	const specB = ruleB.specifier.trim();
+
+	if (specA === specB) return true;
+
+	if (ruleA.specifierKind === "command" && ruleB.specifierKind === "command") {
+		return matchesCommandPattern(specA, specB) || matchesCommandPattern(specB, specA);
+	}
+
+	if (ruleA.specifierKind === "path" && ruleB.specifierKind === "path") {
+		return matchesPathPattern(specA, specB, cwd) || matchesPathPattern(specB, specA, cwd);
+	}
+
+	return false;
+}
+
 /**
  * 权限规则管理器 (PermissionManager)
  */
 export class PermissionManager {
 	private cwd: string;
+	private userDir: string;
+	private isTrusted: boolean = true;
+	private projectRulesBlocked: boolean = false;
 	private sessionRules: PermissionRules = { allow: [], ask: [], deny: [] };
 	private projectRules: PermissionRules = { allow: [], ask: [], deny: [] };
 	private userRules: PermissionRules = { allow: [], ask: [], deny: [] };
 
-	constructor(cwd: string) {
+	constructor(cwd: string, userDir?: string, initialSessionRules?: PermissionRules, isTrusted = true) {
 		this.cwd = cwd;
+		this.userDir = userDir || join(homedir(), ".pi", "agent");
+		this.isTrusted = isTrusted;
+		if (initialSessionRules) {
+			this.sessionRules = {
+				allow: [...initialSessionRules.allow],
+				ask: [...initialSessionRules.ask],
+				deny: [...initialSessionRules.deny],
+			};
+		}
+		this.reloadAll();
+	}
+
+	public setIsTrusted(isTrusted: boolean): void {
+		this.isTrusted = isTrusted;
+		this.reloadAll();
+	}
+
+	public getIsTrusted(): boolean {
+		return this.isTrusted;
+	}
+
+	public isProjectRulesBlocked(): boolean {
+		return this.projectRulesBlocked;
+	}
+
+	/**
+	 * 重新加载磁盘规则文件（项目级与用户全局），保留内存态 sessionRules
+	 */
+	public reloadFiles(): void {
 		this.reloadAll();
 	}
 
 	public reloadAll(): void {
-		this.projectRules = this.loadRulesFromFile(join(this.cwd, ".pi", "approval-rules.json"));
-		this.userRules = this.loadRulesFromFile(join(homedir(), ".pi", "agent", "approval-rules.json"));
+		const projectRuleFile = join(this.cwd, ".pi", "approval-rules.json");
+		if (this.isTrusted) {
+			this.projectRules = this.loadRulesFromFile(projectRuleFile);
+			this.projectRulesBlocked = false;
+		} else {
+			this.projectRules = { allow: [], ask: [], deny: [] };
+			this.projectRulesBlocked = existsSync(projectRuleFile);
+		}
+		this.userRules = this.loadRulesFromFile(join(this.userDir, "approval-rules.json"));
 	}
 
 	public getSessionRules(): PermissionRules {
@@ -352,24 +447,108 @@ export class PermissionManager {
 
 	public clearProjectRules(): void {
 		this.projectRules = { allow: [], ask: [], deny: [] };
-		this.saveRulesToFile(join(this.cwd, ".pi", "approval-rules.json"), this.projectRules);
+		if (this.isTrusted) {
+			this.saveRulesToFile(join(this.cwd, ".pi", "approval-rules.json"), this.projectRules);
+		}
 	}
 
 	public clearUserRules(): void {
 		this.userRules = { allow: [], ask: [], deny: [] };
-		this.saveRulesToFile(join(homedir(), ".pi", "agent", "approval-rules.json"), this.userRules);
+		this.saveRulesToFile(join(this.userDir, "approval-rules.json"), this.userRules);
 	}
 
 	/**
-	 * 添加规则到指定作用域
+	 * 检查某条规则是否存在跨层冲突/压死
+	 */
+	public checkConflict(
+		type: "allow" | "ask" | "deny",
+		ruleStr: string,
+		_scope: "session" | "project" | "user",
+	): ConflictCheckResult {
+		const trimmed = ruleStr.trim();
+		if (!trimmed) return { hasConflict: false };
+
+		const newParsed = parseDslRule(trimmed);
+		const severityMap: Record<"allow" | "ask" | "deny", number> = {
+			allow: 1,
+			ask: 2,
+			deny: 3,
+		};
+		const newSeverity = severityMap[type];
+
+		const allScopes: Array<{ scope: "session" | "project" | "user"; rules: PermissionRules }> = [
+			{ scope: "session", rules: this.sessionRules },
+			{ scope: "project", rules: this.projectRules },
+			{ scope: "user", rules: this.userRules },
+		];
+
+		// 1. 检查是否被更高优先级的规则压死 (Stricter shadow)
+		for (const s of allScopes) {
+			for (const verdict of ["deny", "ask"] as const) {
+				if (severityMap[verdict] > newSeverity) {
+					for (const existingRule of s.rules[verdict]) {
+						const existingParsed = parseDslRule(existingRule);
+						if (rulesOverlap(newParsed, existingParsed, this.cwd)) {
+							return {
+								hasConflict: true,
+								shadowedBy: {
+									scope: s.scope,
+									verdict,
+									rule: existingRule,
+								},
+								warning: `⚠️ 该 ${type} 规则将被${formatScopeName(s.scope)} ${verdict} 压死（${existingRule}），本条不会生效。`,
+							};
+						}
+					}
+				}
+			}
+		}
+
+		// 2. 检查本条规则是否会压死其他层级已有的更弱规则 (Shadows weaker existing)
+		for (const s of allScopes) {
+			if (s.scope === _scope) continue; // 同层忽略
+			for (const verdict of ["ask", "allow"] as const) {
+				if (severityMap[verdict] < newSeverity) {
+					for (const existingRule of s.rules[verdict]) {
+						const existingParsed = parseDslRule(existingRule);
+						if (rulesOverlap(newParsed, existingParsed, this.cwd)) {
+							return {
+								hasConflict: true,
+								shadowsExisting: {
+									scope: s.scope,
+									verdict,
+									rule: existingRule,
+								},
+								warning: `⚠️ 新增的 ${type} 规则将压死现有的${formatScopeName(s.scope)} ${verdict} 规则（${existingRule}）。`,
+							};
+						}
+					}
+				}
+			}
+		}
+
+		return { hasConflict: false };
+	}
+
+	/**
+	 * 添加规则到指定作用域（附带跨层冲突检测）
 	 */
 	public addRule(
 		type: "allow" | "ask" | "deny",
 		ruleStr: string,
 		scope: "session" | "project" | "user",
-	): void {
+	): ConflictCheckResult {
 		const trimmed = ruleStr.trim();
-		if (!trimmed) return;
+		if (!trimmed) return { hasConflict: false };
+
+		if (scope === "project" && !this.isTrusted) {
+			return {
+				hasConflict: false,
+				warning: `⚠️ 当前工作区未受信任，项目级规则加载与持久化已禁用。请使用 --approve 信任项目。`,
+			};
+		}
+
+		const conflict = this.checkConflict(type, trimmed, scope);
 
 		if (scope === "session") {
 			if (!this.sessionRules[type].includes(trimmed)) {
@@ -383,9 +562,11 @@ export class PermissionManager {
 		} else if (scope === "user") {
 			if (!this.userRules[type].includes(trimmed)) {
 				this.userRules[type].push(trimmed);
-				this.saveRulesToFile(join(homedir(), ".pi", "agent", "approval-rules.json"), this.userRules);
+				this.saveRulesToFile(join(this.userDir, "approval-rules.json"), this.userRules);
 			}
 		}
+
+		return conflict;
 	}
 
 	/**
