@@ -1,4 +1,3 @@
-<!-- 同步来源: pi-approval-mode-docs/design/README.md | 同步日期: 2026-09-28 -->
 
 # Pi Approval Mode (`pi-approval-mode`)
 
@@ -12,10 +11,12 @@ English | [中文文档](#中文文档)
 ## 🌟 Highlights
 
 - **5 Approval Modes**: `default`, `auto-edit`, `auto`, `yolo`, and `plan`.
-- **Tri-State Permission Rules (`deny` > `ask` > `allow`)**:
+- **Four-State Permission Rules (`deny` > `ask` > `default` > `allow`)**:
   - **`deny`**: Hard blocking at runtime without modal prompt; takes precedence over everything.
   - **`ask`**: Enforces interactive confirmation modal, overriding auto-approval modes.
+  - **`default`**: Delegates to the approval-mode funnel (LLM classifier in `auto`, manual confirmation otherwise); optional — omit it and behavior matches the original tri-state design.
   - **`allow`**: Auto-approves matching operations.
+  - **Tool default permission layer**: read-family tools (`read`/`grep`/`find`/`ls`) with no matching rule fast-path inside the workspace and require confirmation outside it (including `~` expansion).
 - **Rule DSL & Meta-categories**:
   - Format: `Tool(specifier)` (e.g. `Bash(git status)`, `Bash(git *)`, `Read(/src/**)`, `Read(.env*)`, `Edit(/package.json)`).
   - Meta-categories: `Read` (covers read, grep, glob), `Edit` (covers edit, write), `Bash` (covers bash).
@@ -92,8 +93,8 @@ Configure the approval mode, classifier model, timeout, and loop detection thres
 }
 ```
 
-### 2. Tri-State Permission Rules (`approval-rules.json`)
-Pre-configure rules matching Qwen Code DSL (`deny` > `ask` > `allow`):
+### 2. Four-State Permission Rules (`approval-rules.json`)
+Pre-configure rules matching Qwen Code DSL (`deny` > `ask` > `default` > `allow`):
 - Global: `~/.pi/agent/approval-rules.json`
 - Project: `<workspace>/.pi/approval-rules.json`
 
@@ -103,6 +104,9 @@ Pre-configure rules matching Qwen Code DSL (`deny` > `ask` > `allow`):
     "Bash(git status)",
     "Bash(git diff *)",
     "Read(/src/**)"
+  ],
+  "default": [
+    "Read(./secrets/**)"
   ],
   "ask": [
     "Bash(git push *)",
@@ -122,9 +126,9 @@ Why two distinct configuration files?
 - **`approval-rules.json` (Permission Rules)**: Evaluated using **Union + Deny-First** semantics. Rules across all scopes are aggregated into global pools. A denial rule in any layer can never be overridden by an allow rule in another layer, maintaining absolute defense-in-depth.
 - **`approval-config.json` (Runtime Settings & Thresholds)**: Evaluated using **Top-Level Shallow Merge** semantics (`{ ...global, ...project }`). Project-level settings take precedence over global settings. If a project defines a top-level key (such as `classifierModel`, `defaultMode`, or `loopDetection`), it completely overrides that top-level key from the user configuration.
 
-### 4. Tri-State Priority & Multi-Tier Rule Resolution
+### 4. Four-State Priority & Multi-Tier Rule Resolution
 Rules across all three tiers (**Session**, **Project**, **User**) are resolved strictly by verdict priority:
-$$\text{Deny} > \text{Ask} > \text{Allow} > \text{Default}$$
+$$\text{Deny} > \text{Ask} > \text{Default} > \text{Allow}$$
 
 1. **Independent Loading**:
    - **Session**: In-memory ephemeral rules (valid for current session only).
@@ -133,12 +137,14 @@ $$\text{Deny} > \text{Ask} > \text{Allow} > \text{Default}$$
 2. **Union Rule Pools**:
    - $\text{Deny Pool} = \text{Session} \cup \text{Project} \cup \text{User}$
    - $\text{Ask Pool} = \text{Session} \cup \text{Project} \cup \text{User}$
+   - $\text{Default Pool} = \text{Session} \cup \text{Project} \cup \text{User}$
    - $\text{Allow Pool} = \text{Session} \cup \text{Project} \cup \text{User}$
 3. **Short-Circuit Evaluation**:
    - **Deny First**: If any matched rule is in the Deny pool, the action is **immediately blocked without prompt**.
    - **Ask Second**: If matched in the Ask pool, an interactive confirmation modal is **always enforced** (even in `auto` mode).
-   - **Allow Third**: If matched in the Allow pool, the action is **auto-approved**.
-   - **Default**: If unmatched, delegates to the active Approval Mode (e.g., LLM classifier in `auto` mode, or confirmation in `default` mode).
+   - **Default Third**: If matched in the Default pool, the action **delegates to the active Approval Mode** (LLM classifier in `auto` mode — interactive fallback to manual, headless rejection; manual confirmation otherwise).
+   - **Allow Fourth**: If matched in the Allow pool, the action is **auto-approved**.
+   - **Fallback Default**: If no explicit rule matches, delegates to the active Approval Mode; read-family tools additionally pass through the **tool default permission layer** (fast-path inside the workspace, confirmation outside).
 
 > **Crucial Invariant**: **Verdict priority strictly trumps scope tier.** Tiers only determine where rules are persisted and their lifecycle; tiers do not determine precedence. A user-level `deny` will definitively block a project-level or session-level `allow`.
 
@@ -157,26 +163,26 @@ $$\text{Deny} > \text{Ask} > \text{Allow} > \text{Default}$$
 ## ⌨️ Shortcuts & Commands
 
 - **`Ctrl+Alt+A`**: Cycle through modes (`default` ➔ `auto-edit` ➔ `auto` ➔ `yolo` ➔ `plan`).
-- **`/approval-mode [mode]`** or **`/mode [mode]`**: Switch approval mode.
+- **`/approval-mode [mode]`**: Switch approval mode.
 - **`/classifier-model [provider/model]`**: View or configure classifier model.
 - **`/approval-rules [list|clear]`**: View or clear permission rules.
-- **`/yolo`**: Toggle YOLO mode.
-- **`/plan`**: Toggle Plan mode.
 
 ---
 
 <a name="中文文档"></a>
 # 中文说明
 
-为 **Pi Coding Agent** 提供对齐 **千问 Code (Qwen Code)** 的多级工具审批模式、三态权限规则体系与两阶段 LLM 安全分类器。
+为 **Pi Coding Agent** 提供对齐 **千问 Code (Qwen Code)** 的多级工具审批模式、四态权限规则体系与两阶段 LLM 安全分类器。
 
 ### 核心能力
 
 1. **五大运行模式**：`default`（标准）、`auto-edit`（免审编辑）、`auto`（智能两阶段分类）、`yolo`（全自动）、`plan`（只读规划）。
-2. **Qwen Code 风格三态权限预设 (`deny` > `ask` > `allow`)**：
+2. **Qwen Code 风格四态权限预设 (`deny` > `ask` > `default` > `allow`)**：
    - 支持 DSL 规则语法：`Tool(specifier)`（如 `Bash(git status)`, `Read(/src/**)`, `Read(.env*)`, `Edit(/package.json)`）；
    - 支持宏分类：`Read`（只读文件/搜索/目录）、`Edit`（编辑与写入）、`Bash`（Shell 命令）；
-   - 跨层级 Union 并集加载与 Deny-First 绝对封顶机制。
+   - `default` 规则＝「交给审批模式」（auto 走分类器、非交互拒绝）；不配置时行为与三态现状一致（复杂度按需付费）；
+   - 跨层级 Union 并集加载与 Deny-First 绝对封顶机制；
+   - **工具默认权限层**：读类工具（`read`/`grep`/`find`/`ls`）未命中规则时，工作区内快路径放行、工作区外强制人工（含 `~` 展开）。
 3. **工业级 Shell 状态机分析器（拒绝玩具级正则）**：
    - 词法状态机解析单双引号与转义，杜绝复合命令（`&&`, `||`, `;`, `&`）注入逃逸；
    - 写入重定向（`>`, `>>`, `&>`）一票否决只读属性；
@@ -206,16 +212,17 @@ $$\text{Deny} > \text{Ask} > \text{Allow} > \text{Default}$$
 
 #### 2. 三层规则合并与 Deny-First 绝对裁决
 规则裁决严格遵循：
-$$\text{Deny} > \text{Ask} > \text{Allow} > \text{Default}$$
+$$\text{Deny} > \text{Ask} > \text{Default} > \text{Allow}$$
 
 - **规则池汇总**：
   - 会话级（Session，仅保存在内存）、项目级（Project，`<workspace>/.pi/approval-rules.json`）、用户级（User，`~/.pi/agent/approval-rules.json`）分别独立加载；
-  - 运行时按裁决类型汇聚为三大集合：$\text{Deny 集合}$、$\text{Ask 集合}$、$\text{Allow 集合}$。
+  - 运行时按裁决类型汇聚为四大集合：$\text{Deny 集合}$、$\text{Ask 集合}$、$\text{Default 集合}$、$\text{Allow 集合}$。
 - **裁决顺序与短路**：
   1. **Deny 优先（一票否决）**：命中任意层的 Deny 规则即刻阻断工具调用，静默拦截不弹窗；
   2. **Ask 次之（强制交互）**：命中 Ask 规则时，即使处于 `auto` 免审模式也会强行唤起审批弹窗；
-  3. **Allow 再次（免审放行）**：若未命中 Deny/Ask 且命中 Allow 规则，直接自动放行；
-  4. **Default 兜底**：未命中显式规则时返回 Default，交由当前运行模式（如 Auto 模式的两阶段 LLM 分类器）进行裁决。
+  3. **Default 再次（交给审批模式）**：命中显式 `default` 规则时，交由模式漏斗裁决——`auto` 下先经两阶段分类器（交互不通过转人工、非交互不通过直接拒绝），非 `auto` 下人工确认；
+  4. **Allow 免审放行**：若未命中 Deny/Ask/Default 且命中 Allow 规则，直接自动放行；
+  5. **未命中兜底 Default**：未命中任何显式规则时返回 Default，交由当前运行模式裁决；其中**读类工具**先经**工具默认权限层**（工作区内快路径放行、工作区外强制人工）。
 - **核心原则**：**裁决类型（Verdict）优先级严格高于规则层级（Scope）**。层级只决定规则存放在哪里与存活多久，不决定谁能胜出。任何层级的 Deny 绝对压死所有层级的 Allow。
 
 #### 3. `/reload` 与会话恢复生命周期

@@ -1,14 +1,15 @@
 /**
  * Permission Engine and DSL Rule Matcher
  *
- * 对齐 Qwen Code 的三态权限规则控制体系与 DSL 语法引擎：
+ * 对齐 Qwen Code 的四态权限规则控制体系与 DSL 语法引擎：
  *
- * 1. 三态判定优先级：
+ * 1. 四态判定优先级：
  *    Deny (3, 最高) > Ask (2) > Default (1) > Allow (0)
  *    - deny: 运行时直接阻断，向模型返回错误原因，不触发用户弹窗；
  *    - ask:  强制挂起并弹窗要求用户确认，压倒 allow；
+ *    - default: 显式 default 规则命中，或未命中任何规则 → 交给审批模式漏斗（auto→classifier、非交互拒绝）；
  *    - allow: 免审放行（受 auto 模式高危暂存保护）；
- *    - default: 未命中显式规则，回退至当前审批模式 (default/auto-edit/auto/plan/yolo)。
+ *    （读类工具未命中规则时，再经工具默认权限层：工作区内 allow / 工作区外 ask）
  *
  * 2. DSL 语法与分流解析：
  *    ToolName 或 ToolName(specifier)
@@ -35,10 +36,14 @@ import { stripLeadingEnvVars, tokenizeShellCommand } from "./shell-analyzer.ts";
 
 export type DecisionType = "deny" | "ask" | "allow" | "default";
 
+/** 规则四态类型（allow / ask / default / deny）。 */
+export type RuleVerdict = "allow" | "ask" | "deny" | "default";
+
 export interface PermissionRules {
 	allow: string[];
 	ask: string[];
 	deny: string[];
+	default: string[];
 	updatedAt?: string;
 }
 
@@ -57,7 +62,7 @@ export interface RuleMatchContext {
 
 // 宏元分类映射表
 const TOOL_MACROS: Record<string, string[]> = {
-	read: ["read", "read_file", "grep", "grep_search", "glob", "list_directory", "zoom_image"],
+	read: ["read", "read_file", "grep", "grep_search", "find", "ls", "glob", "list_directory", "zoom_image"],
 	edit: ["edit", "write", "write_file", "notebook_edit"],
 	bash: ["bash", "run_shell_command", "monitor"],
 	shell: ["bash", "run_shell_command", "monitor"],
@@ -230,12 +235,13 @@ export function matchesPathPattern(targetPath: string, pattern: string, cwd: str
 	const home = homedir().replace(/\\/g, "/");
 	const projectRoot = normalize(cwd).replace(/\\/g, "/");
 
-	// 1. 计算目标文件的物理绝对路径
+	// 1. 计算目标文件的物理绝对路径（`~` 与 pattern 侧同样展开，保证往返匹配）
 	let absTarget: string;
-	if (isAbsolute(normTarget)) {
-		absTarget = normTarget;
+	const expandedTarget = expandTilde(normTarget);
+	if (isAbsolute(expandedTarget)) {
+		absTarget = expandedTarget;
 	} else {
-		absTarget = normalize(join(cwd, normTarget)).replace(/\\/g, "/");
+		absTarget = normalize(join(cwd, expandedTarget)).replace(/\\/g, "/");
 	}
 
 	// 目标文件相对于工作区根目录的相对路径 (如 src/index.ts)
@@ -319,12 +325,12 @@ export interface ConflictCheckResult {
 	hasConflict: boolean;
 	shadowedBy?: {
 		scope: "session" | "project" | "user";
-		verdict: "deny" | "ask";
+		verdict: "deny" | "ask" | "default";
 		rule: string;
 	};
 	shadowsExisting?: {
 		scope: "session" | "project" | "user";
-		verdict: "allow" | "ask";
+		verdict: "allow" | "default" | "ask";
 		rule: string;
 	};
 	warning?: string;
@@ -379,9 +385,9 @@ export class PermissionManager {
 	private userDir: string;
 	private isTrusted: boolean = true;
 	private projectRulesBlocked: boolean = false;
-	private sessionRules: PermissionRules = { allow: [], ask: [], deny: [] };
-	private projectRules: PermissionRules = { allow: [], ask: [], deny: [] };
-	private userRules: PermissionRules = { allow: [], ask: [], deny: [] };
+	private sessionRules: PermissionRules = { allow: [], ask: [], deny: [], default: [] };
+	private projectRules: PermissionRules = { allow: [], ask: [], deny: [], default: [] };
+	private userRules: PermissionRules = { allow: [], ask: [], deny: [], default: [] };
 
 	constructor(cwd: string, userDir?: string, initialSessionRules?: PermissionRules, isTrusted = true) {
 		this.cwd = cwd;
@@ -392,6 +398,7 @@ export class PermissionManager {
 				allow: [...initialSessionRules.allow],
 				ask: [...initialSessionRules.ask],
 				deny: [...initialSessionRules.deny],
+				default: [...(initialSessionRules.default ?? [])],
 			};
 		}
 		this.reloadAll();
@@ -423,7 +430,7 @@ export class PermissionManager {
 			this.projectRules = this.loadRulesFromFile(projectRuleFile);
 			this.projectRulesBlocked = false;
 		} else {
-			this.projectRules = { allow: [], ask: [], deny: [] };
+			this.projectRules = { allow: [], ask: [], deny: [], default: [] };
 			this.projectRulesBlocked = existsSync(projectRuleFile);
 		}
 		this.userRules = this.loadRulesFromFile(join(this.userDir, "approval-rules.json"));
@@ -442,18 +449,18 @@ export class PermissionManager {
 	}
 
 	public clearSessionRules(): void {
-		this.sessionRules = { allow: [], ask: [], deny: [] };
+		this.sessionRules = { allow: [], ask: [], deny: [], default: [] };
 	}
 
 	public clearProjectRules(): void {
-		this.projectRules = { allow: [], ask: [], deny: [] };
+		this.projectRules = { allow: [], ask: [], deny: [], default: [] };
 		if (this.isTrusted) {
 			this.saveRulesToFile(join(this.cwd, ".pi", "approval-rules.json"), this.projectRules);
 		}
 	}
 
 	public clearUserRules(): void {
-		this.userRules = { allow: [], ask: [], deny: [] };
+		this.userRules = { allow: [], ask: [], deny: [], default: [] };
 		this.saveRulesToFile(join(this.userDir, "approval-rules.json"), this.userRules);
 	}
 
@@ -461,7 +468,7 @@ export class PermissionManager {
 	 * 检查某条规则是否存在跨层冲突/压死
 	 */
 	public checkConflict(
-		type: "allow" | "ask" | "deny",
+		type: RuleVerdict,
 		ruleStr: string,
 		_scope: "session" | "project" | "user",
 	): ConflictCheckResult {
@@ -469,8 +476,9 @@ export class PermissionManager {
 		if (!trimmed) return { hasConflict: false };
 
 		const newParsed = parseDslRule(trimmed);
-		const severityMap: Record<"allow" | "ask" | "deny", number> = {
-			allow: 1,
+		const severityMap: Record<RuleVerdict, number> = {
+			allow: 0,
+			default: 1,
 			ask: 2,
 			deny: 3,
 		};
@@ -484,7 +492,7 @@ export class PermissionManager {
 
 		// 1. 检查是否被更高优先级的规则压死 (Stricter shadow)
 		for (const s of allScopes) {
-			for (const verdict of ["deny", "ask"] as const) {
+			for (const verdict of ["deny", "ask", "default"] as const) {
 				if (severityMap[verdict] > newSeverity) {
 					for (const existingRule of s.rules[verdict]) {
 						const existingParsed = parseDslRule(existingRule);
@@ -507,7 +515,7 @@ export class PermissionManager {
 		// 2. 检查本条规则是否会压死其他层级已有的更弱规则 (Shadows weaker existing)
 		for (const s of allScopes) {
 			if (s.scope === _scope) continue; // 同层忽略
-			for (const verdict of ["ask", "allow"] as const) {
+			for (const verdict of ["default", "ask", "allow"] as const) {
 				if (severityMap[verdict] < newSeverity) {
 					for (const existingRule of s.rules[verdict]) {
 						const existingParsed = parseDslRule(existingRule);
@@ -534,7 +542,7 @@ export class PermissionManager {
 	 * 添加规则到指定作用域（附带跨层冲突检测）
 	 */
 	public addRule(
-		type: "allow" | "ask" | "deny",
+		type: RuleVerdict,
 		ruleStr: string,
 		scope: "session" | "project" | "user",
 	): ConflictCheckResult {
@@ -590,6 +598,11 @@ export class PermissionManager {
 			...this.projectRules.allow,
 			...this.userRules.allow,
 		];
+		const allDefault = [
+			...this.sessionRules.default,
+			...this.projectRules.default,
+			...this.userRules.default,
+		];
 
 		// 1. 扫描 Deny 规则池 (最高优先级，短路阻断)
 		for (const r of allDeny) {
@@ -604,6 +617,14 @@ export class PermissionManager {
 			const parsed = parseDslRule(r);
 			if (matchesParsedRule(parsed, ctx)) {
 				return { decision: "ask", matchedRule: r };
+			}
+		}
+
+		// 2.5 扫描 default 规则池 (交给审批模式：auto→classifier，非 auto→人工)
+		for (const r of allDefault) {
+			const parsed = parseDslRule(r);
+			if (matchesParsedRule(parsed, ctx)) {
+				return { decision: "default", matchedRule: r };
 			}
 		}
 
@@ -623,7 +644,7 @@ export class PermissionManager {
 	 * 从文件读取并规范化规则格式 (无缝兼容旧版本的纯字符串数组)
 	 */
 	private loadRulesFromFile(filePath: string): PermissionRules {
-		const empty: PermissionRules = { allow: [], ask: [], deny: [] };
+		const empty: PermissionRules = { allow: [], ask: [], deny: [], default: [] };
 		if (!existsSync(filePath)) return empty;
 
 		try {
@@ -640,8 +661,11 @@ export class PermissionManager {
 			const deny = Array.isArray(data.deny)
 				? data.deny.filter((x: any) => typeof x === "string" && x.trim().length > 0)
 				: [];
+			const def = Array.isArray(data.default)
+				? data.default.filter((x: any) => typeof x === "string" && x.trim().length > 0)
+				: [];
 
-			return { allow, ask, deny, updatedAt: data.updatedAt };
+			return { allow, ask, deny, default: def, updatedAt: data.updatedAt };
 		} catch {
 			return empty;
 		}
@@ -660,6 +684,7 @@ export class PermissionManager {
 				allow: Array.from(new Set(rules.allow)),
 				ask: Array.from(new Set(rules.ask)),
 				deny: Array.from(new Set(rules.deny)),
+				default: Array.from(new Set(rules.default)),
 				updatedAt: new Date().toISOString(),
 			};
 			writeFileSync(filePath, JSON.stringify(data, null, 2), "utf-8");
@@ -667,4 +692,109 @@ export class PermissionManager {
 			console.error(`[permission-engine] 保存规则失败 (${filePath}):`, err);
 		}
 	}
+}
+
+// ==============================================================
+// 工具默认权限层（qwen-code getDefaultPermission 等价物）
+// ==============================================================
+
+/** 读类工具集合（pi 实际内置的只读工具）。 */
+const READ_ONLY_TOOLS = new Set(["read", "grep", "find", "ls"]);
+
+/** 判断是否为读类工具（需要工具默认权限层）。 */
+export function isReadOnlyTool(toolName: string): boolean {
+	return READ_ONLY_TOOLS.has(toolName.toLowerCase());
+}
+
+/** 读类工具模式漏斗处置档位。 */
+export type ModeFunnelDisposition = "allow" | "classifier" | "prompt";
+
+/**
+ * 读类工具（命中 default 规则）在各审批模式下的漏斗处置矩阵：
+ *
+ * | 模式           | 处置                                    |
+ * |----------------|-----------------------------------------|
+ * | yolo           | 放行                                    |
+ * | plan           | 放行（plan 只读语义）                   |
+ * | auto           | classifier（交互不通过转人工、非交互拒绝）|
+ * | auto-edit / default | 人工确认                            |
+ *
+ * 纯函数，独立于 pi 运行时，便于单测验收处置矩阵。
+ */
+export function resolveReadDisposition(mode: string): ModeFunnelDisposition {
+	switch (mode) {
+		case "yolo":
+		case "plan":
+			return "allow";
+		case "auto":
+			return "classifier";
+		default:
+			return "prompt";
+	}
+}
+
+/** 展开路径中的 `~` / `~/`（规则与目标两侧统一使用，保证往返匹配）。 */
+function expandTilde(p: string): string {
+	if (p === "~") return homedir();
+	if (p.startsWith("~/") || p.startsWith("~\\")) return join(homedir(), p.slice(2));
+	return p;
+}
+
+/**
+ * 为读类调用生成可往返匹配的 DSL 规则（审批弹窗「记住」用）：
+ * - 绝对路径 → `//...`（文件系统绝对根作用域）
+ * - `~` / `~/...` → 原样（家目录作用域，匹配时目标同步展开）
+ * - 相对路径 → 原样（工作区相对作用域）
+ */
+export function buildReadDslRule(targetPath: string): string {
+	const raw = (targetPath || "").trim();
+	if (!raw) return "Read(*)";
+	if (raw === "~") return `Read(//${homedir()})`;
+	if (raw.startsWith("~/") || raw.startsWith("~\\")) return `Read(${raw})`;
+	if (isAbsolute(raw)) return `Read(//${raw.replace(/^[\\/]+/, "")})`;
+	return `Read(${raw})`;
+}
+
+/**
+ * 工具默认权限：内建的保守安全基线，在用户规则之后、审批模式之前生效。
+ *
+ * 读类工具（read/grep/find/ls）：工作区内 `allow`，工作区外 `ask`（对齐 qwen-code）。
+ * 其余工具返回 `allow`（交给现有审批模式兑底，不在此层额外收紧）。
+ *
+ * @param toolName   工具名
+ * @param targetPath 目标路径（读类工具的 path 参数；无则为空串）
+ * @param cwd        当前工作目录
+ */
+export function getToolDefaultPermission(
+	toolName: string,
+	targetPath: string,
+	cwd: string,
+): "allow" | "ask" {
+	const lower = toolName.toLowerCase();
+	if (!READ_ONLY_TOOLS.has(lower)) {
+		return "allow";
+	}
+
+	const raw = (targetPath || "").trim();
+	if (!raw) {
+		// 无显式目标路径（如 grep/find/ls 默认当前目录）→ 工作区内
+		return "allow";
+	}
+
+	// 展开 `~`（验收要求：read ~/.ssh/id_rsa 应判为区外）
+	const expanded = expandTilde(raw);
+
+	let abs: string;
+	if (isAbsolute(expanded)) {
+		abs = normalize(expanded).replace(/\\/g, "/");
+	} else {
+		abs = normalize(join(cwd, expanded)).replace(/\\/g, "/");
+	}
+	const root = normalize(cwd).replace(/\\/g, "/");
+
+	const rel = relative(root, abs).replace(/\\/g, "/");
+	if (rel === "" || (!rel.startsWith("..") && !isAbsolute(rel))) {
+		return "allow";
+	}
+	return "ask";
 }

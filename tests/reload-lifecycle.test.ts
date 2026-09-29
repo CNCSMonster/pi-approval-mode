@@ -81,6 +81,7 @@ test("PermissionManager - 支持 initialSessionRules 状态迁移与恢复", () 
 			allow: ["Bash(echo hi)"],
 			ask: ["Bash(deploy)"],
 			deny: ["Bash(drop database)"],
+			default: [],
 		};
 
 		const pm = new PermissionManager(projectDir, userDir, initialSession);

@@ -30,13 +30,22 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolCallEventResult } from "@earendil-works/pi-coding-agent";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
-import { Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Key, matchesKey, truncateToWidth, visibleWidth, type AutocompleteItem } from "@earendil-works/pi-tui";
 
 import { analyzeShellCommand } from "./shell-analyzer.ts";
 import { fallbackHeuristicCheck, isProtectedPath, CLASSIFIER_BASE_PROMPT } from "./heuristic-guard.ts";
-import { PermissionManager, formatScopeName, type DecisionType } from "./permission-engine.ts";
+import {
+	PermissionManager,
+	buildReadDslRule,
+	formatScopeName,
+	getToolDefaultPermission,
+	isReadOnlyTool,
+	resolveReadDisposition,
+	type DecisionType,
+} from "./permission-engine.ts";
 import { LoopDetector, type LoopCheckResult } from "./loop-detector.ts";
 import { DenialTracker, DENIAL_MESSAGES, type DenialLimits } from "./denial-tracker.ts";
+import { projectToolInput, buildTranscript } from "./classifier-projection.ts";
 
 export type ApprovalMode = "default" | "auto-edit" | "auto" | "yolo" | "plan";
 
@@ -220,17 +229,6 @@ Respond with JSON only: { "shouldBlock": boolean, "reason": string }.`;
 
 
 
-function extractMessageText(content: unknown): string {
-	if (typeof content === "string") return content;
-	if (Array.isArray(content)) {
-		return content
-			.filter((c) => c && typeof c === "object" && c.type === "text" && typeof c.text === "string")
-			.map((c) => c.text)
-			.join("\n");
-	}
-	return "";
-}
-
 function parseClassifierJson(text: string): any {
 	try {
 		const trimmed = text.trim();
@@ -259,12 +257,11 @@ function withTimeout<T>(promise: Promise<T>, ms: number, onTimeoutValue: T): Pro
 
 export default function approvalModeExtension(pi: ExtensionAPI): void {
 	let currentMode: ApprovalMode = "default";
-	let previousModeBeforeToggle: ApprovalMode = "default";
 	let toolsBeforePlanMode: string[] | undefined;
 	let customClassifierModel: string | undefined;
 	let classifierTimeoutMs = 1500;
 
-	// Qwen Code 三态权限规则管理器
+	// Qwen Code 四态权限规则管理器
 	let permissionManager: PermissionManager;
 
 	// 死循环与连续失败统计熔断器
@@ -324,7 +321,6 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 	function switchMode(newMode: ApprovalMode, ctx: ExtensionContext, silent = false): void {
 		if (newMode === currentMode) return;
 
-		previousModeBeforeToggle = currentMode;
 		currentMode = newMode;
 
 		loopDetector.reset();
@@ -460,9 +456,12 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 			const sRules = permissionManager.getSessionRules();
 			const pRules = permissionManager.getProjectRules();
 			const uRules = permissionManager.getUserRules();
-			const sCount = sRules.allow.length + sRules.ask.length + sRules.deny.length;
-			const pCount = pRules.allow.length + pRules.ask.length + pRules.deny.length;
-			const uCount = uRules.allow.length + uRules.ask.length + uRules.deny.length;
+			const sCount =
+				sRules.allow.length + sRules.ask.length + sRules.deny.length + sRules.default.length;
+			const pCount =
+				pRules.allow.length + pRules.ask.length + pRules.deny.length + pRules.default.length;
+			const uCount =
+				uRules.allow.length + uRules.ask.length + uRules.deny.length + uRules.default.length;
 
 			const trustLabel = isTrusted ? "已信任" : "未信任(已隔离项目配置)";
 			const pLabel = isTrusted ? `${pCount}` : "0(隔离)";
@@ -474,7 +473,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		}
 	});
 
-	// 3. 注册命令：/approval-mode 或 /mode
+	// 3. 注册命令：/approval-mode
 	const modeCommandHandler = async (args: string | undefined, ctx: ExtensionContext) => {
 		const inputMode = args?.trim().toLowerCase() as ApprovalMode;
 		if (inputMode && ALL_MODES.includes(inputMode)) {
@@ -504,43 +503,34 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		}
 	};
 
+	// 审批模式参数补全提示（输入 /approval-mode 后按 Tab 显示可选模式）
+	const MODE_SHORT_DESCRIPTIONS: Record<ApprovalMode, string> = {
+		default: "标准确认模式（文件修改与 Shell 命令均需审批）",
+		"auto-edit": "自动批准文件编辑（仅 Shell 命令需审批）",
+		auto: "智能分类器模式（双阶段 LLM 自动判定风险）",
+		yolo: "全自动模式（无条件直接执行所有工具）",
+		plan: "只读规划模式（禁用编辑/写入，仅放行只读命令）",
+	};
+
+	function getModeCompletions(prefix: string): AutocompleteItem[] | null {
+		const p = prefix.trim().toLowerCase();
+		const items = ALL_MODES
+			.filter((m) => m.startsWith(p))
+			.map((m) => ({
+				value: m,
+				label: m,
+				description: MODE_SHORT_DESCRIPTIONS[m],
+			}));
+		return items.length > 0 ? items : null;
+	}
+
 	pi.registerCommand("approval-mode", {
 		description: "查看或切换审批模式 (default, auto-edit, auto, yolo, plan)",
+		getArgumentCompletions: getModeCompletions,
 		handler: modeCommandHandler,
 	});
 
-	pi.registerCommand("mode", {
-		description: "查看或切换审批模式快捷别名",
-		handler: modeCommandHandler,
-	});
-
-	// 快速切换 YOLO
-	pi.registerCommand("yolo", {
-		description: "一键切换 YOLO 全自动模式",
-		handler: async (_args, ctx) => {
-			if (currentMode === "yolo") {
-				const fallback = previousModeBeforeToggle === "yolo" ? "default" : previousModeBeforeToggle;
-				switchMode(fallback, ctx);
-			} else {
-				switchMode("yolo", ctx);
-			}
-		},
-	});
-
-	// 快速切换 Plan
-	pi.registerCommand("plan", {
-		description: "一键切换 Plan 只读规划模式",
-		handler: async (_args, ctx) => {
-			if (currentMode === "plan") {
-				const fallback = previousModeBeforeToggle === "plan" ? "default" : previousModeBeforeToggle;
-				switchMode(fallback, ctx);
-			} else {
-				switchMode("plan", ctx);
-			}
-		},
-	});
-
-	// 管理与查看三态权限规则：/approval-rules
+	// 管理与查看四态权限规则：/approval-rules
 	pi.registerCommand("approval-rules", {
 		description: "查看或清空权限规则 (/approval-rules [list|clear])",
 		handler: async (args, ctx) => {
@@ -577,7 +567,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 
 			const formatRules = (
 				title: string,
-				r: { allow: string[]; ask: string[]; deny: string[] },
+				r: { allow: string[]; ask: string[]; deny: string[]; default: string[] },
 				scope: "session" | "project" | "user",
 			) => {
 				const items: string[] = [];
@@ -588,6 +578,13 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 					const conflict = permissionManager.checkConflict("ask", rule, scope);
 					const status = conflict.shadowedBy ? ` [⚠️ 被${formatScopeName(conflict.shadowedBy.scope)} deny 压死]` : "";
 					items.push(`  ⚠️ ask:  ${rule}${status}`);
+				}
+				for (const rule of r.default) {
+					const conflict = permissionManager.checkConflict("default", rule, scope);
+					const status = conflict.shadowedBy
+						? ` [⚠️ 被${formatScopeName(conflict.shadowedBy.scope)} ${conflict.shadowedBy.verdict} 压死]`
+						: "";
+					items.push(`  🔁 default: ${rule}${status}`);
 				}
 				for (const rule of r.allow) {
 					const conflict = permissionManager.checkConflict("allow", rule, scope);
@@ -664,25 +661,12 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 	});
 
 	/**
-	 * 获取近期对话与工具调用摘要（用于分类器理解用户真实意图与调用链）
+	 * 获取近期对话与工具调用摘要（薄封装：取 entries 后交给 buildTranscript 纯函数）。
 	 */
-	function getRecentConversationTranscript(ctx: ExtensionContext, maxTurns = 6): string {
+	function getRecentConversationTranscript(ctx: ExtensionContext): string {
 		try {
 			const entries = ctx.sessionManager.getBranch();
-			const items: string[] = [];
-
-			for (let i = entries.length - 1; i >= 0 && items.length < maxTurns; i--) {
-				const entry = entries[i];
-				if (entry.type === "message" && entry.message) {
-					const text = extractMessageText(entry.message.content).trim();
-					if (text) {
-						items.unshift(`[${entry.message.role.toUpperCase()}]: ${text}`);
-					}
-				} else if (entry.type === "tool_call" && (entry as any).toolName) {
-					items.unshift(`[TOOL_CALL]: ${(entry as any).toolName}(${JSON.stringify((entry as any).input || {})})`);
-				}
-			}
-			return items.join("\n\n");
+			return buildTranscript(entries as any, ctx.cwd).join("\n\n");
 		} catch {
 			return "";
 		}
@@ -774,8 +758,11 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		}
 
 		const transcript = getRecentConversationTranscript(ctx);
-		const pendingAction = `Tool: ${toolName}\nArguments:\n${JSON.stringify(toolInput, null, 2)}`;
-		const promptContent = `Conversation Transcript:\n${transcript}\n\nPending Action to evaluate:\n${pendingAction}`;
+		const projectedInput = projectToolInput(toolName, toolInput, ctx.cwd);
+		const promptContent =
+			`Conversation Transcript:\n${transcript}\n\n` +
+			`## Pending tool call to classify\n\n` +
+			`Tool: ${toolName}\nArguments:\n${JSON.stringify(projectedInput, null, 2)}`;
 
 		// === Stage 1: 极速初筛 (带超时熔断保护) ===
 		let stage1Response: any = null;
@@ -1162,7 +1149,9 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 			const dslRule =
 				toolName === "bash"
 					? `Bash(${input.command})`
-					: `Edit(${relative(ctx.cwd, input.path || "").replace(/\\/g, "/")})`;
+					: isReadOnlyTool(toolName)
+						? buildReadDslRule(String(input.path ?? ""))
+						: `Edit(${relative(ctx.cwd, input.path || "").replace(/\\/g, "/")})`;
 
 			const dialogDetails: Array<{ label: string; content: string }> = [];
 			if (loopCheck.isLoop && loopCheck.warningMessage) {
@@ -1195,8 +1184,139 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		}
 
 		// ==============================================================
+		// 步骤 0.5: 工具默认权限层
+		// 仅当未命中显式规则（decision === "default" 且无 matchedRule）时，
+		// 读类工具用工具默认权限兑底：工作区内 allow 快路径 / 工作区外 ask 人工。
+		// 命中 default 规则（matchedRule 有值）或非读类工具 → 继续走模式漏斗。
+		// ==============================================================
+		if (
+			permDecision.decision === "default" &&
+			!permDecision.matchedRule &&
+			isReadOnlyTool(toolName)
+		) {
+			const targetPath = String(input.path ?? "").trim();
+			const toolDefault = getToolDefaultPermission(toolName, targetPath, ctx.cwd);
+
+			// 工作区内读取 → 快路径放行（不进 classifier）
+			if (toolDefault === "allow") {
+				return allowCall(toolName, input);
+			}
+
+			// 工作区外读取 → 人工确认
+			if (!ctx.hasUI) {
+				return blockCall(
+					toolName,
+					input,
+					DENIAL_MESSAGES.presetAskHeadless(`Read(${targetPath || toolName})`),
+				);
+			}
+
+			const label = targetPath || toolName;
+			const dslRule = buildReadDslRule(targetPath);
+			const dialogDetails: Array<{ label: string; content: string }> = [];
+			if (loopCheck.isLoop && loopCheck.warningMessage) {
+				dialogDetails.push({ label: "🚨 死循环预警", content: loopCheck.warningMessage });
+			}
+			dialogDetails.push({ label: "越界读取", content: label });
+
+			const action = await promptApprovalDialog(
+				ctx,
+				formatDialogTitle("🛡️ [工作区外读取审批]", "越界读取", loopCheck),
+				dialogDetails,
+				loopCheck.isLoop,
+			);
+
+			return handleOutcome(action, dslRule, ctx, label, toolName, input);
+		}
+
+		// ==============================================================
 		// 步骤 1: 运行模式漏斗裁决 (Approval Mode State Machine)
 		// ==============================================================
+
+		// 0) 命中 default 规则的读类工具 → 模式漏斗矩阵
+		// 能到达此处的读类工具均命中了 default 规则（未命中的已在步骤 0.5 按工具默认权限处置）
+		if (isReadOnlyTool(toolName)) {
+			const disposition = resolveReadDisposition(currentMode);
+			const targetPath = String(input.path ?? "").trim();
+			const label = targetPath || toolName;
+			const dslRule = buildReadDslRule(targetPath);
+
+			// yolo / plan：放行（plan 只读语义）
+			if (disposition === "allow") {
+				return allowCall(toolName, input);
+			}
+
+			// auto：双阶段 LLM 安全分类器研判（交互不通过转人工、非交互不通过拒绝）
+			if (disposition === "classifier") {
+				const fingerprint = DenialTracker.createFingerprint(toolName, input);
+				const fallback = denialTracker.checkFallback(fingerprint);
+				if (fallback.shouldFallback && !ctx.hasUI) {
+					const terminate = fallback.kind === "total_denial" && denialTracker.shouldAbortOnCap();
+					return blockCall(toolName, input, fallback.reasonText || "Blocked", terminate);
+				}
+
+				let decision: { shouldBlock: boolean; reason: string; stage: "fast" | "thinking" | "fallback" };
+				if (fallback.shouldFallback && fallback.kind === "consecutive_unavailable") {
+					decision = fallbackHeuristicCheck(toolName, input);
+				} else {
+					decision = await runTwoStageClassifier(ctx, toolName, input);
+				}
+
+				if (!decision.shouldBlock) {
+					return allowCall(toolName, input);
+				}
+
+				if (!ctx.hasUI) {
+					return blockCall(toolName, input, DENIAL_MESSAGES.autoReadBlocked(decision.reason, label));
+				}
+
+				denialTracker.consumePendingFingerprint();
+
+				const classifierDialog: Array<{ label: string; content: string }> = [];
+				if (loopCheck.isLoop && loopCheck.warningMessage) {
+					classifierDialog.push({ label: "🚨 死循环预警", content: loopCheck.warningMessage });
+				}
+				classifierDialog.push({ label: "读取目标", content: label });
+				classifierDialog.push({ label: "分类器研判风险", content: decision.reason });
+
+				const classifierAction = await promptApprovalDialog(
+					ctx,
+					formatDialogTitle("🤖 [读取安全分类器研判 (Auto Mode)]", "读取风险", loopCheck),
+					classifierDialog,
+					loopCheck.isLoop,
+				);
+
+				return handleOutcome(classifierAction, dslRule, ctx, label, toolName, input);
+			}
+
+			// auto-edit / default：人工确认
+			if (!ctx.hasUI) {
+				return blockCall(
+					toolName,
+					input,
+					currentMode === "auto-edit"
+						? DENIAL_MESSAGES.autoEditReadHeadless(label)
+						: DENIAL_MESSAGES.defaultReadHeadless(label),
+				);
+			}
+
+			const readDialog: Array<{ label: string; content: string }> = [];
+			if (loopCheck.isLoop && loopCheck.warningMessage) {
+				readDialog.push({ label: "🚨 死循环预警", content: loopCheck.warningMessage });
+			}
+			readDialog.push({ label: "读取目标", content: label });
+
+			const readAction = await promptApprovalDialog(
+				ctx,
+				currentMode === "auto-edit"
+					? formatDialogTitle("📝 [读取审批 (auto-edit)]", "读取", loopCheck)
+					: formatDialogTitle("🛡️ [读取审批 (default)]", "读取", loopCheck),
+				readDialog,
+				loopCheck.isLoop,
+			);
+
+			return handleOutcome(readAction, dslRule, ctx, label, toolName, input);
+		}
 
 		// 1) yolo 模式：无条件直接放行
 		if (currentMode === "yolo") {
@@ -1370,6 +1490,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 
 				return handleOutcome(action, dslRule, ctx, cmd, toolName, input);
 			}
+
 			return allowCall(toolName, input);
 		}
 

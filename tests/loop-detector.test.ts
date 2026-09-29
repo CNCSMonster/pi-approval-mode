@@ -114,7 +114,7 @@ test("LoopDetector - 支持动态从配置更新阈值偏好", () => {
 	assert.equal(res.streak, 2);
 });
 
-test("LoopDetector - 预警文案随次数升级与硬上限熔断 (ISSUE-0004)", () => {
+test("LoopDetector - 预警文案随次数升级与硬上限熔断", () => {
 	// identicalThreshold: 2, hardLimitMultiplier: 3 => hardLimit = 6
 	const detector = new LoopDetector({
 		identicalThreshold: 2,

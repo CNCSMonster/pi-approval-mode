@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.2.0] - 2026-09-29
+
+### 🛡️ Security & Trust
+- **Classifier Transcript Alignment**: The two-stage safety classifier now receives a hardened transcript aligned with qwen-code's iron rules — assistant text/thinking stripped (prevents self-endorsement), tool results/bash executions stripped (prevents prompt-injection via untrusted content), prior tool calls rewritten as `Prior action: tool(projected args)`, last 40 message entries.
+- **Minimal Tool Input Projection**: Replaced full-argument exposure with field-limited projections — `bash`→`{command,cwd}`, `edit`→path + first-5 edit previews (300 chars), `write`→path + byte count + 300-char content preview, read-family→path only.
+
+### ⚙️ Permissions & Engine
+- **Four-State Permission Rules**: Rule verdicts extended from `deny > ask > allow` to `deny > ask > default > allow`. Explicit `default` rules delegate to the approval-mode funnel (LLM classifier in `auto` — interactive fallback to manual, headless rejection; manual confirmation in `auto-edit`/`default`; allow in `yolo`/`plan`). Omitting `default` rules preserves legacy tri-state behavior (complexity pay-as-you-go). Cross-layer conflict detection, `/approval-rules` display, and JSON persistence now cover the fourth state.
+- **Tool Default Permission Layer**: Read-family tools (`read`/`grep`/`find`/`ls`) without a matching rule fast-path only inside the workspace; out-of-workspace targets (including `~` expansion) require interactive confirmation in every mode — closing the read fast-path blind spot identified against qwen-code's `getDefaultPermission()`.
+- **Round-Trip Safe Read Rules**: Approval dialogs now emit scope-correct `Read(...)` rules (`//` for absolute, `~/` for home, relative for workspace paths), and path matching expands `~` on the target side, so remembered decisions reliably match future calls.
+
+### 🪄 Command Surface
+- **Command Cleanup & Completion**: Removed the `/mode`, `/yolo`, and `/plan` shortcuts — mode switching is unified under the `Ctrl+Alt+A` quick key and the single `/approval-mode` command; `/approval-mode` now supports Tab argument completion listing all five modes with descriptions.
+
 ## [0.1.0] - 2026-09-29
 
 ### 🛡️ Security & Trust

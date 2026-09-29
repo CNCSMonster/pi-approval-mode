@@ -202,7 +202,7 @@ export class DenialTracker {
 }
 
 // ==============================================================
-// 2. 统一英文引导文案表 (Spec §3.5 规范)
+// 2. 统一英文引导文案表
 // ==============================================================
 
 export const DENIAL_MESSAGES = {
@@ -229,6 +229,15 @@ export const DENIAL_MESSAGES = {
 
 	autoCommandBlocked: (classifierReason: string, cmd: string): string =>
 		`[Auto Mode] Command blocked by the safety classifier: ${classifierReason} (${cmd}). To request manual approval, retry the same tool call without changing its arguments. You may continue with unrelated safe work or a genuinely safer alternative. Do not bypass via another tool, shell indirection, generated script, alias, symlink, config change, hook, or encoded payload.`,
+
+	autoReadBlocked: (classifierReason: string, targetPath: string): string =>
+		`[Auto Mode] Read blocked by the safety classifier: ${classifierReason} (target: ${targetPath}). To request manual approval, retry the same tool call without changing its arguments. You may continue with unrelated safe work or a genuinely safer alternative. Do not bypass via another tool, shell indirection, generated script, alias, symlink, config change, hook, or encoded payload.`,
+
+	autoEditReadHeadless: (targetPath: string): string =>
+		`[Auto-edit Mode] Read requires approval, but no interactive UI is available: ${targetPath}. Continue with unrelated safe work or report the blocker to the user.`,
+
+	defaultReadHeadless: (targetPath: string): string =>
+		`[Default Mode] Read requires approval, but no interactive UI is available: ${targetPath}. Continue with unrelated safe work or report the blocker to the user.`,
 
 	autoEditHeadless: (cmd: string): string =>
 		`[Auto-edit Mode] Shell execution requires approval, but no interactive UI is available: ${cmd}. Continue with unrelated safe work or report the blocker to the user.`,
