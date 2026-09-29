@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-29
+
+### 📖 Documentation
+- Added the bilingual **User Guide** (`docs/user-guide.md`, English first / 中文随后): quickstart, approval-mode × tool behavior matrix, rules cookbook, classifier & model setup, FAQ & troubleshooting, development guide.
+- README: English and Chinese sections brought to full parity (approval-modes table, config JSON samples, trust gate, shortcuts & commands, license in both languages); corrected the stale `/reload` session-rule semantics in the English section; added user-guide links.
+
 ## [0.2.0] - 2026-09-29
 
 ### 🛡️ Security & Trust
