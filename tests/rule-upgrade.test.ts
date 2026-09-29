@@ -162,7 +162,7 @@ test("处置矩阵 - default 决策的读类工具在四种模式下的分流", 
 	// auto-edit：人工确认
 	assert.equal(resolveReadDisposition("auto-edit"), "prompt");
 	// default：人工确认
-	assert.equal(resolveReadDisposition("default"), "prompt");
+	assert.equal(resolveReadDisposition("manual"), "prompt");
 });
 
 test("处置矩阵 - 非交互拒绝路径的消息契约（auto 读被 classifier 拦截 / 非 auto 读需人工）", () => {
@@ -174,11 +174,11 @@ test("处置矩阵 - 非交互拒绝路径的消息契约（auto 读被 classifi
 
 	// auto-edit / default：非无 UI → 拒绝并要求人工
 	assert.ok(DENIAL_MESSAGES.autoEditReadHeadless("secrets.json").includes("no interactive UI"));
-	assert.ok(DENIAL_MESSAGES.defaultReadHeadless("secrets.json").includes("no interactive UI"));
+	assert.ok(DENIAL_MESSAGES.manualReadHeadless("secrets.json").includes("no interactive UI"));
 });
 
 // ==============================================================
-// D. 读类工具门禁
+// D. 读类工具门禁（spec §4 验收）
 // ==============================================================
 
 test("读类门禁 - Read(secrets.json) → default 规则命中（auto 下走 classifier 的前提）", () => {
@@ -222,7 +222,7 @@ test("读类门禁 - 未命中规则 + 区外 → 工具默认权限 ask（read 
 });
 
 // ==============================================================
-// E. 按需付费：不配 default 规则时行为与三态现状一致
+// E. 按需付费：不配 default 规则时行为与三态现状一致（spec §4）
 // ==============================================================
 
 test("按需付费 - 不配 default 规则时，三态决策与现状完全一致", () => {

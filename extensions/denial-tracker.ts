@@ -236,20 +236,20 @@ export const DENIAL_MESSAGES = {
 	autoEditReadHeadless: (targetPath: string): string =>
 		`[Auto-edit Mode] Read requires approval, but no interactive UI is available: ${targetPath}. Continue with unrelated safe work or report the blocker to the user.`,
 
-	defaultReadHeadless: (targetPath: string): string =>
-		`[Default Mode] Read requires approval, but no interactive UI is available: ${targetPath}. Continue with unrelated safe work or report the blocker to the user.`,
+	manualReadHeadless: (targetPath: string): string =>
+		`[Manual Mode] Read requires approval, but no interactive UI is available: ${targetPath}. Continue with unrelated safe work or report the blocker to the user.`,
 
 	autoEditHeadless: (cmd: string): string =>
 		`[Auto-edit Mode] Shell execution requires approval, but no interactive UI is available: ${cmd}. Continue with unrelated safe work or report the blocker to the user.`,
 
-	defaultEditHeadless: (relPath: string): string =>
-		`[Default Mode] File edits require approval, but no interactive UI is available: ${relPath}. Continue with unrelated safe work or report the blocker to the user.`,
+	manualEditHeadless: (relPath: string): string =>
+		`[Manual Mode] File edits require approval, but no interactive UI is available: ${relPath}. Continue with unrelated safe work or report the blocker to the user.`,
 
-	defaultWriteHeadless: (relPath: string): string =>
-		`[Default Mode] File writes require approval, but no interactive UI is available: ${relPath}. Continue with unrelated safe work or report the blocker to the user.`,
+	manualWriteHeadless: (relPath: string): string =>
+		`[Manual Mode] File writes require approval, but no interactive UI is available: ${relPath}. Continue with unrelated safe work or report the blocker to the user.`,
 
-	defaultBashHeadless: (cmd: string): string =>
-		`[Default Mode] Shell execution requires approval, but no interactive UI is available: ${cmd}. Continue with unrelated safe work or report the blocker to the user.`,
+	manualBashHeadless: (cmd: string): string =>
+		`[Manual Mode] Shell execution requires approval, but no interactive UI is available: ${cmd}. Continue with unrelated safe work or report the blocker to the user.`,
 
 	heuristicFallback: (matchedPattern: string): string =>
 		`[Heuristic Check] Blocked by deterministic high-risk rules: ${matchedPattern}. To request manual approval, retry the same tool call without changing its arguments.`,

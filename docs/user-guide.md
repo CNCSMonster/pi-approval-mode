@@ -19,12 +19,14 @@ pi install git:github.com/CNCSMonster/pi-approval-mode
 
 Update anytime with `pi update`. The plugin activates automatically — no core modification required.
 
-### 1.2 Your first run (`default` mode)
+### 1.2 Your first run (`auto` mode)
 
-On a fresh install the plugin starts in **`default`** (safe baseline) mode:
+On a fresh install the plugin starts in **`auto`** (classifier-driven) mode — the
+practical default for day-to-day work:
 
 - **Read-only tools** (`read` / `grep` / `find` / `ls`) inside your workspace are auto-approved — investigation flows without friction.
-- **File edits, file writes, and shell commands** each raise an approval dialog.
+- **Regular in-workspace edits** pass automatically; prompts still appear for **classifier-flagged shell commands, protected-path changes, out-of-workspace reads, and anything matching an `ask` rule**.
+- Prefer a confirmation for every change? Switch to **`manual`** with `/approval-mode manual` (§1.4).
 
 ### 1.3 The approval dialog
 
@@ -42,7 +44,7 @@ Options `2`–`4` write an `allow` rule at the corresponding tier, so the same a
 
 ### 1.4 Switching modes
 
-- **`Ctrl+Alt+A`** — cycle `default ➔ auto-edit ➔ auto ➔ yolo ➔ plan`;
+- **`Ctrl+Alt+A`** — cycle `manual ➔ auto-edit ➔ auto ➔ yolo ➔ plan`;
 - **`/approval-mode [mode]`** — jump directly to a mode (Tab-completed, e.g. `/approval-mode auto`).
 
 The current mode is always visible in the status bar (e.g. `[🤖 auto]`).
@@ -68,15 +70,15 @@ loop breaker ─▶ deny rules ─▶ ask rules ─▶ default rules / allow rul
 2. **`deny` rule** — silent hard block, no dialog, in every mode.
 3. **`ask` rule** — dialog is **forced**, overriding every auto-approve mode (including `yolo`).
 4. **`default` rule** — delegates the decision to the *mode funnel* (this is the "pay-as-you-go" verdict: without `default` rules, behavior matches the classic three-state design).
-5. **`allow` rule** — auto-approved in every mode.
+5. **`allow` rule** — auto-approved in every mode — **except in `auto`**: broad allow rules that would defeat the classifier (tool-level `Bash`, interpreter wildcards like `Bash(npx *)`) are temporarily stashed on entry and return when you leave `auto`.
 6. **Tool default layer** (read-family tools only, when no rule matched) — inside the workspace: auto-approved; outside the workspace (including `~` expansion): interactive confirmation **in every mode, `yolo` included**.
 7. **Mode funnel** — the per-mode behavior described by the matrix below.
 
 ### 2.2 The matrix
 
-Modes are columns; the state of the call is the row. `*`-marked cells are explained below the table.
+The five modes form an automation ramp — `manual → auto-edit → auto → yolo` (`plan` is orthogonal). Modes are columns; the state of the call is the row. `*`-marked cells are explained below the table.
 
-| Call | `default` | `auto-edit` | `auto` | `yolo` | `plan` |
+| Call | `manual` | `auto-edit` | `auto` | `yolo` | `plan` |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | `edit` / `write` — regular workspace file | 🛡️ prompt | ✅ auto | ✅ auto | ✅ auto | ⛔ blocked |
 | `edit` / `write` — **protected path** `*` | 🛡️ prompt | ✅ auto | 🤖 classifier → dialog `*` | ✅ auto | ⛔ blocked |
@@ -102,7 +104,7 @@ English denial message instead — the model is told why and how to proceed safe
 
 - `ask` rule → `[Permission: ask] Rule … requires interactive confirmation …`
 - classifier flag → `[Auto Mode] … blocked by the safety classifier …`
-- default-mode prompts → `[Default Mode] … no interactive UI …`
+- manual-mode prompts → `[Manual Mode] … no interactive UI …`
 - loop hard limit → `[Circuit Breaker] … do not retry …`
 
 In `auto` headless runs, a classifier *availability* problem silently falls back to the
@@ -282,7 +284,15 @@ repo from shipping `defaultMode: "yolo"` or `allow: ["Bash(*)"]`. Trust the proj
 Approval `2` (session) lives in memory only and ends with the session; `/reload` **preserves**
 session rules (and hot-reloads models). Use `3` (project) or `4` (user) for anything that
 should survive. When resuming an old session that was left in `yolo`, the plugin **downgrades
-to the safe baseline automatically** — pass `pi --yolo` explicitly if you really mean it.
+to the safe baseline (`auto`, or your configured `defaultMode`) automatically** — pass `pi --yolo` explicitly if you really mean it.
+
+### 5.6 Where did the `default` mode go?
+
+It was renamed to **`manual`** (v0.3.0). Once fresh sessions started in `auto`, the name
+`default` stopped being the default — and it collided with the rules' fourth-state verdict
+`default` (which is unchanged). Old values are accepted transparently: `defaultMode:
+"default"` in config, `--approval-mode default`, and old session states all map to
+`manual` automatically.
 
 ---
 
@@ -298,7 +308,8 @@ Layout:
 
 - `extensions/` — the plugin sources (`approval-mode.ts` is the entry registered in `package.json`);
 - `tests/` — the full suite (rule engine, disposition matrix, classifier projection,
-  shell analyzer, loop detector, policy consistency, trust gate, reload lifecycle);
+  shell analyzer, loop detector, policy consistency, trust gate, reload lifecycle,
+  dangerous-allow guard, mode aliasing);
 - `README.md` / `docs/user-guide.md` — **synced copies**; each carries a source comment
   pointing at the authoritative document, edit there, not here.
 
@@ -329,12 +340,13 @@ pi install git:github.com/CNCSMonster/pi-approval-mode
 
 随时 `pi update` 更新。插件自动激活，**零核心改动**。
 
-### 1.2 首次运行（`default` 模式）
+### 1.2 首次运行（`auto` 模式）
 
-全新安装后插件以 **`default`**（安全基线）模式启动：
+全新安装后插件以 **`auto`**（分类器驱动）模式启动——日常工作的实用默认：
 
 - 工作区内的**只读工具**（`read` / `grep` / `find` / `ls`）自动放行——排查问题零打扰；
-- **文件编辑、文件写入、Shell 命令**逐个弹出审批对话框。
+- **工作区内常规编辑**自动通过；弹窗仍会出现于**分类器拦截的 Shell 命令、受保护路径修改、工作区外读取，以及命中 `ask` 规则的操作**；
+- 想每笔变更都确认？`/approval-mode manual` 切换到 **`manual`**（§1.4）。
 
 ### 1.3 审批对话框
 
@@ -352,7 +364,7 @@ pi install git:github.com/CNCSMonster/pi-approval-mode
 
 ### 1.4 切换模式
 
-- **`Ctrl+Alt+A`** — 循环切换 `default ➔ auto-edit ➔ auto ➔ yolo ➔ plan`；
+- **`Ctrl+Alt+A`** — 循环切换 `manual ➔ auto-edit ➔ auto ➔ yolo ➔ plan`；
 - **`/approval-mode [mode]`** — 直达指定模式（支持 Tab 补全，如 `/approval-mode auto`）。
 
 当前模式常驻状态栏（如 `[🤖 auto]`）。
@@ -377,15 +389,15 @@ pi install git:github.com/CNCSMonster/pi-approval-mode
 2. **`deny` 规则** — 一切模式下静默硬阻断，不弹窗。
 3. **`ask` 规则** — **强制弹窗**，压倒一切免审模式（含 `yolo`）。
 4. **`default` 规则** — 把裁决交给*模式漏斗*（这就是"按需付费"裁决：不配 `default` 规则，行为与经典三态一致）。
-5. **`allow` 规则** — 一切模式下自动放行。
+5. **`allow` 规则** — 一切模式下自动放行——**`auto` 模式例外**：宽到足以绕过分类器的 allow 规则（工具级 `Bash`、解释器通配如 `Bash(npx *)`）进入 `auto` 时被暂存剥离，退出时归位。
 6. **工具默认权限层**（仅读类工具、未命中规则时）— 工作区内自动放行；工作区外（含 `~` 展开）**包括 `yolo` 在内的一切模式**都需人工确认。
 7. **模式漏斗** — 即下表所述的分模式行为。
 
 ### 2.2 行为矩阵
 
-行为是列、调用状态是行。带 `*` 的单元格见表下注释。
+五个模式构成自动化梯度——`manual → auto-edit → auto → yolo`（`plan` 正交）。模式是列、调用状态是行。带 `*` 的单元格见表下注释。
 
-| 调用 | `default` | `auto-edit` | `auto` | `yolo` | `plan` |
+| 调用 | `manual` | `auto-edit` | `auto` | `yolo` | `plan` |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | `edit` / `write` — 工作区常规文件 | 🛡️ 弹窗 | ✅ 自动 | ✅ 自动 | ✅ 自动 | ⛔ 阻断 |
 | `edit` / `write` — **受保护路径** `*` | 🛡️ 弹窗 | ✅ 自动 | 🤖 分类器 → 弹窗 `*` | ✅ 自动 | ⛔ 阻断 |
@@ -410,7 +422,7 @@ pi install git:github.com/CNCSMonster/pi-approval-mode
 
 - `ask` 规则 → `[Permission: ask] Rule … requires interactive confirmation …`
 - 分类器拦截 → `[Auto Mode] … blocked by the safety classifier …`
-- default 模式需人工 → `[Default Mode] … no interactive UI …`
+- manual 模式需人工 → `[Manual Mode] … no interactive UI …`
 - 死循环硬上限 → `[Circuit Breaker] … do not retry …`
 
 `auto` 无头运行中，分类器**不可用**时会静默回落到确定性启发式规则（失败安全：高危模式仍会拦截，见 §4.3）。
@@ -577,7 +589,11 @@ $$\text{Deny} > \text{Ask} > \text{Default} > \text{Allow}$$
 
 审批 `2`（会话级）只在内存里，随会话结束消失；`/reload` **会保留**会话级规则
 （并热载模型）。想留久用 `3`（项目级）或 `4`（用户级）。恢复遗留在 `yolo` 状态的旧会话时，
-插件会**自动降级回安全基线**——真要全自动请显式 `pi --yolo`。
+插件会**自动降级回安全基线（`auto`，或你配置的 `defaultMode`）**——真要全自动请显式 `pi --yolo`。
+
+### 5.6 `default` 模式哪去了？
+
+v0.3.0 起更名为 **`manual`**。新会话默认 `auto` 后，`default` 这个名字已名不副实，且与规则四态判定 `default`（语义不变）撞名。旧值透明兼容：配置里的 `defaultMode: "default"`、`--approval-mode default` 与历史会话状态都会自动映射为 `manual`。
 
 ---
 
@@ -593,7 +609,7 @@ npm test        # node --test --experimental-strip-types tests/*.ts —— 无�
 
 - `extensions/` — 插件源码（`approval-mode.ts` 是 `package.json` 注册的入口）；
 - `tests/` — 全量测试（规则引擎、处置矩阵、分类器投影、Shell 分析器、死循环检测、
-  策略一致性、信任闸、reload 生命周期）；
+  策略一致性、信任闸、reload 生命周期、危险 allow 护栏、模式别名）；
 - `README.md` / `docs/user-guide.md` — **同步副本**；文件头有指向权威文档的来源注释，
   改文档请去源头改。
 

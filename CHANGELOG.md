@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-30
+
+### 💥 Breaking Changes
+- **Renamed the `default` approval mode to `manual`**: CLI flag (`--approval-mode manual`), config (`defaultMode`), and `/approval-mode manual`. Old `default` values are accepted and mapped to `manual` transparently (config, CLI, session history); the rules' fourth-state verdict `default` is unchanged.
+
+### ✨ Features
+- **Sessions now start in `auto`** (classifier-driven) instead of the safe baseline; an explicit `defaultMode` still wins. The YOLO resume downgrade target is `auto`, or your configured `defaultMode`.
+- **`auto` guardrail**: broad allow rules that would defeat the classifier (tool-level `Bash`, dangerous bash interpreters like `Bash(npx *)`) are temporarily stashed while in `auto` and restored on exit; adding such a rule while already in `auto` stashes it immediately (aligned with Qwen Code `stripDangerousRulesForAutoMode`). Stashed rules are visible in `/approval-rules`.
+- Trust-gate regression coverage: an untrusted project's `defaultMode` (e.g. `"yolo"`) is blocked together with the whole project config file.
+
+### ⚙️ Changed
+- `loadApprovalConfig` extracted to the dependency-free `extensions/approval-config.ts` (pure module, injectable agent dir) so the config/trust-gate chain is unit-testable; `approval-mode.ts` re-exports the previous API.
+- Status badges and dialog titles: `[🛡️ manual]`, `Manual Mode`.
+
+### 🧪 Testing
+- +9 tests (78 total): mode aliasing, trust-gate `defaultMode` attack regression, dangerous-allow predicate/strip/restore/stash/persistence.
+
 ## [0.2.1] - 2026-09-29
 
 ### 📖 Documentation

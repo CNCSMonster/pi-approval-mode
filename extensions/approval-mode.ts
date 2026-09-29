@@ -29,7 +29,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolCallEventResult } from "@earendil-works/pi-coding-agent";
-import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth, visibleWidth, type AutocompleteItem } from "@earendil-works/pi-tui";
 
 import { analyzeShellCommand } from "./shell-analyzer.ts";
@@ -44,16 +44,23 @@ import {
 	type DecisionType,
 } from "./permission-engine.ts";
 import { LoopDetector, type LoopCheckResult } from "./loop-detector.ts";
-import { DenialTracker, DENIAL_MESSAGES, type DenialLimits } from "./denial-tracker.ts";
+import { DenialTracker, DENIAL_MESSAGES } from "./denial-tracker.ts";
 import { projectToolInput, buildTranscript } from "./classifier-projection.ts";
+import {
+	ALL_MODES,
+	normalizeMode,
+	loadApprovalConfig,
+	type ApprovalMode,
+	type ApprovalConfigFile,
+} from "./approval-config.ts";
 
-export type ApprovalMode = "default" | "auto-edit" | "auto" | "yolo" | "plan";
-
-const ALL_MODES: ApprovalMode[] = ["default", "auto-edit", "auto", "yolo", "plan"];
+// 对外 API 再导出（历史习惯从 approval-mode 取这些符号）
+export { ALL_MODES, normalizeMode, loadApprovalConfig };
+export type { ApprovalMode, ApprovalConfigFile };
 
 // 模式说明文案
 const MODE_DESCRIPTIONS: Record<ApprovalMode, string> = {
-	default: "🛡️ default - 标准确认模式（文件修改与 Shell 命令均需审批）",
+	manual: "🛡️ manual - 人审模式（文件修改与 Shell 命令均需人工审批）",
 	"auto-edit": "📝 auto-edit - 自动批准文件编辑（仅 Shell 命令需审批）",
 	auto: "🤖 auto - 智能分类器模式（双阶段 LLM 自动判定意图与风险）",
 	yolo: "⚡ yolo - 全自动模式（无条件直接执行所有工具）",
@@ -128,68 +135,8 @@ function formatDialogTitle(baseTitle: string, subType: string, loopCheck: LoopCh
 }
 
 // ==========================================
-// 配置文件格式定义 (~/.pi/agent/approval-config.json)
+// 配置文件格式与加载：见 ./approval-config.ts（纯模块，零 pi 依赖，可单测）
 // ==========================================
-
-export interface LoopDetectionConfig {
-	identicalThreshold?: number; // 连续同名同参熔断阈值（默认 3）
-	denialThreshold?: number; // 连续被拒熔断阈值（默认 3）
-	stagnationThreshold?: number; // 参数颠簸停滞熔断阈值（默认 6）
-}
-
-export interface ApprovalConfigFile {
-	classifierModel?: string; // 审批分类器模型，例如 "llm-proxy-openai-chat/gemini-3.8-flash-high-lp"
-	defaultMode?: ApprovalMode; // 默认启动模式，例如 "auto" 或 "default"
-	classifierTimeoutMs?: number; // 分类器超时毫秒数 (默认 1500ms)
-	loopDetection?: LoopDetectionConfig; // 死循环与连续失败统计熔断阈值用户偏好配置
-	denialLimits?: Partial<DenialLimits>; // 无头拦截与连续失败阈值 (对齐 Qwen Code)
-	headlessAbortOnDenialCap?: boolean; // 达到累计拦截上限时是否附带 terminate: true 终止无头任务
-	comment?: string;
-}
-
-export interface LoadApprovalConfigResult {
-	config: ApprovalConfigFile;
-	projectConfigFound: boolean;
-	projectConfigBlocked: boolean;
-}
-
-/**
- * 加载配置文件（工作区 .pi/approval-config.json 需经信任闸核验后方可覆盖全局配置）
- */
-function loadApprovalConfig(cwd: string, isTrusted = true): LoadApprovalConfigResult {
-	let config: ApprovalConfigFile = {};
-	let projectConfigFound = false;
-	let projectConfigBlocked = false;
-
-	// 1. 全局配置
-	const globalConfigPath = join(getAgentDir(), "approval-config.json");
-	if (existsSync(globalConfigPath)) {
-		try {
-			const data = JSON.parse(readFileSync(globalConfigPath, "utf-8"));
-			config = { ...config, ...data };
-		} catch {
-			// ignore
-		}
-	}
-
-	// 2. 项目工作区配置覆盖（经信任闸核验）
-	const projectConfigPath = join(cwd, CONFIG_DIR_NAME, "approval-config.json");
-	if (existsSync(projectConfigPath)) {
-		projectConfigFound = true;
-		if (isTrusted) {
-			try {
-				const data = JSON.parse(readFileSync(projectConfigPath, "utf-8"));
-				config = { ...config, ...data };
-			} catch {
-				// ignore
-			}
-		} else {
-			projectConfigBlocked = true;
-		}
-	}
-
-	return { config, projectConfigFound, projectConfigBlocked };
-}
 
 /**
  * 将配置持久化保存到全局文件
@@ -256,7 +203,7 @@ function withTimeout<T>(promise: Promise<T>, ms: number, onTimeoutValue: T): Pro
 }
 
 export default function approvalModeExtension(pi: ExtensionAPI): void {
-	let currentMode: ApprovalMode = "default";
+	let currentMode: ApprovalMode = "auto";
 	let toolsBeforePlanMode: string[] | undefined;
 	let customClassifierModel: string | undefined;
 	let classifierTimeoutMs = 1500;
@@ -291,7 +238,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 	function updateStatus(ctx: ExtensionContext): void {
 		const theme = ctx.ui.theme;
 		const badges: Record<ApprovalMode, string> = {
-			default: theme.fg("success", "🛡️ default"),
+			manual: theme.fg("success", "🛡️ manual"),
 			"auto-edit": theme.fg("accent", "📝 auto-edit"),
 			auto: theme.fg("borderAccent", "🤖 auto"),
 			yolo: theme.fg("error", "⚡ yolo"),
@@ -321,10 +268,25 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 	function switchMode(newMode: ApprovalMode, ctx: ExtensionContext, silent = false): void {
 		if (newMode === currentMode) return;
 
+		const prevMode = currentMode;
 		currentMode = newMode;
 
 		loopDetector.reset();
 		applyModeTools(newMode);
+
+		// auto 护栏：进入 auto 暂存危险 allow 规则，离开 auto 恢复
+		if (newMode === "auto") {
+			const stripped = permissionManager?.stripDangerousAllowRulesForAuto() ?? [];
+			if (stripped.length > 0 && !silent) {
+				ctx.ui.notify(
+					`⚠️ auto 模式已暂存 ${stripped.length} 条过宽 allow 规则（如 ${stripped[0]}），期间由分类器统一研判；退出 auto 自动恢复。`,
+					"warning",
+				);
+			}
+		} else if (prevMode === "auto") {
+			permissionManager?.restoreDangerousAllowRules();
+		}
+
 		updateStatus(ctx);
 
 		if (!silent) {
@@ -366,7 +328,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		}
 
 		// 读取配置文件（过信任闸）
-		const { config: fileConfig, projectConfigBlocked } = loadApprovalConfig(ctx.cwd, isTrusted);
+		const { config: fileConfig, projectConfigBlocked } = loadApprovalConfig(ctx.cwd, isTrusted, getAgentDir());
 		const projectRulesBlocked = permissionManager.isProjectRulesBlocked();
 
 		// 若当前项目未受信任且携带项目级配置或规则，发出明确安全告警
@@ -392,11 +354,8 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 			});
 		}
 
-		// 基线默认模式
-		const baselineMode: ApprovalMode =
-			fileConfig.defaultMode && ALL_MODES.includes(fileConfig.defaultMode)
-				? fileConfig.defaultMode
-				: "default";
+		// 基线默认模式（内置回退 auto；旧配置值 default 经别名映射为 manual）
+		const baselineMode: ApprovalMode = normalizeMode(fileConfig.defaultMode) ?? "auto";
 
 		// 检查会话历史（针对 pi -c / pi -r 恢复旧会话场景）
 		let historicalMode: ApprovalMode | undefined;
@@ -405,8 +364,9 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 			for (const entry of branch) {
 				if (entry.type === "custom" && entry.customType === "approval-mode-state") {
 					const data = entry.data as { mode?: ApprovalMode } | undefined;
-					if (data?.mode && ALL_MODES.includes(data.mode)) {
-						historicalMode = data.mode;
+					const normalizedHistory = normalizeMode(data?.mode);
+					if (normalizedHistory) {
+						historicalMode = normalizedHistory;
 					}
 				}
 			}
@@ -433,8 +393,8 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		if (pi.getFlag("yolo")) {
 			currentMode = "yolo";
 		} else {
-			const flagMode = pi.getFlag("approval-mode") as ApprovalMode | undefined;
-			if (flagMode && ALL_MODES.includes(flagMode)) {
+			const flagMode = normalizeMode(pi.getFlag("approval-mode"));
+			if (flagMode) {
 				currentMode = flagMode;
 			}
 		}
@@ -446,6 +406,19 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 
 		applyModeTools(currentMode);
 		updateStatus(ctx);
+
+		// auto 护栏：进入 auto 即暂存宽到足以绕过分类器的危险 allow 规则；否则恢复暂存
+		if (currentMode === "auto") {
+			const stripped = permissionManager.stripDangerousAllowRulesForAuto();
+			if (stripped.length > 0) {
+				ctx.ui.notify(
+					`⚠️ auto 模式已暂存 ${stripped.length} 条过宽 allow 规则（如 ${stripped[0]}），期间由分类器统一研判；退出 auto 自动恢复。`,
+					"warning",
+				);
+			}
+		} else {
+			permissionManager.restoreDangerousAllowRules();
+		}
 
 		// 若本次为 /reload 触发，且处于交互 UI 界面下，输出状态就绪摘要与模型解析告警
 		if (isReload && ctx.hasUI) {
@@ -475,8 +448,8 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 
 	// 3. 注册命令：/approval-mode
 	const modeCommandHandler = async (args: string | undefined, ctx: ExtensionContext) => {
-		const inputMode = args?.trim().toLowerCase() as ApprovalMode;
-		if (inputMode && ALL_MODES.includes(inputMode)) {
+		const inputMode = normalizeMode(args?.trim().toLowerCase());
+		if (inputMode) {
 			switchMode(inputMode, ctx);
 			return;
 		}
@@ -505,7 +478,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 
 	// 审批模式参数补全提示（输入 /approval-mode 后按 Tab 显示可选模式）
 	const MODE_SHORT_DESCRIPTIONS: Record<ApprovalMode, string> = {
-		default: "标准确认模式（文件修改与 Shell 命令均需审批）",
+		manual: "人审模式（文件修改与 Shell 命令均需人工审批）",
 		"auto-edit": "自动批准文件编辑（仅 Shell 命令需审批）",
 		auto: "智能分类器模式（双阶段 LLM 自动判定风险）",
 		yolo: "全自动模式（无条件直接执行所有工具）",
@@ -525,7 +498,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 	}
 
 	pi.registerCommand("approval-mode", {
-		description: "查看或切换审批模式 (default, auto-edit, auto, yolo, plan)",
+		description: "查看或切换审批模式 (manual, auto-edit, auto, yolo, plan)",
 		getArgumentCompletions: getModeCompletions,
 		handler: modeCommandHandler,
 	});
@@ -596,11 +569,19 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 				return [title, items.length > 0 ? items.join("\n") : "  (无)"].join("\n");
 			};
 
+			const stashed = permissionManager.getStashedAllowRules();
 			const report = [
 				`📋 [Qwen Code 风格工具权限规则概览]`,
 				formatRules(`• 会话级规则 (Session)`, session, "session"),
 				formatRules(`• 项目级规则 (Project: .pi/approval-rules.json)`, project, "project"),
 				formatRules(`• 全局用户级规则 (Global: ~/.pi/agent/approval-rules.json)`, user, "user"),
+				...(stashed.length > 0
+					? [
+							`• ⏸️ auto 暂存的危险 allow 规则（退出 auto 自动恢复）:\n${stashed
+								.map((s) => `  ⏸️ allow[${s.scope}]: ${s.rule}`)
+								.join("\n")}`,
+					  ]
+					: []),
 			].join("\n\n");
 
 			ctx.ui.notify(report, "info");
@@ -1045,8 +1026,11 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 				const res = permissionManager.addRule("allow", dslRule, "session");
 				if (res.warning) {
 					ctx.ui.notify(res.warning, "warning");
+				} else if (res.stashed) {
+					ctx.ui.notify(`⚠️ auto 模式下该 allow 规则过于宽泛，已暂存不生效（退出 auto 自动恢复）: ${dslRule}`, "warning");
+				} else {
+					ctx.ui.notify(`已加入会话免审白名单: ${dslRule}`, "info");
 				}
-				ctx.ui.notify(`已加入会话免审白名单: ${dslRule}`, "info");
 				return allowCall(toolName, input);
 			}
 
@@ -1054,6 +1038,8 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 				const res = permissionManager.addRule("allow", dslRule, "project");
 				if (res.warning) {
 					ctx.ui.notify(res.warning, "warning");
+				} else if (res.stashed) {
+					ctx.ui.notify(`⚠️ auto 模式下该 allow 规则过于宽泛，已暂存不生效（退出 auto 自动恢复）: ${dslRule}`, "warning");
 				} else {
 					ctx.ui.notify(`已加入项目级免审白名单: ${dslRule} (.pi/approval-rules.json)`, "info");
 				}
@@ -1064,8 +1050,11 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 				const res = permissionManager.addRule("allow", dslRule, "user");
 				if (res.warning) {
 					ctx.ui.notify(res.warning, "warning");
+				} else if (res.stashed) {
+					ctx.ui.notify(`⚠️ auto 模式下该 allow 规则过于宽泛，已暂存不生效（退出 auto 自动恢复）: ${dslRule}`, "warning");
+				} else {
+					ctx.ui.notify(`已加入全局用户级免审白名单: ${dslRule} (~/.pi/agent/approval-rules.json)`, "info");
 				}
-				ctx.ui.notify(`已加入全局用户级免审白名单: ${dslRule} (~/.pi/agent/approval-rules.json)`, "info");
 				return allowCall(toolName, input);
 			}
 
@@ -1296,7 +1285,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 					input,
 					currentMode === "auto-edit"
 						? DENIAL_MESSAGES.autoEditReadHeadless(label)
-						: DENIAL_MESSAGES.defaultReadHeadless(label),
+						: DENIAL_MESSAGES.manualReadHeadless(label),
 				);
 			}
 
@@ -1310,7 +1299,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 				ctx,
 				currentMode === "auto-edit"
 					? formatDialogTitle("📝 [读取审批 (auto-edit)]", "读取", loopCheck)
-					: formatDialogTitle("🛡️ [读取审批 (default)]", "读取", loopCheck),
+					: formatDialogTitle("🛡️ [读取审批 (manual)]", "读取", loopCheck),
 				readDialog,
 				loopCheck.isLoop,
 			);
@@ -1494,8 +1483,8 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 			return allowCall(toolName, input);
 		}
 
-		// 5) default 模式：文件修改与 bash 均需审批
-		if (currentMode === "default") {
+		// 5) manual 模式：文件修改与 bash 均需审批
+		if (currentMode === "manual") {
 			// 文件局部修改审批 (edit)
 			if (toolName === "edit") {
 				const filePath = (input.path || "未知文件").replace(/\\/g, "/");
@@ -1506,7 +1495,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 					return blockCall(
 						toolName,
 						input,
-						DENIAL_MESSAGES.defaultEditHeadless(relPath),
+						DENIAL_MESSAGES.manualEditHeadless(relPath),
 					);
 				}
 
@@ -1538,7 +1527,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 					return blockCall(
 						toolName,
 						input,
-						DENIAL_MESSAGES.defaultWriteHeadless(relPath),
+						DENIAL_MESSAGES.manualWriteHeadless(relPath),
 					);
 				}
 
@@ -1569,7 +1558,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 					return blockCall(
 						toolName,
 						input,
-						DENIAL_MESSAGES.defaultBashHeadless(cmd),
+						DENIAL_MESSAGES.manualBashHeadless(cmd),
 					);
 				}
 
@@ -1581,7 +1570,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 
 				const action = await promptApprovalDialog(
 					ctx,
-					formatDialogTitle("🛡️ [Shell 命令执行审批 (default)]", "Shell 命令", loopCheck),
+					formatDialogTitle("🛡️ [Shell 命令执行审批 (manual)]", "Shell 命令", loopCheck),
 					dialogDetails,
 					loopCheck.isLoop,
 				);

@@ -323,6 +323,8 @@ export function matchesParsedRule(rule: ParsedRule, ctx: RuleMatchContext): bool
 
 export interface ConflictCheckResult {
 	hasConflict: boolean;
+	/** auto 模式不变量：危险 allow 规则在暂存态下被拦截入暂存池（不激活、不参与匹配）。 */
+	stashed?: boolean;
 	shadowedBy?: {
 		scope: "session" | "project" | "user";
 		verdict: "deny" | "ask" | "default";
@@ -388,6 +390,8 @@ export class PermissionManager {
 	private sessionRules: PermissionRules = { allow: [], ask: [], deny: [], default: [] };
 	private projectRules: PermissionRules = { allow: [], ask: [], deny: [], default: [] };
 	private userRules: PermissionRules = { allow: [], ask: [], deny: [], default: [] };
+	/** auto 模式下暂存的危险 allow 规则（null = 未处于暂存态）。运行时专用：磁盘规则文件保留这些规则，退出 auto 恢复。 */
+	private strippedAllowRules: Array<{ scope: "session" | "project" | "user"; rule: string }> | null = null;
 
 	constructor(cwd: string, userDir?: string, initialSessionRules?: PermissionRules, isTrusted = true) {
 		this.cwd = cwd;
@@ -449,10 +453,16 @@ export class PermissionManager {
 	}
 
 	public clearSessionRules(): void {
+		if (this.strippedAllowRules) {
+			this.strippedAllowRules = this.strippedAllowRules.filter((s) => s.scope !== "session");
+		}
 		this.sessionRules = { allow: [], ask: [], deny: [], default: [] };
 	}
 
 	public clearProjectRules(): void {
+		if (this.strippedAllowRules) {
+			this.strippedAllowRules = this.strippedAllowRules.filter((s) => s.scope !== "project");
+		}
 		this.projectRules = { allow: [], ask: [], deny: [], default: [] };
 		if (this.isTrusted) {
 			this.saveRulesToFile(join(this.cwd, ".pi", "approval-rules.json"), this.projectRules);
@@ -460,8 +470,72 @@ export class PermissionManager {
 	}
 
 	public clearUserRules(): void {
+		if (this.strippedAllowRules) {
+			this.strippedAllowRules = this.strippedAllowRules.filter((s) => s.scope !== "user");
+		}
 		this.userRules = { allow: [], ask: [], deny: [], default: [] };
 		this.saveRulesToFile(join(this.userDir, "approval-rules.json"), this.userRules);
+	}
+
+	// ==============================================================
+	// AUTO 模式危险 allow 规则暂存
+	// （对齐 qwen-code stripDangerousRulesForAutoMode 语义：
+	//   进入 auto 剥离、退出恢复、暂存态新增同拦、运行时专用不改磁盘意图）
+	// ==============================================================
+
+	/** 返回当前暂存的危险 allow 规则快照（供 /approval-rules 展示）。 */
+	public getStashedAllowRules(): Array<{ scope: "session" | "project" | "user"; rule: string }> {
+		return this.strippedAllowRules ? [...this.strippedAllowRules] : [];
+	}
+
+	/**
+	 * 进入 auto：把宽到足以绕过分类器的 allow 规则移出工作池暂存。幂等。
+	 * @returns 本次被暂存的规则清单（已处于暂存态时为空数组）
+	 */
+	public stripDangerousAllowRulesForAuto(): string[] {
+		if (this.strippedAllowRules) return [];
+		this.strippedAllowRules = [];
+		const stripped: string[] = [];
+		const scopes: Array<{ scope: "session" | "project" | "user"; rules: PermissionRules }> = [
+			{ scope: "session", rules: this.sessionRules },
+			{ scope: "project", rules: this.projectRules },
+			{ scope: "user", rules: this.userRules },
+		];
+		for (const { scope, rules } of scopes) {
+			const moved = rules.allow.filter((r) => isDangerousAllowRule(r));
+			if (moved.length === 0) continue;
+			rules.allow = rules.allow.filter((r) => !isDangerousAllowRule(r));
+			for (const rule of moved) {
+				this.strippedAllowRules.push({ scope, rule });
+				stripped.push(rule);
+			}
+		}
+		return stripped;
+	}
+
+	/** 退出 auto：暂存的危险 allow 规则原样归位（磁盘文件本就保留，仅内存态恢复）。 */
+	public restoreDangerousAllowRules(): void {
+		if (!this.strippedAllowRules) return;
+		for (const { scope, rule } of this.strippedAllowRules) {
+			const target =
+				scope === "session" ? this.sessionRules : scope === "project" ? this.projectRules : this.userRules;
+			if (!target.allow.includes(rule)) target.allow.push(rule);
+		}
+		this.strippedAllowRules = null;
+	}
+
+	/** 持久化某层规则：磁盘 = 内存工作池 + 该层暂存规则（保证暂存规则不被后续写入冲掉）。 */
+	private persistRules(scope: "project" | "user"): void {
+		const base = scope === "project" ? this.projectRules : this.userRules;
+		const stashedForScope = (this.strippedAllowRules ?? [])
+			.filter((s) => s.scope === scope && !base.allow.includes(s.rule))
+			.map((s) => s.rule);
+		const next: PermissionRules = stashedForScope.length
+			? { ...base, allow: [...base.allow, ...stashedForScope] }
+			: base;
+		const filePath =
+			scope === "project" ? join(this.cwd, ".pi", "approval-rules.json") : join(this.userDir, "approval-rules.json");
+		this.saveRulesToFile(filePath, next);
 	}
 
 	/**
@@ -556,6 +630,15 @@ export class PermissionManager {
 			};
 		}
 
+		// auto 模式不变量：暂存态下新增的危险 allow 规则入暂存池，不激活。
+		// 持久层（project/user）磁盘照常写入（persistRules 合成暂存），退出 auto 恢复。
+		if (type === "allow" && this.strippedAllowRules !== null && isDangerousAllowRule(trimmed)) {
+			this.strippedAllowRules.push({ scope, rule: trimmed });
+			if (scope === "project") this.persistRules("project");
+			if (scope === "user") this.persistRules("user");
+			return { hasConflict: false, stashed: true };
+		}
+
 		const conflict = this.checkConflict(type, trimmed, scope);
 
 		if (scope === "session") {
@@ -565,12 +648,12 @@ export class PermissionManager {
 		} else if (scope === "project") {
 			if (!this.projectRules[type].includes(trimmed)) {
 				this.projectRules[type].push(trimmed);
-				this.saveRulesToFile(join(this.cwd, ".pi", "approval-rules.json"), this.projectRules);
+				this.persistRules("project");
 			}
 		} else if (scope === "user") {
 			if (!this.userRules[type].includes(trimmed)) {
 				this.userRules[type].push(trimmed);
-				this.saveRulesToFile(join(this.userDir, "approval-rules.json"), this.userRules);
+				this.persistRules("user");
 			}
 		}
 
@@ -717,7 +800,7 @@ export type ModeFunnelDisposition = "allow" | "classifier" | "prompt";
  * | yolo           | 放行                                    |
  * | plan           | 放行（plan 只读语义）                   |
  * | auto           | classifier（交互不通过转人工、非交互拒绝）|
- * | auto-edit / default | 人工确认                            |
+ * | auto-edit / manual | 人工确认                           |
  *
  * 纯函数，独立于 pi 运行时，便于单测验收处置矩阵。
  */
@@ -731,6 +814,90 @@ export function resolveReadDisposition(mode: string): ModeFunnelDisposition {
 		default:
 			return "prompt";
 	}
+}
+
+// ==============================================================
+// AUTO 模式危险 allow 判据
+// （对齐 qwen-code dangerousRules.ts：解释器裸规则/通配规则会绕过分类器；
+//   具体命令如 `Bash(npm test)` 是用户明确信任的，不剥离）
+// ==============================================================
+
+/** 裸首命令即任意代码执行入口的 token 集（Unix/Windows shell、脚本解释器、
+ * 构建/包工具、包运行器、远程 shell、eval 类）。对齐 qwen-code 同名清单。 */
+const DANGEROUS_BASH_INTERPRETERS: readonly string[] = Object.freeze([
+	"bash", "sh", "zsh", "fish", "csh", "tcsh", "dash", "ksh",
+	"cmd", "pwsh", "powershell",
+	"python", "python3", "python2", "node", "deno", "tsx", "bun", "ruby", "perl", "php", "lua",
+	"julia", "r", "rscript", "groovy", "awk", "gawk",
+	"cargo", "npm", "pnpm", "yarn", "make", "gmake", "gradle", "mvn", "rake", "task", "just", "go",
+	"npx", "bunx", "pnpx", "uvx", "pipx", "dlx",
+	"ssh", "eval", "exec", "source",
+]);
+
+function stripExeSuffix(token: string): string {
+	return token.endsWith(".exe") ? token.slice(0, -".exe".length) : token;
+}
+
+function matcherColonIndex(content: string): number {
+	const firstColon = content.indexOf(":");
+	if (firstColon < 0) return -1;
+	if (/^[a-z]:[\\/]/i.test(content)) return content.indexOf(":", 2);
+	return firstColon;
+}
+
+function leadingCommandToken(content: string): string {
+	if (/^[a-z]:[\\/]/i.test(content)) {
+		const exeIndex = content.indexOf(".exe");
+		if (exeIndex >= 0) return content.slice(0, exeIndex + ".exe".length);
+	}
+	return content.split(/\s/)[0] ?? "";
+}
+
+/** 首命令 token 是否解释器（支持裸名、绝对路径、尾通配、冒号、 .exe 后缀）。 */
+function isInterpreterToken(rawToken: string): boolean {
+	if (!rawToken) return false;
+	let end = rawToken.length;
+	while (end > 0 && rawToken.charCodeAt(end - 1) === 42 /* '*' */) end--;
+	const noWildcard = rawToken.slice(0, end);
+	const colonIndex = matcherColonIndex(noWildcard);
+	const beforeColon = colonIndex >= 0 ? noWildcard.slice(0, colonIndex) : noWildcard;
+	const lastSegment = beforeColon.split(/[\\/]/).pop() ?? "";
+	const normalizedSegment = stripExeSuffix(lastSegment);
+	return DANGEROUS_BASH_INTERPRETERS.some((i) => stripExeSuffix(i) === normalizedSegment);
+}
+
+/**
+ * 判定一条 allow 规则是否宽到足以绕过 auto 分类器：
+ * - shell 族工具（bash / run_shell_command / monitor，含 Bash 宏展开）：
+ *   裸规则、`*`、解释器裸名、解释器×任意通配（`python *`、`npx *`、`/usr/bin/python3 *`）→ 危险；
+ * - 具体命令（`Bash(git status)`、`Bash(npm test)`、`Bash(python script.py)`）→ 用户明确信任，不剥离；
+ * - 非 shell 族（Read/Edit 等）→ 本判据不适用，返回 false。
+ *
+ * 注：qwen-code 同源清单还含 Agent/Skill 工具类（子代理/技能执行绕过分类器），
+ * pi 工具集无对应项，待 pi 出现同类工具时再行对齐（见 task 记录）。
+ */
+export function isDangerousAllowRule(ruleStr: string): boolean {
+	const parsed = parseDslRule(ruleStr);
+	const tools = expandToolNames(parsed.toolName);
+	const isShellLike = tools.some((t) => t === "bash" || t === "run_shell_command" || t === "monitor");
+	if (!isShellLike) return false;
+
+	if (!parsed.specifier) return true;
+	const content = parsed.specifier.trim().toLowerCase();
+	if (content === "" || content === "*") return true;
+
+	const firstToken = leadingCommandToken(content);
+	if (!isInterpreterToken(firstToken)) return false;
+
+	// 解释器裸名（`Bash(python)`）→ 危险
+	if (firstToken === content && matcherColonIndex(content) < 0) return true;
+	// 解释器 × 任意通配（`python *`、`node -e *`、`npx *`）→ 危险
+	if (content.includes("*")) return true;
+	// 冒号匹配器形式：仅空后缀（`python:`）危险，具体子命令不剥离
+	const colonIndex = matcherColonIndex(content);
+	if (colonIndex >= 0) return content.slice(colonIndex + 1).trim() === "";
+	// 多词具体命令（`npm test`、`python script.py`）→ 具体信任，不剥离
+	return false;
 }
 
 /** 展开路径中的 `~` / `~/`（规则与目标两侧统一使用，保证往返匹配）。 */

@@ -118,8 +118,8 @@ test("DENIAL_MESSAGES - 英文文案标准化与全场景覆盖", () => {
 	const autoEdit = DENIAL_MESSAGES.autoEditHeadless("cargo build");
 	assert.match(autoEdit, /\[Auto-edit Mode\] Shell execution requires approval/i);
 
-	const defaultBash = DENIAL_MESSAGES.defaultBashHeadless("git push");
-	assert.match(defaultBash, /\[Default Mode\] Shell execution requires approval/i);
+	const manualBash = DENIAL_MESSAGES.manualBashHeadless("git push");
+	assert.match(manualBash, /\[Manual Mode\] Shell execution requires approval/i);
 
 	const planEdit = DENIAL_MESSAGES.planModeToolDisabled("edit");
 	assert.match(planEdit, /Plan mode is read-only: the "edit" tool is disabled/i);

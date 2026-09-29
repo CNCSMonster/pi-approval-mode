@@ -10,7 +10,7 @@ English | [中文文档](#中文文档)
 
 ## 🌟 Highlights
 
-- **5 Approval Modes**: `default`, `auto-edit`, `auto`, `yolo`, and `plan`.
+- **5 Approval Modes**: `manual`, `auto-edit`, `auto`, `yolo`, and `plan` — fresh sessions start in **`auto`** (classifier-driven), changeable anytime.
 - **Four-State Permission Rules (`deny` > `ask` > `default` > `allow`)**:
   - **`deny`**: Hard blocking at runtime without modal prompt; takes precedence over everything.
   - **`ask`**: Enforces interactive confirmation modal, overriding auto-approval modes.
@@ -41,7 +41,7 @@ English | [中文文档](#中文文档)
 - **Safe Session Resume (`pi -c`) & Ghost Privilege Escalation Defense**:
   - **CLI Wins**: Explicit `--approval-mode` or `--yolo` always takes precedence.
   - **YOLO Safe Downgrade**: If resumed session or reload was left in YOLO mode, automatically downgrades to safe baseline mode to prevent accidental destruction.
-  - **Workflow Preservation**: Safely preserves `plan`, `auto`, `auto-edit`, or `default`.
+  - **Workflow Preservation**: Safely preserves `plan`, `auto`, `auto-edit`, or `manual`.
 - **Zero Core Changes**: Pure Pi extension packaged according to the official Pi Package specifications.
 
 ---
@@ -65,9 +65,9 @@ pi update
 
 | Mode | Status Badge | Description |
 | :--- | :--- | :--- |
-| **`default`** | `[🛡️ default]` | **Safe baseline**. Edits, writes, and shell commands require approval. Read-only tools are auto-approved. |
+| **`manual`** | `[🛡️ manual]` | **Human review**. Edits, writes, and shell commands each require explicit approval. Read-only tools are auto-approved. |
 | **`auto-edit`** | `[📝 auto-edit]` | Auto-approves file edits; only shell commands (`bash`) require confirmation. |
-| **`auto`** | `[🤖 auto]` | **Classifier-driven**. 3-layer filter funnel + 2-stage LLM classifier. Safe operations proceed seamlessly; risky operations are reviewed. |
+| **`auto`** | `[🤖 auto]` | **Classifier-driven** (the startup default). 3-layer filter funnel + 2-stage LLM classifier. Safe operations proceed seamlessly; risky operations are reviewed. Broad allow rules that would defeat the classifier are temporarily stashed while in this mode. |
 | **`yolo`** | `[⚡ yolo]` | **Autonomous**. All tool calls execute without prompts (Pi core default). |
 | **`plan`** | `[📋 plan]` | **Read-only planning**. Disables `edit` and `write`; limits shell to read-only commands; injects planning instructions. |
 
@@ -154,7 +154,7 @@ $$\text{Deny} > \text{Ask} > \text{Default} > \text{Allow}$$
 - **`/reload` Session Rule Preservation & Model Hot-Reload**:
   - Running Pi's `/reload` **preserves in-memory session-level approvals** (temporary authorizations from modals survive the reload) and **hot-reloads the model registry**, so a classifier model written to `models.json` or `approval-config.json` takes effect without restarting Pi. A clear status summary is shown when the reload completes.
 - **YOLO Safe Downgrade (Ghost Privilege Escalation Defense)**:
-  - When reloading (`/reload`) or resuming a session (`pi -c` / `pi -r`), if the resumed session was previously in `yolo` mode, it is **automatically downgraded to the safe baseline mode** (`default` or your configured `defaultMode`) with a warning notification.
+  - When reloading (`/reload`) or resuming a session (`pi -c` / `pi -r`), if the resumed session was previously in `yolo` mode, it is **automatically downgraded to the safe baseline mode** (`auto`, or your configured `defaultMode`) with a warning notification.
   - This prevents accidental damage from unintended commands executing autonomously after session re-attachment.
   - Other workflow modes (`plan`, `auto`, `auto-edit`) are faithfully preserved.
   - To force YOLO mode across starts, explicitly pass `pi --yolo` (CLI flags hold absolute highest precedence).
@@ -168,7 +168,7 @@ $$\text{Deny} > \text{Ask} > \text{Default} > \text{Allow}$$
 
 ## ⌨️ Shortcuts & Commands
 
-- **`Ctrl+Alt+A`**: Cycle through modes (`default` ➔ `auto-edit` ➔ `auto` ➔ `yolo` ➔ `plan`).
+- **`Ctrl+Alt+A`**: Cycle through modes (`manual` ➔ `auto-edit` ➔ `auto` ➔ `yolo` ➔ `plan`).
 - **`/approval-mode [mode]`**: Switch approval mode.
 - **`/classifier-model [provider/model]`**: View or configure classifier model.
 - **`/approval-rules [list|clear]`**: View or clear permission rules.
@@ -195,7 +195,7 @@ English | [中文文档](#中文文档)
 
 ## 🌟 核心能力
 
-1. **五大运行模式**：`default`（标准）、`auto-edit`（免审编辑）、`auto`（智能两阶段分类）、`yolo`（全自动）、`plan`（只读规划）。
+1. **五大运行模式**：`manual`（人审）、`auto-edit`（免审编辑）、`auto`（智能两阶段分类，**新会话默认**）、`yolo`（全自动）、`plan`（只读规划）。
 2. **Qwen Code 风格四态权限预设 (`deny` > `ask` > `default` > `allow`)**：
    - `deny`：运行时硬阻断、不弹窗，压倒一切；
    - `ask`：强制人工确认弹窗，压倒一切免审模式；
@@ -223,7 +223,7 @@ English | [中文文档](#中文文档)
 7. **安全会话恢复 (`pi -c`) 与防幽灵提权**：
    - **CLI 最高优先级**：显式 `--approval-mode` 或 `--yolo` 始终压倒一切；
    - **YOLO 安全降级**：恢复的会话或重载遗留在 YOLO 状态时，自动降级回安全基线，防止误执行破坏性命令；
-   - **工作流保持**：`plan`、`auto`、`auto-edit`、`default` 在恢复/重载后原样保持。
+   - **工作流保持**：`plan`、`auto`、`auto-edit`、`manual` 在恢复/重载后原样保持。
 8. **零核心改动**：按官方 Pi Package 规范打包的纯扩展。
 
 ---
@@ -246,9 +246,9 @@ pi update
 
 | 模式 | 状态徽标 | 说明 |
 | :--- | :--- | :--- |
-| **`default`** | `[🛡️ default]` | **安全基线**。编辑、写入与 Shell 命令需审批；只读工具自动放行。 |
+| **`manual`** | `[🛡️ manual]` | **人审模式**。编辑、写入与 Shell 命令逐个需人工审批；只读工具自动放行。 |
 | **`auto-edit`** | `[📝 auto-edit]` | 文件编辑自动放行；仅 Shell 命令（`bash`）需确认。 |
-| **`auto`** | `[🤖 auto]` | **分类器驱动**。三层过滤漏斗 + 两阶段 LLM 分类器：安全操作无感放行，风险操作研判确认。 |
+| **`auto`** | `[🤖 auto]` | **分类器驱动（新会话默认）**。三层过滤漏斗 + 两阶段 LLM 分类器：安全操作无感放行，风险操作研判确认；进入该模式时，宽到足以绕过分类器的 allow 规则会被**暂存剥离**（退出恢复）。 |
 | **`yolo`** | `[⚡ yolo]` | **全自动**。所有工具调用免弹窗直接执行（Pi 内核默认）。 |
 | **`plan`** | `[📋 plan]** | **只读规划**。禁用 `edit` 与 `write`；Shell 仅限只读命令；注入规划指令。 |
 
@@ -335,7 +335,7 @@ $$\text{Deny} > \text{Ask} > \text{Default} > \text{Allow}$$
 - **`/reload` 会话规则保留与模型热载**：
   - 在 Pi 内部执行 `/reload` 时，**内存态会话级临时授权被完整保留**（弹窗产生的临时放行不因重载丢失），同时**模型注册表就地热载**——刚写入 `models.json` 或 `approval-config.json` 的分类器模型无需重启即可生效，重载完成后弹出清晰的状态摘要。
 - **YOLO 安全降级（防幽灵提权）**：
-  - 当通过 `/reload` 重载或通过 `pi -c` / `pi -r` 恢复历史会话时，如果遗留在 `yolo`（全自动免审）状态，插件将**强制自动重置为安全基线模式**（`default` 或配置的 `defaultMode`），并发出警示通知。
+  - 当通过 `/reload` 重载或通过 `pi -c` / `pi -r` 恢复历史会话时，如果遗留在 `yolo`（全自动免审）状态，插件将**强制自动重置为安全基线模式**（`auto` 或配置的 `defaultMode`），并发出警示通知。
   - 该设计防止恢复历史会话或重载时，因忘记先前的 YOLO 状态而导致 Agent 在无提示下误执行高危破坏性指令。
   - `plan`、`auto`、`auto-edit` 等工作流模式在重载或恢复时均会无缝保持。
   - 若启动时确需全自动执行，请显式使用命令行参数 `pi --yolo`（CLI 旗标享有绝对最高裁决权）。
@@ -349,7 +349,7 @@ $$\text{Deny} > \text{Ask} > \text{Default} > \text{Allow}$$
 
 ## ⌨️ 快捷键与命令
 
-- **`Ctrl+Alt+A`**：循环切换模式（`default` ➔ `auto-edit` ➔ `auto` ➔ `yolo` ➔ `plan`）。
+- **`Ctrl+Alt+A`**：循环切换模式（`manual` ➔ `auto-edit` ➔ `auto` ➔ `yolo` ➔ `plan`）。
 - **`/approval-mode [mode]`**：切换审批模式。
 - **`/classifier-model [provider/model]`**：查看或配置分类器模型。
 - **`/approval-rules [list|clear]`**：查看或清空权限规则。
