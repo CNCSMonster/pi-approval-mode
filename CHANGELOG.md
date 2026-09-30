@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-30
+
+### ✨ Features
+- **Per-stage classifier models**: new `classifierStage1Model` / `classifierStage2Model` config keys (fall back to shared `classifierModel`) so the fast screen and the deep review can use different models; `/classifier-model` prints per-stage configured → effective values with fallback reasons. Failure semantics: stage-1 failure falls through to stage 2; stage-2 failure fails closed (interactive → human-review dialog, headless → deny); if no model can be resolved at all, the call degrades to heuristic checks instead of hard-blocking.
+- **Skill-directory read allowlist**: read tools targeting user-level skill dirs (`~/.pi/agent/skills/**`, `~/.agents/skills/**`) are always fast-pathed, project-level ones (`.pi/skills/**`, `.agents/skills/**`) when the project is trusted; explicit `deny`/`ask` rules still win, and symlink / `../` escapes never qualify (realpath-checked).
+- **`auto-edit` path boundaries**: edits/writes to protected paths or outside the workspace now require confirmation in `auto-edit` (headless: blocked) instead of being auto-approved; regular in-workspace edits stay fast-pathed.
+- **Bilingual docs split into separate files**: `README.zh-CN.md` and `docs/user-guide.zh-CN.md` are standalone files cross-linked with relative paths; in-file anchor switching is gone.
+- **README `default` disambiguation**: notes where `default` is a rule verdict state (delegating to the mode funnel) versus the renamed `manual` mode, linking to the user-guide FAQ.
+- **Positioning copy**: README taglines describe an independent design distilled from studying multiple code agents; Qwen Code DSL compatibility remains as a factual note.
+
+### 🛡️ Security & Trust
+- **Classifier-outage statistics separated from denial statistics**: blocks caused by classifier failures (stage-2 exception / timeout / JSON parse) count only toward the classifier-unavailable circuit and no longer inflate consecutive-denial or loop-detection counters, so the outage-degradation branch stays reachable; the classifier-unavailable default threshold is aligned to 3 (denial-circuit family value).
+
+### ⚙️ Changed
+- In-session classifier fallback notices are deduplicated per configuration key (no repeat spam after `/reload`).
+
+### 🧪 Testing
+- 78 → 90 tests: per-stage model resolution and failure semantics with interactive human-review and circuit-degradation cases; skill-dir allowlist unit + hook-level coverage (3 modes × interactive/headless); auto-edit boundary hook-level cases; default classifier-unavailable threshold anchor; test suites redirect `HOME` so they never touch the real user config.
+
+### 📖 Documentation
+- Bilingual split files (above); behavior-matrix updates (auto-edit boundary rows, skill-dir read exemption footnote); classifier per-stage config keys documented in README and user-guide (EN/ZH); fixed the historical guide→README dead link and the Chinese FAQ anchor target.
+
 ## [0.3.0] - 2026-09-30
 
 ### 💥 Breaking Changes

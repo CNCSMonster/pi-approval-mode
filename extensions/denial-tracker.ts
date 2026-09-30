@@ -10,7 +10,7 @@ import { LoopDetector } from "./loop-detector.ts";
 
 export interface DenialLimits {
 	maxConsecutiveBlock: number; // 连续拦截阈值 (默认 3)
-	maxConsecutiveUnavailable: number; // 连续分类器不可用阈值 (默认 2)
+	maxConsecutiveUnavailable: number; // 连续分类器不可用阈值 (默认 3，对齐设计基线 M11)
 	maxTotalDenials: number; // 会话累计拦截上限 (默认 20)
 }
 
@@ -43,7 +43,7 @@ export class DenialTracker {
 	}) {
 		this.limits = {
 			maxConsecutiveBlock: options?.limits?.maxConsecutiveBlock ?? 3,
-			maxConsecutiveUnavailable: options?.limits?.maxConsecutiveUnavailable ?? 2,
+			maxConsecutiveUnavailable: options?.limits?.maxConsecutiveUnavailable ?? 3,
 			maxTotalDenials: options?.limits?.maxTotalDenials ?? 20,
 		};
 		this.abortOnDenialCap = options?.abortOnDenialCap ?? false;
@@ -241,6 +241,9 @@ export const DENIAL_MESSAGES = {
 
 	autoEditHeadless: (cmd: string): string =>
 		`[Auto-edit Mode] Shell execution requires approval, but no interactive UI is available: ${cmd}. Continue with unrelated safe work or report the blocker to the user.`,
+
+	autoEditProtectedPathHeadless: (relPath: string): string =>
+		`[Auto-edit Mode] Protected-path or out-of-workspace edit requires approval, but no interactive UI is available: ${relPath}. Continue with unrelated safe work or report the blocker to the user.`,
 
 	manualEditHeadless: (relPath: string): string =>
 		`[Manual Mode] File edits require approval, but no interactive UI is available: ${relPath}. Continue with unrelated safe work or report the blocker to the user.`,

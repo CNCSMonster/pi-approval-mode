@@ -38,6 +38,8 @@ export interface LoopDetectionConfig {
 
 export interface ApprovalConfigFile {
 	classifierModel?: string; // 审批分类器模型，例如 "llm-proxy-openai-chat/gemini-3.8-flash-high-lp"
+	classifierStage1Model?: string; // 审批分类器 Stage 1 (快筛) 模型
+	classifierStage2Model?: string; // 审批分类器 Stage 2 (复核) 模型
 	defaultMode?: ApprovalMode; // 默认启动模式，例如 "auto" 或 "manual"（旧值 "default" 自动映射为 manual）
 	classifierTimeoutMs?: number; // 分类器超时毫秒数 (默认 1500ms)
 	loopDetection?: LoopDetectionConfig; // 死循环与连续失败统计熔断阈值用户偏好配置

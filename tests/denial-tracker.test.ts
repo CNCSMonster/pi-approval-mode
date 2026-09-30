@@ -60,6 +60,21 @@ test("DenialTracker - 分类器不可用与连续失败熔断 (consecutive_unava
 	assert.equal(tracker.checkFallback("fp").shouldFallback, false);
 });
 
+test("DenialTracker - 默认连续不可用阈值 = 3（默认值锚定回归）", () => {
+	const tracker = new DenialTracker(); // 无显式配置 → 走默认值，防 2↔3 回归
+
+	tracker.recordUnavailable();
+	tracker.recordUnavailable();
+	assert.equal(tracker.getStats().consecutiveUnavailable, 2);
+	assert.equal(tracker.checkFallback("fp").shouldFallback, false, "第 2 次连续不可用不得熔断（默认阈值必须 > 2）");
+
+	tracker.recordUnavailable();
+	const check = tracker.checkFallback("fp");
+	assert.equal(check.shouldFallback, true, "第 3 次连续不可用必须熔断（M11 默认 3）");
+	assert.equal(check.kind, "consecutive_unavailable");
+	assert.match(check.reasonText, /classifier unavailable x3/);
+});
+
 test("DenialTracker - 任务级累计拒绝上限与 terminate: true (total_denial)", () => {
 	const tracker = new DenialTracker({
 		limits: { maxTotalDenials: 5, maxConsecutiveBlock: 10 },

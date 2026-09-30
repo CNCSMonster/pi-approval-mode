@@ -3,13 +3,15 @@
  *
  * 启发式安全规则与离线兜底引擎 (单一来源规范架构)
  *
- * 核心设计规范:
+ * 核心设计规范 (对齐上游安全设计):
  * 1. CLASSIFIER_BASE_PROMPT (两阶段 LLM 分类器提示词) 与确定性启发式风控规则基于 SECURITY_POLICY_RULES 单一数据结构定义。
  * 2. 新增或修改任何安全风控规则时，必须在此统一注册，由 buildClassifierBasePrompt() 动态生成提示词，
  *    并通过一致性自动化测试套件双向检验正反例，杜绝语义漂移。
  */
 
 import { stripLeadingEnvVars, tokenizeShellCommand } from "./shell-analyzer.ts";
+import { realpathSync } from "node:fs";
+import { relative, resolve, isAbsolute } from "node:path";
 
 // ==============================================================
 // 1. 安全分类单一定义结构 (Single-Source Security Taxonomy)
@@ -362,4 +364,17 @@ export function fallbackHeuristicCheck(
 		}
 	}
 	return { shouldBlock: false, reason: "", stage: "fallback" };
+}
+
+
+export function isEscapingWorkspace(cwd: string, filePath: string): boolean {
+	const absPath = resolve(cwd, filePath);
+	try {
+		const real = realpathSync(absPath);
+		const rel = relative(cwd, real).replace(/\\/g, "/");
+		return rel.startsWith("..") || isAbsolute(rel);
+	} catch {
+		const rel = relative(cwd, absPath).replace(/\\/g, "/");
+		return rel.startsWith("..") || isAbsolute(rel);
+	}
 }

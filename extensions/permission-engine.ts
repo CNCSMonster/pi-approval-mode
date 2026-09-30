@@ -29,7 +29,7 @@
  *    以及 Session 规则做并集 (Union) 合并，Deny 规则绝对优先。
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, normalize, relative, resolve } from "node:path";
 import { stripLeadingEnvVars, tokenizeShellCommand } from "./shell-analyzer.ts";
@@ -789,7 +789,7 @@ export function isReadOnlyTool(toolName: string): boolean {
 	return READ_ONLY_TOOLS.has(toolName.toLowerCase());
 }
 
-/** 读类工具模式漏斗处置档位。 */
+/** 读类工具模式漏斗处置档位矩阵。 */
 export type ModeFunnelDisposition = "allow" | "classifier" | "prompt";
 
 /**
@@ -923,6 +923,19 @@ export function buildReadDslRule(targetPath: string): string {
 }
 
 /**
+ * 解析真实路径（跟随符号链接与内核 `..` 语义）；解析失败（路径不存在等）返回 null。
+ * 白名单匹配必须同时防 `../` 穿越与符号链接逃逸——能解析的按真实位置判，
+ * 无法解析的路径读取必然失败，回退词法匹配维持既有行为。
+ */
+function realpathOrNull(p: string): string | null {
+	try {
+		return normalize(realpathSync(p)).replace(/\\/g, "/");
+	} catch {
+		return null;
+	}
+}
+
+/**
  * 工具默认权限：内建的保守安全基线，在用户规则之后、审批模式之前生效。
  *
  * 读类工具（read/grep/find/ls）：工作区内 `allow`，工作区外 `ask`（对齐 qwen-code）。
@@ -936,6 +949,7 @@ export function getToolDefaultPermission(
 	toolName: string,
 	targetPath: string,
 	cwd: string,
+	isProjectTrusted: boolean = true,
 ): "allow" | "ask" {
 	const lower = toolName.toLowerCase();
 	if (!READ_ONLY_TOOLS.has(lower)) {
@@ -957,9 +971,49 @@ export function getToolDefaultPermission(
 	} else {
 		abs = normalize(join(cwd, expanded)).replace(/\\/g, "/");
 	}
-	const root = normalize(cwd).replace(/\\/g, "/");
 
-	const rel = relative(root, abs).replace(/\\/g, "/");
+	// 白名单先归一化、再按真实路径判（realpath 跟随符号链接，防逃逸）
+	const rawAbs = isAbsolute(expanded) ? expanded : join(cwd, expanded);
+	const realAbs = realpathOrNull(rawAbs);
+	const underWhitelist = (dirLexical: string): boolean => {
+		if (realAbs !== null) {
+			const realDir = realpathOrNull(dirLexical) ?? dirLexical;
+			return realAbs === realDir || realAbs.startsWith(realDir + "/");
+		}
+		return abs === dirLexical || abs.startsWith(dirLexical + "/");
+	};
+
+	// 1. 恒豁免用户级 skill 目录
+	const userSkillDir1 = normalize(join(homedir(), ".pi/agent/skills")).replace(/\\/g, "/");
+	const userSkillDir2 = normalize(join(homedir(), ".agents/skills")).replace(/\\/g, "/");
+	if (underWhitelist(userSkillDir1) || underWhitelist(userSkillDir2)) {
+		return "allow";
+	}
+
+	// 2. 项目受信时，豁免 cwd 及其祖先目录中的项目级 skill 目录
+	if (isProjectTrusted) {
+		let current = normalize(cwd).replace(/\\/g, "/");
+		while (true) {
+			const projSkillDir1 = normalize(join(current, ".pi/skills")).replace(/\\/g, "/");
+			const projSkillDir2 = normalize(join(current, ".agents/skills")).replace(/\\/g, "/");
+			
+			if (underWhitelist(projSkillDir1) || underWhitelist(projSkillDir2)) {
+				return "allow";
+			}
+			
+			const parent = normalize(join(current, "..")).replace(/\\/g, "/");
+			if (parent === current) break;
+			current = parent;
+		}
+	}
+
+	// 工作区内外同样按真实路径判（realpath 可解析时）：防符号链接从区内逃逸到区外读取
+	// （I3 / Claude Code acceptEdits 先例；realpath 失败=路径不存在=读取必失败，回退词法行为不变）
+	const realCwd = realAbs !== null ? realpathOrNull(cwd) : null;
+	const root = realCwd ?? normalize(cwd).replace(/\\/g, "/");
+	const subject = realAbs ?? abs;
+
+	const rel = relative(root, subject).replace(/\\/g, "/");
 	if (rel === "" || (!rel.startsWith("..") && !isAbsolute(rel))) {
 		return "allow";
 	}
