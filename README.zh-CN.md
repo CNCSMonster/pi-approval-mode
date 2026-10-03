@@ -65,7 +65,7 @@ pi update
 | **`auto-edit`** | `[📝 auto-edit]` | 区内文件免审，受保护路径与区外需确认，仅 shell 需审批 |
 | **`auto`** | `[🤖 auto]` | **分类器驱动（新会话默认）**。三层过滤漏斗 + 两阶段 LLM 分类器：安全操作无感放行，风险操作研判确认；进入该模式时，宽到足以绕过分类器的 allow 规则会被**暂存剥离**（退出恢复）。 |
 | **`yolo`** | `[⚡ yolo]` | **全自动**。所有工具调用免弹窗直接执行（Pi 内核默认）。 |
-| **`plan`** | `[📋 plan]** | **只读规划**。禁用 `edit` 与 `write`；Shell 仅限只读命令；注入规划指令。 |
+| **`plan`** | `[📋 plan]` | **只读规划**。禁用 `edit` 与 `write`；Shell 仅限只读命令；注入规划指令。 |
 
 > 各模式 × 各工具的逐格行为（含分类器路由与无头运行）：见[用户指南 §2](https://github.com/CNCSMonster/pi-approval-mode/blob/main/docs/user-guide.md#2-approval-modes--tool-behavior)。
 

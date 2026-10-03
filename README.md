@@ -35,7 +35,7 @@ English | [简体中文](./README.zh-CN.md)
   - `1`: Allow once
   - `2`: Allow in this session (in-memory)
   - `3`: Always allow in this project (`.pi/approval-rules.json`)
-  - `4`: Always allow for this user (``~/.pi/agent/approval-rules.json`)
+  - `4`: Always allow for this user (`~/.pi/agent/approval-rules.json`)
   - `5`: Block (`Esc` / `q`)
 - **Safe Session Resume (`pi -c`) & Ghost Privilege Escalation Defense**:
   - **CLI Wins**: Explicit `--approval-mode` or `--yolo` always takes precedence.
