@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import approvalModeExtension, { resolveClassifierModel } from "../extensions/approval-mode.ts";
 
-// 环境隔离：HOME 重定向，防本机真实用户规则/配置干扰钩子级断言（同批次隔离惯例）
+// 环境隔离：HOME 重定向，防本机真实用户规则/配置干扰钩子级断言（同白名单测试）
 process.env.HOME = mkdtempSync(join(tmpdir(), "pi-issue-0017-home-"));
 
 test("resolveClassifierModel logic (① double default, ② single stage inheritance, ③ invalid fallback)", () => {
@@ -46,7 +46,7 @@ test("resolveClassifierModel logic (① double default, ② single stage inherit
 });
 
 // ④ 失败语义 + ⑤ 记数语义 + 会话内告警，经 tool_call 钩子端到端验证。
-// 设计要点：DenialTracker 阈值 consecutiveUnavailable=3，用例顺序刻意安排使每条断言
+// 设计要点：DenialTracker 阈值 consecutiveUnavailable=3（设计基线 M11；由 2 调齐），用例顺序刻意安排使每条断言
 // 都能区分错误实现（详见各 case 注释）。
 test("failure and metrics semantics via extension hooks (④, ⑤, 会话内告警)", async () => {
 	const handlers: Record<string, any> = {};
@@ -104,8 +104,8 @@ test("failure and metrics semantics via extension hooks (④, ⑤, 会话内告�
 
 	await handlers["session_start"]({ reason: "start" }, ctx);
 	// 归零分类器配置（清掉共享目录可能的残留）→ 设置共享模型（两阶段均解析 test/stage1）
-	await commands["classifier-model"].handler("default", ctx);
-	await commands["classifier-model"].handler("test/stage1", ctx);
+	await commands["classifier-model"].handler("clear", ctx);
+	await commands["classifier-model"].handler("--both test/stage1", ctx);
 
 	// ---- Case A（④）：stage1 运行失败 → 进 stage2 研判 → stage2 放行 ----
 	queue = ["throw", "allow"]; calls = 0;
@@ -162,7 +162,7 @@ test("failure and metrics semantics via extension hooks (④, ⑤, 会话内告�
 	assert.match(String(resD3?.reason), /classifier unavailable x3/, "熔断 reason 必须 loud 且计数正确");
 
 	// 收尾：清理 /tmp/agent 共享配置，避免影响并行的其它测试文件
-	await commands["classifier-model"].handler("default", ctx);
+	await commands["classifier-model"].handler("clear", ctx);
 });
 
 // ④ 交互侧：矩阵“失败语义”的转人审分支 + “连续不可用熔断→启发式（现状）”的 hasUI 分支
@@ -209,9 +209,9 @@ test("交互转人审 + 连续不可用交互降级启发式", async () => {
 			sessionManager: { getBranch: () => [] },
 		};
 		await handlers["session_start"]({ reason: "start" }, ctx);
-		await commands["classifier-model"].handler("default", ctx);
-		await commands["classifier-model"].handler("test/stage1", ctx);
-		return { handlers, ctx, select: () => selectCalls, reset: () => commands["classifier-model"].handler("default", ctx) };
+		await commands["classifier-model"].handler("clear", ctx);
+		await commands["classifier-model"].handler("--both test/stage1", ctx);
+		return { handlers, ctx, select: () => selectCalls, reset: () => commands["classifier-model"].handler("clear", ctx) };
 	};
 
 	// 实例 A：交互下 stage2 失败 → fail-closed 转人审（弹窗被触发，默认拒绝 → block）

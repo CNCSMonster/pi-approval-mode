@@ -64,29 +64,101 @@ test("LoopDetector - 用法不同的连续调用不误判为停滞", () => {
 	assert.equal(res.isLoop, false);
 });
 
-test("LoopDetector - 同一操作反复重试且无进展才触发停滞", () => {
-	// 抬高 identical/denial 阈值，单独验证 action_stagnation 机制
+test("LoopDetector - 同一操作反复重试且无进展才触发停滞（满足可达性条件：identical>stagnation 且 denial>stagnation）", () => {
+	// 停滞分支只在两道前置检查都不先撞线时可达：identicalThreshold(20) > stagnationThreshold(6)
+	// 且 denialThreshold(20) > stagnationThreshold(6)。
 	const detector = new LoopDetector({
-		identicalThreshold: 100,
-		denialThreshold: 100,
-		stagnationThreshold: 4,
+		identicalThreshold: 20,
+		denialThreshold: 20,
+		stagnationThreshold: 6,
 	});
 
-	// 同一操作被反复拒绝（无进展）：第 3 次后，第 4 次触顶停滞
-	for (let i = 0; i < 3; i++) {
+	// 同一操作被反复拒绝（无进展）：第 6 次触顶停滞
+	for (let i = 0; i < 5; i++) {
 		detector.recordDenial("bash", { command: "rm -rf /" });
 	}
 	const res = detector.checkBeforeExecution("bash", { command: "rm -rf /" });
 	assert.equal(res.isLoop, true);
 	assert.equal(res.loopType, "action_stagnation");
-	assert.equal(res.streak, 4);
+	assert.equal(res.streak, 6);
 });
 
-test("LoopDetector - 成功即清零，重复成功不算停滞", () => {
-	// 抬高 identical/denial 阈值，单独看 action_stagnation 是否被成功清零
+test("LoopDetector - 停滞分支硬上限跟随 hardLimitMultiplier", () => {
+	// 取 headroom：硬上限 = stagnationThreshold(6) × hardLimitMultiplier(3) = 18，
+	// 须 identicalThreshold(20) 与 denialThreshold(20) 都大于 18，检查 1/2 才不会抢在停滞硬熔断之前。
 	const detector = new LoopDetector({
-		identicalThreshold: 100,
-		denialThreshold: 100,
+		identicalThreshold: 20,
+		denialThreshold: 20,
+		stagnationThreshold: 6,
+		hardLimitMultiplier: 3,
+	});
+
+	const sig = { command: "rm -rf /" };
+	let denials = 0;
+	const advanceTo = (streak: number) => {
+		while (denials < streak - 1) {
+			detector.recordDenial("bash", sig);
+			denials++;
+		}
+		return detector.checkBeforeExecution("bash", sig);
+	};
+
+	// 首次触顶（streak 6）：基础停滞提示
+	const res6 = advanceTo(6);
+	assert.equal(res6.loopType, "action_stagnation");
+	assert.equal(res6.streak, 6);
+	assert.equal(res6.isHardLimit, false);
+
+	// 升级预警（streak 7）：文案告知硬上限为 6 × 3 = 18（旧实现写死 * 2 会算出 12）
+	const res7 = advanceTo(7);
+	assert.equal(res7.loopType, "action_stagnation");
+	assert.ok(res7.warningMessage?.includes("达到 18 次将自动熔断"));
+
+	// 第 12 次：若沿用旧的 * 2 乘数此处已是硬熔断，新语义下 12 < 18 仍只是严重预警
+	const res12 = advanceTo(12);
+	assert.equal(res12.loopType, "action_stagnation");
+	assert.equal(res12.streak, 12);
+	assert.equal(res12.isHardLimit, false);
+	assert.ok(res12.warningMessage?.includes("严重预警"));
+
+	// 第 18 次：达到新乘数硬上限，强制熔断
+	const res18 = advanceTo(18);
+	assert.equal(res18.loopType, "action_stagnation");
+	assert.equal(res18.streak, 18);
+	assert.equal(res18.isHardLimit, true);
+	assert.ok(res18.warningMessage?.includes("停滞硬上限触发"));
+	assert.ok(res18.warningMessage?.includes("超过安全硬上限 (18)"));
+});
+
+test("LoopDetector - 默认配置下连拒由 consecutive_denials / identical_call_loop 先手，action_stagnation 不触发（防改检查顺序）", () => {
+	// 默认 identical=3、denial=3、stagnation=6 不满足可达性条件（两道前置都先撞线），
+	// 因此停滞分支在默认配置下永不返回。若有人调整检查顺序，本测试必须报警。
+	const sameSig = new LoopDetector(); // 默认 3/3/6
+	for (let i = 0; i < 5; i++) {
+		const res = sameSig.checkBeforeExecution("bash", { command: "rm -rf /" });
+		if (res.isLoop) assert.notEqual(res.loopType, "action_stagnation");
+		sameSig.recordDenial("bash", { command: "rm -rf /" });
+	}
+	// 同签名连拒到第 3 次由 identical_call_loop 先手
+	const res = sameSig.checkBeforeExecution("bash", { command: "rm -rf /" });
+	assert.equal(res.loopType, "identical_call_loop");
+
+	// 变换签名的连拒：停滞计数不累计，由 consecutive_denials 在第 3 次先手
+	const altSig = new LoopDetector();
+	altSig.recordDenial("bash", { command: "a" });
+	altSig.recordDenial("bash", { command: "b" });
+	altSig.recordDenial("bash", { command: "c" });
+	const altRes = altSig.checkBeforeExecution("edit", { path: "d" });
+	assert.equal(altRes.isLoop, true);
+	assert.equal(altRes.loopType, "consecutive_denials");
+	assert.equal(altRes.streak, 3);
+});
+
+test("LoopDetector - 成功即清零，重复成功不算停滞（满足可达性条件：identical>stagnation 且 denial>stagnation）", () => {
+	// 抬高 identical/denial 阈值以满足停滞分支可达性条件（20 > 3），单独看 action_stagnation 是否被成功清零
+	const detector = new LoopDetector({
+		identicalThreshold: 20,
+		denialThreshold: 20,
 		stagnationThreshold: 3,
 	});
 
@@ -114,7 +186,7 @@ test("LoopDetector - 支持动态从配置更新阈值偏好", () => {
 	assert.equal(res.streak, 2);
 });
 
-test("LoopDetector - 预警文案随次数升级与硬上限熔断", () => {
+test("LoopDetector - 预警文案随次数升级与硬上限熔断 ", () => {
 	// identicalThreshold: 2, hardLimitMultiplier: 3 => hardLimit = 6
 	const detector = new LoopDetector({
 		identicalThreshold: 2,

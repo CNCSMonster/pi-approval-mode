@@ -82,10 +82,6 @@ const SAFE_READ_ONLY_BINARIES = new Set([
 	"python3",
 	"node",
 	"ruby",
-	"rustc",
-	"gcc",
-	"g++",
-	"clang",
 ]);
 
 // 允许在管道下游充当过滤器的命令
@@ -107,7 +103,6 @@ const SAFE_PIPE_FILTERS = new Set([
 	"fmt",
 	"nl",
 	"fold",
-	"awk",
 	"cat",
 ]);
 

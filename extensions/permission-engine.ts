@@ -9,7 +9,7 @@
  *    - ask:  强制挂起并弹窗要求用户确认，压倒 allow；
  *    - default: 显式 default 规则命中，或未命中任何规则 → 交给审批模式漏斗（auto→classifier、非交互拒绝）；
  *    - allow: 免审放行（受 auto 模式高危暂存保护）；
- *    （读类工具未命中规则时，再经工具默认权限层：工作区内 allow / 工作区外 ask）
+ *    （读类工具未命中规则时，再经工具默认权限层：工作区内 allow / 工作区外 ask，）
  *
  * 2. DSL 语法与分流解析：
  *    ToolName 或 ToolName(specifier)
@@ -438,6 +438,7 @@ export class PermissionManager {
 			this.projectRulesBlocked = existsSync(projectRuleFile);
 		}
 		this.userRules = this.loadRulesFromFile(join(this.userDir, "approval-rules.json"));
+		this.reassertAutoStashOnLoadedRules();
 	}
 
 	public getSessionRules(): PermissionRules {
@@ -495,6 +496,27 @@ export class PermissionManager {
 	public stripDangerousAllowRulesForAuto(): string[] {
 		if (this.strippedAllowRules) return [];
 		this.strippedAllowRules = [];
+		return this.stashDangerousAllowRules();
+	}
+
+	/**
+	 * auto 暂存态下的加载一致性收口：
+	 * 磁盘规则文件本就保留暂存规则（persistRules 合成），因此 reloadAll 整表重载会把它们带回工作池并
+	 * 参与 evaluate()——出现"界面显示已暂存、实际已生效"的危险不一致。任何加载路径
+	 * （/approval-rules、/reload、setIsTrusted 信任闸）重载后都必须重新摘除，并与既有暂存池去重合并。
+	 */
+	private reassertAutoStashOnLoadedRules(): void {
+		if (this.strippedAllowRules === null) return;
+		this.stashDangerousAllowRules();
+	}
+
+	/**
+	 * 把三层工作池中的危险 allow 规则摘除并入暂存池（按 scope+rule 去重，故可重复调用）。
+	 * @returns 本次从工作池摘除的规则清单
+	 */
+	private stashDangerousAllowRules(): string[] {
+		const stash = this.strippedAllowRules;
+		if (stash === null) return [];
 		const stripped: string[] = [];
 		const scopes: Array<{ scope: "session" | "project" | "user"; rules: PermissionRules }> = [
 			{ scope: "session", rules: this.sessionRules },
@@ -506,7 +528,9 @@ export class PermissionManager {
 			if (moved.length === 0) continue;
 			rules.allow = rules.allow.filter((r) => !isDangerousAllowRule(r));
 			for (const rule of moved) {
-				this.strippedAllowRules.push({ scope, rule });
+				if (!stash.some((s) => s.scope === scope && s.rule === rule)) {
+					stash.push({ scope, rule });
+				}
 				stripped.push(rule);
 			}
 		}
@@ -778,7 +802,7 @@ export class PermissionManager {
 }
 
 // ==============================================================
-// 工具默认权限层（qwen-code getDefaultPermission 等价物）
+// 工具默认权限层（qwen-code getDefaultPermission 等价物，）
 // ==============================================================
 
 /** 读类工具集合（pi 实际内置的只读工具）。 */
@@ -789,7 +813,7 @@ export function isReadOnlyTool(toolName: string): boolean {
 	return READ_ONLY_TOOLS.has(toolName.toLowerCase());
 }
 
-/** 读类工具模式漏斗处置档位矩阵。 */
+/** 读类工具模式漏斗处置档位。 */
 export type ModeFunnelDisposition = "allow" | "classifier" | "prompt";
 
 /**
@@ -924,7 +948,7 @@ export function buildReadDslRule(targetPath: string): string {
 
 /**
  * 解析真实路径（跟随符号链接与内核 `..` 语义）；解析失败（路径不存在等）返回 null。
- * 白名单匹配必须同时防 `../` 穿越与符号链接逃逸——能解析的按真实位置判，
+ * 拍板：白名单匹配必须同时防 `../` 穿越与符号链接逃逸——能解析的按真实位置判，
  * 无法解析的路径读取必然失败，回退词法匹配维持既有行为。
  */
 function realpathOrNull(p: string): string | null {
@@ -972,7 +996,7 @@ export function getToolDefaultPermission(
 		abs = normalize(join(cwd, expanded)).replace(/\\/g, "/");
 	}
 
-	// 白名单先归一化、再按真实路径判（realpath 跟随符号链接，防逃逸）
+	// 拍板：白名单先归一化、再按真实路径判（realpath 跟随符号链接，防逃逸）
 	const rawAbs = isAbsolute(expanded) ? expanded : join(cwd, expanded);
 	const realAbs = realpathOrNull(rawAbs);
 	const underWhitelist = (dirLexical: string): boolean => {

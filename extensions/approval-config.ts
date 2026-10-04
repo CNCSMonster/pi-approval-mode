@@ -41,7 +41,8 @@ export interface ApprovalConfigFile {
 	classifierStage1Model?: string; // 审批分类器 Stage 1 (快筛) 模型
 	classifierStage2Model?: string; // 审批分类器 Stage 2 (复核) 模型
 	defaultMode?: ApprovalMode; // 默认启动模式，例如 "auto" 或 "manual"（旧值 "default" 自动映射为 manual）
-	classifierTimeoutMs?: number; // 分类器超时毫秒数 (默认 1500ms)
+	classifierTimeoutMs?: number; // Stage 1 快筛超时毫秒数 (默认 1500ms)
+	classifierStage2TimeoutMs?: number; // Stage 2 复核超时毫秒数 (缺省 = Stage 1 × 2)
 	loopDetection?: LoopDetectionConfig; // 死循环与连续失败统计熔断阈值用户偏好配置
 	denialLimits?: Partial<DenialLimits>; // 无头拦截与连续失败阈值 (对齐 Qwen Code)
 	headlessAbortOnDenialCap?: boolean; // 达到累计拦截上限时是否附带 terminate: true 终止无头任务

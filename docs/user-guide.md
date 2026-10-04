@@ -47,7 +47,12 @@ Options `2`–`4` write an `allow` rule at the corresponding tier, so the same a
 - **`Ctrl+Alt+A`** — cycle `manual ➔ auto-edit ➔ auto ➔ yolo ➔ plan`;
 - **`/approval-mode [mode]`** — jump directly to a mode (Tab-completed, e.g. `/approval-mode auto`).
 
-The current mode is always visible in the status bar (e.g. `[🤖 auto]`).
+The current mode is always visible in the status bar (e.g. `[⚖️ auto]`).
+
+> ⚠️ **Note**: the `(auto)` after the context usage on status-bar line 2 is **Pi's native
+> auto-compaction indicator** (`compaction.enabled`, see Pi's `docs/settings.md`) and has
+> nothing to do with this plugin; this plugin's approval-mode badge lives on the extension
+> status line (e.g. `[⚖️ auto]`). See §5.7 for details.
 
 ### 1.5 Suggested next step
 
@@ -81,13 +86,13 @@ The five modes form an automation ramp — `manual → auto-edit → auto → yo
 | Call | `manual` | `auto-edit` | `auto` | `yolo` | `plan` |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | `edit` / `write` — regular workspace file | 🛡️ prompt | ✅ auto | ✅ auto | ✅ auto | ⛔ blocked |
-| `edit` / `write` — **outside workspace** | 🛡️ prompt | 🛡️ prompt | 🤖 classifier → dialog `*` | ✅ auto | ⛔ blocked |
-| `edit` / `write` — **protected path** `*` | 🛡️ prompt | 🛡️ prompt | 🤖 classifier → dialog `*` | ✅ auto | ⛔ blocked |
-| `bash` — read-only (by shell analysis) | 🛡️ prompt | 🛡️ prompt | ✅ auto | ✅ auto | ✅ auto |
-| `bash` — anything else | 🛡️ prompt | 🛡️ prompt | 🤖 classifier → dialog `*` | ✅ auto | ⛔ blocked |
+| `edit` / `write` — **outside workspace** | 🛡️ prompt | 🛡️ prompt | ⚖️ classifier → dialog `*` | ✅ auto | ⛔ blocked |
+| `edit` / `write` — **protected path** `*` | 🛡️ prompt | 🛡️ prompt | ⚖️ classifier → dialog `*` | ✅ auto | ⛔ blocked |
+| `bash` — read-only (by shell analysis) | 🛡️ prompt | 🛡️ prompt | ⚖️ classifier → dialog | ✅ auto | ✅ auto |
+| `bash` — anything else | 🛡️ prompt | 🛡️ prompt | ⚖️ classifier → dialog `*` | ✅ auto | ⛔ blocked |
 | read-family, no rule, **inside** workspace | ✅ auto | ✅ auto | ✅ auto | ✅ auto | ✅ auto |
 | read-family, no rule, **outside** workspace (except skill dirs `*`) | 🛡️ ask dialog | 🛡️ ask dialog | 🛡️ ask dialog | 🛡️ ask dialog | 🛡️ ask dialog |
-| read-family, matched **`default`** rule | 🛡️ prompt | 📝 prompt | 🤖 classifier → dialog `*` | ✅ auto | ✅ auto |
+| read-family, matched **`default`** rule | 🛡️ prompt | 📝 prompt | ⚖️ classifier → dialog `*` | ✅ auto | ✅ auto |
 | matched **`ask`** rule (any mode) | 🛡️ ask dialog | 🛡️ ask dialog | 🛡️ ask dialog | 🛡️ ask dialog | 🛡️ ask dialog |
 | matched **`deny`** rule (any mode) | ⛔ silent block | ⛔ silent block | ⛔ silent block | ⛔ silent block | ⛔ silent block |
 | matched **`allow`** rule (any mode) | ✅ auto | ✅ auto | ✅ auto | ✅ auto | ✅ auto |
@@ -97,7 +102,7 @@ The five modes form an automation ramp — `manual → auto-edit → auto → yo
 - **Protected path** = workspace-sensitive locations (`.pi/`, `.git/`, `AGENTS.md`, dotfiles such as `.bashrc` / `.zshrc` / `.profile`, `.env*`, `id_rsa*`). In `auto` these route through the classifier instead of the fast path.
 - **Classifier → dialog**: the two-stage LLM classifier reviews the call with its conversation context. If flagged risky, an interactive dialog shows the risk reason before the same `1`–`5` choices; if deemed safe, the call proceeds without any prompt.
 - **Skill dirs** `*` = user-level `~/.pi/agent/skills/**` and `~/.agents/skills/**` (always exempt) plus project-level `.pi/skills/**` and `.agents/skills/**` (exempt only when the project is trusted). Explicit `deny` / `ask` rules still win over this whitelist.
-- **Read-only `bash`** is decided by a shell state-machine (quotes, redirections, pipes, `&&`/`;` splitting, `$( )` substitution, flag guards for `find`/`git`/`sed`). A single write redirection revokes read-only status.
+- **Read-only `bash`** is decided by a shell state-machine (quotes, redirections, pipes, `&&`/`;` splitting, `$( )` substitution, flag guards for `find`/`git`/`sed`). A single write redirection revokes read-only status. **In `auto` the read-only fast path is retired**: the analysis now only guards `plan` (hard block) and feeds the "static structure" display line of `auto` dialogs — display, not verdict. Every rule-unmatched shell call, `ls` included, goes through the classifier; pin a command back to 0 s with an `allow` rule.
 
 ### 2.3 Headless (non-interactive) runs
 
@@ -162,6 +167,7 @@ Rules are pooled **union-style** across three persistence tiers (session / proje
 | Protect credentials everywhere | `"deny": ["Read(.env*)", "Read(~/.ssh/**)"]` |
 | Force **classifier audit** for sensitive reads in `auto` | `"default": ["Read(./secrets/**)"]` — the read goes through the classifier instead of the workspace fast path |
 | Silence routine git commands | `"allow": ["Bash(git status)", "Bash(git diff *)"]` |
+| Hard-block destructive git yourself (there is no built-in rule — the classifier judges by common sense) | `"deny": ["Bash(git push *--force*)"]` |
 | Always confirm production-bound pushes | `"ask": ["Bash(git push *)"]` |
 | Let a mode decide (opt-in advanced behavior) | `"default": [...]` — omit `default` rules entirely and behavior stays classic three-state |
 
@@ -179,8 +185,9 @@ Dialog choices `2`/`3`/`4` (§1.3) are the ergonomic way to add rules — this c
 
 ### 4.1 What the classifier does
 
-In **`auto`** mode, risky-looking calls (non-read-only shell, protected-path edits,
-`default`-routed reads) go through a **two-stage LLM review**:
+In **`auto`** mode, every rule-unmatched shell call (the read-only fast path is retired —
+`ls` goes through the classifier too), protected-path edits, and
+`default`-routed reads go through a **two-stage LLM review**:
 
 - **Stage 1** — a fast JSON judgment (with a timeout circuit-breaker);
 - **Stage 2** — a thinking re-review only when Stage 1 flags, to eliminate false positives;
@@ -217,7 +224,13 @@ In **`auto`** mode, risky-looking calls (non-read-only shell, protected-path edi
 
 - **Never store API keys in config files.** Use the `$ENV_VAR` reference form above and
   export the variable in the environment that launches Pi.
-- Inspect or change the active classifier at runtime with **`/classifier-model [provider/model]`**.
+- **Inspect or configure classifier models at runtime**: **`/classifier-model`**
+  - **View status**: Run `/classifier-model` with no arguments to inspect the configured value, effective model, and fallback reason for both Stage 1 (screening) and Stage 2 (review).
+  - **Set per-stage models**: `/classifier-model --stage1 <provider/model>` or `/classifier-model --stage2 <provider/model>` (both stages can be specified in one command, e.g. `/classifier-model --stage1 deepseek/deepseek-flash --stage2 deepseek/deepseek-v4-pro`, order-independent).
+  - **Set both stages together**: `/classifier-model --both <provider/model>` (writes to shared key and clears stage-specific keys).
+  - **Clear configurations**: `/classifier-model clear` (resets all stages back to builtin defaults and main model); targeted resets are also supported: `/classifier-model clear --stage1` (or `--stage2` / `--both`).
+  - **Help and completions**: `/classifier-model help` shows syntax and examples. Full-cycle Tab completion is supported with mutual-exclusion pruning, metadata display (pricing, reasoning capability, context window), and active model indicators (`✓`).
+  - **Migration notes**: Positional syntax `/classifier-model <model>` and `/classifier-model default` has been removed. Please migrate to `--both <model>` and `clear` respectively.
 - `defaultMode` sets the startup mode; project-level `.pi/approval-config.json` overrides
   global settings per top-level key (and is only honored in **trusted** projects — see §5.4).
 
@@ -297,6 +310,22 @@ It was renamed to **`manual`** (v0.3.0). Once fresh sessions started in `auto`, 
 `default` (which is unchanged). Old values are accepted transparently: `defaultMode:
 "default"` in config, `--approval-mode default`, and old session states all map to
 `manual` automatically.
+
+---
+
+### 5.7 Is status-bar `(auto)` the same as `[⚖️ auto]`?
+
+No — different semantics, different location, different owner:
+
+| Display | Meaning | Controlled by |
+| :--- | :--- | :--- |
+| Line 2, `0.0%/262k (auto)` | **Pi native** auto-compaction indicator: shown when the context is auto-compacted as it nears the window limit | `compaction.enabled` in `settings.json` (built into Pi) |
+| Extension status line, `[⚖️ auto]` | **This plugin's** approval-mode badge: ⚖️ (scale) stands for the two-stage LLM classifier auto-adjudicating allow/block | `/approval-mode` command, `Ctrl+Alt+A`, `--approval-mode` flag |
+
+Pi deliberately ships no approval mechanism of its own (the official docs state it
+"intentionally does not include ... permission popups"), so all approval capability comes
+from this plugin. The two "auto"s belong to entirely different subsystems and merely share
+a word.
 
 ---
 

@@ -3,7 +3,7 @@
  *
  * 启发式安全规则与离线兜底引擎 (单一来源规范架构)
  *
- * 核心设计规范 (对齐上游安全设计):
+ * 核心设计规范 :
  * 1. CLASSIFIER_BASE_PROMPT (两阶段 LLM 分类器提示词) 与确定性启发式风控规则基于 SECURITY_POLICY_RULES 单一数据结构定义。
  * 2. 新增或修改任何安全风控规则时，必须在此统一注册，由 buildClassifierBasePrompt() 动态生成提示词，
  *    并通过一致性自动化测试套件双向检验正反例，杜绝语义漂移。
@@ -95,12 +95,6 @@ export const SECURITY_POLICY_RULES: SecurityPolicyRule[] = [
 		category: "soft_block",
 		promptText: "Security weakening (chmod 777, sudo without explicit context, disabling firewall).",
 		negativeSamples: ["chmod 777 /var/www", "sudo chown -R root /tmp"],
-	},
-	{
-		id: "destructive_git_operations",
-		category: "soft_block",
-		promptText: "Destructive git operations (force-push to main/master, rewriting public history, reset --hard).",
-		negativeSamples: ["git push origin main --force", "git reset --hard HEAD~1", "git clean -fd"],
 	},
 	{
 		id: "cloud_metadata_ssrf",

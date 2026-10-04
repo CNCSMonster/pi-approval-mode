@@ -45,7 +45,9 @@ pi install git:github.com/CNCSMonster/pi-approval-mode
 - **`Ctrl+Alt+A`** — 循环切换 `manual ➔ auto-edit ➔ auto ➔ yolo ➔ plan`；
 - **`/approval-mode [mode]`** — 直达指定模式（支持 Tab 补全，如 `/approval-mode auto`）。
 
-当前模式常驻状态栏（如 `[🤖 auto]`）。
+当前模式常驻状态栏（如 `[⚖️ auto]`）。
+
+> ⚠️ **注意区分**：状态栏第 2 行上下文用量后的 `(auto)` 是 **Pi 原生的上下文自动压缩指示**（`compaction.enabled`，见 Pi 官方 `docs/settings.md`），与本插件无关；本插件的审批模式徽标位于扩展状态行（如 `[⚖️ auto]`）。两者详见 §5.7。
 
 ### 1.5 建议的下一步
 
@@ -78,13 +80,13 @@ pi install git:github.com/CNCSMonster/pi-approval-mode
 | 调用 | `manual` | `auto-edit` | `auto` | `yolo` | `plan` |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | `edit` / `write` — 工作区常规文件 | 🛡️ 弹窗 | ✅ 自动 | ✅ 自动 | ✅ 自动 | ⛔ 阻断 |
-| `edit` / `write` — **工作区外** | 🛡️ 弹窗 | 🛡️ 弹窗 | 🤖 分类器 → 弹窗 `*` | ✅ 自动 | ⛔ 阻断 |
-| `edit` / `write` — **受保护路径** `*` | 🛡️ 弹窗 | 🛡️ 弹窗 | 🤖 分类器 → 弹窗 `*` | ✅ 自动 | ⛔ 阻断 |
-| `bash` — 只读（词法分析判定） | 🛡️ 弹窗 | 🛡️ 弹窗 | ✅ 自动 | ✅ 自动 | ✅ 自动 |
-| `bash` — 其余命令 | 🛡️ 弹窗 | 🛡️ 弹窗 | 🤖 分类器 → 弹窗 `*` | ✅ 自动 | ⛔ 阻断 |
+| `edit` / `write` — **工作区外** | 🛡️ 弹窗 | 🛡️ 弹窗 | ⚖️ 分类器 → 弹窗 `*` | ✅ 自动 | ⛔ 阻断 |
+| `edit` / `write` — **受保护路径** `*` | 🛡️ 弹窗 | 🛡️ 弹窗 | ⚖️ 分类器 → 弹窗 `*` | ✅ 自动 | ⛔ 阻断 |
+| `bash` — 只读（词法分析判定） | 🛡️ 弹窗 | 🛡️ 弹窗 | ⚖️ 分类器 → 弹窗 | ✅ 自动 | ✅ 自动 |
+| `bash` — 其余命令 | 🛡️ 弹窗 | 🛡️ 弹窗 | ⚖️ 分类器 → 弹窗 `*` | ✅ 自动 | ⛔ 阻断 |
 | 读类、无规则、**工作区内** | ✅ 自动 | ✅ 自动 | ✅ 自动 | ✅ 自动 | ✅ 自动 |
 | 读类、无规则、**工作区外**（除 skill 目录 `*` 外） | 🛡️ ask 弹窗 | 🛡️ ask 弹窗 | 🛡️ ask 弹窗 | 🛡️ ask 弹窗 | 🛡️ ask 弹窗 |
-| 读类、命中 **`default`** 规则 | 🛡️ 弹窗 | 📝 弹窗 | 🤖 分类器 → 弹窗 `*` | ✅ 自动 | ✅ 自动 |
+| 读类、命中 **`default`** 规则 | 🛡️ 弹窗 | 📝 弹窗 | ⚖️ 分类器 → 弹窗 `*` | ✅ 自动 | ✅ 自动 |
 | 命中 **`ask`** 规则（任意模式） | 🛡️ ask 弹窗 | 🛡️ ask 弹窗 | 🛡️ ask 弹窗 | 🛡️ ask 弹窗 | 🛡️ ask 弹窗 |
 | 命中 **`deny`** 规则（任意模式） | ⛔ 静默阻断 | ⛔ 静默阻断 | ⛔ 静默阻断 | ⛔ 静默阻断 | ⛔ 静默阻断 |
 | 命中 **`allow`** 规则（任意模式） | ✅ 自动 | ✅ 自动 | ✅ 自动 | ✅ 自动 | ✅ 自动 |
@@ -94,7 +96,7 @@ pi install git:github.com/CNCSMonster/pi-approval-mode
 - **受保护路径** = 工作区敏感位置（`.pi/`、`.git/`、`AGENTS.md`、`.bashrc` / `.zshrc` / `.profile` 等点文件、`.env*`、`id_rsa*`）。`auto` 模式下这些路径不走快路径，改走分类器。
 - **分类器 → 弹窗**：两阶段 LLM 分类器结合对话上下文研判该调用。判为有风险则弹窗展示风险理由，之后仍是 `1`–`5` 选择；判为安全则无感放行。
 - **skill 目录** `*` = 用户级 `~/.pi/agent/skills/**` 与 `~/.agents/skills/**`（恒豁免）+ 项目级 `.pi/skills/**` 与 `.agents/skills/**`（仅受信项目豁免）；显式 `deny`/`ask` 规则仍然优先于白名单。
-- **只读 `bash`** 由 Shell 状态机判定（引号、重定向、管道、`&&`/`;` 切分、`$( )` 替换、`find`/`git`/`sed` 参数守卫）。任何一处写入重定向即一票否决只读资格。
+- **只读 `bash`** 由 Shell 状态机判定（引号、重定向、管道、`&&`/`;` 切分、`$( )` 替换、`find`/`git`/`sed` 参数守卫）。任何一处写入重定向即一票否决只读资格。**在 `auto` 下只读快路径已下线**：该分析现仅守卫 `plan`（硬拦）并为 `auto` 弹窗的“静态结构特征”展示行供料——展示≠裁决。每一条未命中规则的 shell 调用（含 `ls`）都进分类器；想把某命令钉回 0 秒，写一条 `allow` 规则。
 
 ### 2.3 无头（非交互）运行
 
@@ -156,6 +158,7 @@ $$\text{Deny} > \text{Ask} > \text{Default} > \text{Allow}$$
 | 全局保护凭据文件 | `"deny": ["Read(.env*)", "Read(~/.ssh/**)"]` |
 | `auto` 下强制敏感读取走**分类器审计** | `"default": ["Read(./secrets/**)"]` — 该读取不走工作区快路径，改入分类器 |
 | 静音日常 git 命令 | `"allow": ["Bash(git status)", "Bash(git diff *)"]` |
+| 自己硬拦破坏性 git（无内置规则——分类器按安全常识研判） | `"deny": ["Bash(git push *--force*)"]` |
 | 发布类推送永远人工确认 | `"ask": ["Bash(git push *)"]` |
 | 交给模式裁决（选择性启用高级行为） | `"default": [...]` — 完全不配 `default` 规则即保持经典三态 |
 
@@ -173,7 +176,7 @@ $$\text{Deny} > \text{Ask} > \text{Default} > \text{Allow}$$
 
 ### 4.1 分类器做什么
 
-**`auto`** 模式下，观感有风险的调用（非只读 Shell、受保护路径编辑、`default` 路由的读取）
+**`auto`** 模式下，每一条未命中规则的 shell 调用（只读快路径已下线——`ls` 同样进分类器）、受保护路径编辑、`default` 路由的读取
 进入**两阶段 LLM 研判**：
 
 - **Stage 1** — 极速 JSON 判定（带超时熔断）；
@@ -210,7 +213,13 @@ $$\text{Deny} > \text{Ask} > \text{Default} > \text{Allow}$$
 ```
 
 - **切勿在配置文件里存 API key**。用上面的 `$ENV_VAR` 引用形式，在启动 Pi 的环境里导出变量。
-- 运行时查看或更换分类器：**`/classifier-model [provider/model]`**。
+- **运行时查看或配置分类器模型**：**`/classifier-model`**
+  - **查看状态**：直接执行 `/classifier-model`，回显 Stage 1（快筛）与 Stage 2（复核）的当前配置值、生效值与回退原因。
+  - **分阶段独立设置**：`/classifier-model --stage1 <provider/model>` 或 `/classifier-model --stage2 <provider/model>`（支持一次性指定两阶段，如 `/classifier-model --stage1 deepseek/deepseek-flash --stage2 deepseek/deepseek-v4-pro`，顺序无关）。
+  - **统一设置两阶段**：`/classifier-model --both <provider/model>`（写入共享键并清空分阶段键）。
+  - **清空配置**：`/classifier-model clear`（重置全部回到内置默认及主模型）；亦可按目标清除 `/classifier-model clear --stage1`（或 `--stage2` / `--both`）。
+  - **帮助与补全**：`/classifier-model help` 显示语法与示例；支持全流程 Tab 自动补全，候选列表智能剪枝互斥选项，展示模型价格、推理与上下文窗口元数据，并对当前生效模型标注 `✓`。
+  - **语法迁移说明**：旧语法位置参数 `/classifier-model <model>` 与 `/classifier-model default` 已移除，请分别迁移为 `--both <model>` 与 `clear`。
 - `defaultMode` 设定启动模式；项目级 `.pi/approval-config.json` 按顶层键整体覆盖全局
   （且仅在**受信任**项目生效——见 §5.4）。
 
@@ -276,6 +285,19 @@ $$\text{Deny} > \text{Ask} > \text{Default} > \text{Allow}$$
 ### 5.6 `default` 模式哪去了？
 
 v0.3.0 起更名为 **`manual`**。新会话默认 `auto` 后，`default` 这个名字已名不副实，且与规则四态判定 `default`（语义不变）撞名。旧值透明兼容：配置里的 `defaultMode: "default"`、`--approval-mode default` 与历史会话状态都会自动映射为 `manual`。
+
+---
+
+### 5.7 状态栏的 `(auto)` 和 `[⚖️ auto]` 是一回事吗？
+
+不是，两者语义、位置、控制方都不同：
+
+| 显示 | 含义 | 由谁控制 |
+| :--- | :--- | :--- |
+| 第 2 行 `0.0%/262k (auto)` | **Pi 原生**的上下文自动压缩（auto-compaction）开关指示——显示即表示上下文接近上限时会自动压缩 | `settings.json` 的 `compaction.enabled`（Pi 内置，项目配置也可关） |
+| 扩展状态行 `[⚖️ auto]` | **本插件**的审批模式徽标：⚖️ 天平代表两阶段 LLM 分类器自动裁决放行/拦截 | `/approval-mode` 命令、`Ctrl+Alt+A`、`--approval-mode` flag |
+
+Pi 本身不内置审批机制（官方文档明示 intentionally does not include permission popups），审批能力全部由本插件提供；两个 "auto" 分属完全不同的子系统，仅是文字撞名。
 
 ---
 

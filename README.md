@@ -26,6 +26,7 @@ English | [简体中文](./README.zh-CN.md)
   - Compound command splitting (`&&`, `||`, `;`, `&`) prevents injection bypass.
   - Subshell & command substitution defenses (`$()`, \`...\`).
   - Flag guards for `find` (`-exec`, `-delete`), `git` (write subcommands), `sed` (`-i`).
+  - **Usage scope**: guards `plan` (its only shell defense) and feeds the `auto` dialog's "static structure" display line — `auto` itself no longer auto-allows read-only shell.
 - **Two-Stage LLM Classifier**:
   - **Stage 1 (Fast)**: quick check with timeout circuit-breaker (default 1500 ms, configurable).
   - **Stage 2 (Review)**: CoT deep review on flagged actions to eliminate false positives.
@@ -66,7 +67,7 @@ pi update
 | :--- | :--- | :--- |
 | **`manual`** | `[🛡️ manual]` | **Human review**. Edits, writes, and shell commands each require explicit approval. Read-only tools are auto-approved. |
 | **`auto-edit`** | `[📝 auto-edit]` | Auto-approves in-workspace file edits; protected paths, out-of-workspace edits, and shell commands require confirmation. |
-| **`auto`** | `[🤖 auto]` | **Classifier-driven** (the startup default). 3-layer filter funnel + 2-stage LLM classifier. Safe operations proceed seamlessly; risky operations are reviewed. Broad allow rules that would defeat the classifier are temporarily stashed while in this mode. |
+| **`auto`** | `[🤖 auto]` | **Classifier-driven** (the startup default). Rule fast paths + the Layer-1 workspace-edit exemption funnel into a 2-stage LLM classifier (the read-only auto-allow layer is retired — every rule-unmatched shell call, `ls` included, is classified). Safe operations proceed seamlessly; risky operations are reviewed. Broad allow rules that would defeat the classifier are temporarily stashed while in this mode. |
 | **`yolo`** | `[⚡ yolo]` | **Autonomous**. All tool calls execute without prompts (Pi core default). |
 | **`plan`** | `[📋 plan]` | **Read-only planning**. Disables `edit` and `write`; limits shell to read-only commands; injects planning instructions. |
 
@@ -173,7 +174,7 @@ $$\text{Deny} > \text{Ask} > \text{Default} > \text{Allow}$$
 
 - **`Ctrl+Alt+A`**: Cycle through modes (`manual` ➔ `auto-edit` ➔ `auto` ➔ `yolo` ➔ `plan`).
 - **`/approval-mode [mode]`**: Switch approval mode.
-- **`/classifier-model [provider/model]`**: View or configure classifier model.
+- **`/classifier-model`**: View or configure two-stage classifier models (supports `--stage1`, `--stage2`, `--both`; `clear`, `help`, and full-cycle Tab autocompletion).
 - **`/approval-rules [list|clear]`**: View or clear permission rules.
 
 ---

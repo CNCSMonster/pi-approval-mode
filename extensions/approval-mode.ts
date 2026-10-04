@@ -7,7 +7,7 @@
  * 2. auto-edit - 自动批准文件编辑：edit/write 自动放行，仅 Shell 命令 (bash) 需审批确认。
  * 3. auto      - 智能两阶段分类器模式（Qwen Code Auto 模式架构）：
  *                - Layer 1: 工作区常规文件修改免审（自身配置与敏感凭据除外）
- *                - Layer 2: 工业级 Shell 只读安全校验 (词法分词、操作符解析、重定向与管道守卫)
+ *                - Layer 2: 工业级 Shell 只读状态机——仅 plan 模式作守卫与 auto 弹窗"静态结构特征"展示；auto 下不再据此免审
  *                - Layer 3: 【双阶段 LLM 安全分类器 (Two-Stage Classifier)】
  *                  • Stage 1 (Fast Path): ~300ms 快速研判 (带 1500ms 超时熔断)
  *                  • Stage 2 (Review Path): 仅当 Stage 1 标记可疑时触发深度推理，消除误报
@@ -23,6 +23,7 @@
  *
  * 审批弹窗特性：
  * - 数字快捷键直选：直接按下数字键 1 - 5 即可瞬间完成审批确认，无需回车！
+ * - 视口自适应换行：长命令/长内容按终端宽度换行完整展示，不再截断省略
  * - 四级免审作用域 (单次 / 会话 / 项目级持久化 / 用户级持久化 / 拒绝)
  */
 
@@ -30,7 +31,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, realpathSync } from
 import { dirname, join, relative, resolve, isAbsolute } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolCallEventResult } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { Key, matchesKey, truncateToWidth, visibleWidth, type AutocompleteItem } from "@earendil-works/pi-tui";
+import { Key, matchesKey, wrapTextWithAnsi, visibleWidth, type AutocompleteItem } from "@earendil-works/pi-tui";
 
 import { analyzeShellCommand } from "./shell-analyzer.ts";
 import { fallbackHeuristicCheck, isProtectedPath, isEscapingWorkspace, CLASSIFIER_BASE_PROMPT } from "./heuristic-guard.ts";
@@ -62,7 +63,7 @@ export type { ApprovalMode, ApprovalConfigFile };
 const MODE_DESCRIPTIONS: Record<ApprovalMode, string> = {
 	manual: "🛡️ manual - 人审模式（文件修改与 Shell 命令均需人工审批）",
 	"auto-edit": "📝 auto-edit - 自动批准文件编辑（仅 Shell 命令需审批）",
-	auto: "🤖 auto - 智能分类器模式（双阶段 LLM 自动判定意图与风险）",
+	auto: "⚖️ auto - 智能分类器模式（双阶段 LLM 自动判定意图与风险）",
 	yolo: "⚡ yolo - 全自动模式（无条件直接执行所有工具）",
 	plan: "📋 plan - 只读分析模式（禁用编辑/写入工具，仅放行只读命令）",
 };
@@ -176,7 +177,7 @@ Respond with JSON only: { "shouldBlock": boolean, "reason": string }.`;
 
 
 
-function parseClassifierJson(text: string): any {
+export function parseClassifierJson(text: string): any {
 	try {
 		const trimmed = text.trim();
 		const jsonMatch = trimmed.match(/\{[\s\S]*\}/);
@@ -270,6 +271,313 @@ export function resolveClassifierModel(
 	return { model: ctx.model, label: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "无", fallbackReason, configValue, stageName };
 }
 
+// ==========================================
+// 分类器 Stage 1 / Stage 2 超时配置校验（载入时执行，纯逻辑、可单测）
+//
+// 单一规则：任一字段违规 → 警告 + 两字段整体回退默认 1500/3000。
+// stage2 缺省走派生（有效 stage1 × 2），非违规。
+// ==========================================
+
+const CLASSIFIER_TIMEOUT_DEFAULT_STAGE1 = 1500;
+const CLASSIFIER_TIMEOUT_DEFAULT_STAGE2 = 3000;
+const CLASSIFIER_TIMEOUT_MIN = 500;
+const CLASSIFIER_TIMEOUT_MAX_STAGE1 = 60000;
+const CLASSIFIER_TIMEOUT_MAX_STAGE2 = 600000;
+
+function formatReceivedTimeout(v: unknown): string {
+	if (typeof v === "number") {
+		if (Number.isNaN(v)) return "NaN";
+		if (!Number.isFinite(v)) return v > 0 ? "Infinity" : "-Infinity";
+		return String(v);
+	}
+	return JSON.stringify(v) ?? String(v);
+}
+
+function timeoutFieldValid(v: unknown, max: number): boolean {
+	if (typeof v !== "number") return false; // 堵字符串 "5000"
+	if (!Number.isFinite(v) || !Number.isInteger(v)) return false; // 堵 NaN/Infinity/小数
+	if (v < CLASSIFIER_TIMEOUT_MIN) return false;
+	if (v > max) return false;
+	return true;
+}
+
+export interface ClassifierTimeoutResolution {
+	stage1: number;
+	stage2: number;
+	violated: boolean;
+}
+
+/**
+ * 校验并解析分类器超时配置，返回 stage1/stage2 有效值。
+ * 违规时发出 console.warn 一行（含字段名、收到值、回退结果）并在提供 ctx 时 ctx.ui.notify 一次；
+ * 载入完成后 console.debug 打一行两字段 effective 值。
+ */
+export function applyClassifierTimeoutConfig(
+	fileConfig: ApprovalConfigFile,
+	ctx?: { ui?: { notify?: (message: string, level: string) => void } },
+): ClassifierTimeoutResolution {
+	const s1Provided = typeof fileConfig.classifierTimeoutMs !== "undefined";
+	const s2Provided = typeof fileConfig.classifierStage2TimeoutMs !== "undefined";
+
+	let stage1 = CLASSIFIER_TIMEOUT_DEFAULT_STAGE1;
+	let stage2 = CLASSIFIER_TIMEOUT_DEFAULT_STAGE2;
+	let violation: string | undefined;
+
+	if (s1Provided) {
+		const candS1 = fileConfig.classifierTimeoutMs;
+		if (!timeoutFieldValid(candS1, CLASSIFIER_TIMEOUT_MAX_STAGE1)) {
+			violation = `classifierTimeoutMs 收到 ${formatReceivedTimeout(candS1)}（须为 ${CLASSIFIER_TIMEOUT_MIN}–${CLASSIFIER_TIMEOUT_MAX_STAGE1} 的整数毫秒）`;
+		} else {
+			stage1 = candS1 as number;
+		}
+	}
+
+	if (!violation) {
+		if (s2Provided) {
+			const candS2 = fileConfig.classifierStage2TimeoutMs;
+			if (!timeoutFieldValid(candS2, CLASSIFIER_TIMEOUT_MAX_STAGE2)) {
+				violation = `classifierStage2TimeoutMs 收到 ${formatReceivedTimeout(candS2)}（须为 ${CLASSIFIER_TIMEOUT_MIN}–${CLASSIFIER_TIMEOUT_MAX_STAGE2} 的整数毫秒）`;
+			} else if ((candS2 as number) <= stage1) {
+				violation = `classifierStage2TimeoutMs 收到 ${formatReceivedTimeout(candS2)}，必须大于 classifierTimeoutMs (${stage1})`;
+			} else {
+				stage2 = candS2 as number;
+			}
+		} else {
+			stage2 = stage1 * 2;
+		}
+	}
+
+	if (violation) {
+		stage1 = CLASSIFIER_TIMEOUT_DEFAULT_STAGE1;
+		stage2 = CLASSIFIER_TIMEOUT_DEFAULT_STAGE2;
+		const message =
+			`[ApprovalMode] 分类器超时配置违规：${violation}；stage1/stage2 整体回退默认 ${CLASSIFIER_TIMEOUT_DEFAULT_STAGE1}/${CLASSIFIER_TIMEOUT_DEFAULT_STAGE2}ms。`;
+		console.warn(message);
+		ctx?.ui?.notify?.(message, "warning");
+	}
+
+	console.debug(`[ApprovalMode] 分类器超时 effective: stage1=${stage1}ms stage2=${stage2}ms`);
+	return { stage1, stage2, violated: Boolean(violation) };
+}
+
+// ==========================================
+// /classifier-model 参数解析、帮助与自动补全纯逻辑
+// ==========================================
+
+export const CLASSIFIER_SET_FLAGS = ["--stage1", "--stage2", "--both"] as const;
+export type ClassifierSetFlag = (typeof CLASSIFIER_SET_FLAGS)[number];
+
+export type ClassifierModelCommand =
+	| { kind: "status" }
+	| { kind: "help" }
+	| { kind: "clear"; targets: ClassifierSetFlag[] }
+	| { kind: "set"; pairs: { flag: ClassifierSetFlag; model: string }[] }
+	| { kind: "error"; message: string };
+
+export const CLASSIFIER_USAGE =
+	"用法: /classifier-model [--stage1 <m>] [--stage2 <m>] [--both <m>] | clear [--stage1|--stage2|--both] | help";
+
+export const CLASSIFIER_FLAG_DESCRIPTIONS: Record<string, string> = {
+	"--stage1": "设置 Stage 1（快筛）专属模型",
+	"--stage2": "设置 Stage 2（复核）专属模型",
+	"--both": "一个模型同时用于 Stage 1 与 Stage 2",
+	clear: "清空分类器模型配置；可用 --stage1/--stage2/--both 指定范围",
+	help: "显示用法与示例",
+};
+
+export const CLASSIFIER_CLEAR_TARGET_DESCRIPTIONS: Record<ClassifierSetFlag, string> = {
+	"--stage1": "清除 Stage 1 专属模型配置",
+	"--stage2": "清除 Stage 2 专属模型配置",
+	"--both": "清除共享与两阶段配置（≡ clear）",
+};
+
+export const CLASSIFIER_HELP_TEXT = `/classifier-model — 查看或设置 Auto 模式分类器模型
+
+用法:
+  /classifier-model                                   查看两阶段状态与用法提示
+  /classifier-model --stage1 <model>                  设置 Stage 1（快筛）专属模型
+  /classifier-model --stage2 <model>                  设置 Stage 2（复核）专属模型
+  /classifier-model --stage1 <m1> --stage2 <m2>       两阶段分别设置（顺序无关）
+  /classifier-model --both <model>                    一个模型同时用于两阶段
+  /classifier-model clear                             清空全部分类器模型配置（回落内置默认→主模型）
+  /classifier-model clear --stage1 [--stage2]         按目标清除（--both ≡ clear）
+  /classifier-model help                              显示本帮助
+
+示例:
+  /classifier-model --stage1 deepseek/deepseek-flash --stage2 deepseek/deepseek-v4-pro
+  /classifier-model --both deepseek/deepseek-flash
+  /classifier-model clear --stage1
+
+说明: --both 与 --stage1/--stage2 互斥；旧语法 <model>/default 已移除（分别用 --both <model>/clear）`;
+
+export function formatModelCost(input?: number, output?: number): string {
+	const fmtNum = (n: number) => (Number.isInteger(n) ? String(n) : String(parseFloat(n.toFixed(4))));
+	const inStr = typeof input === "number" ? fmtNum(input) : "0";
+	const outStr = typeof output === "number" ? fmtNum(output) : "0";
+	return `$${inStr}/$${outStr} per M`;
+}
+
+export function formatModelCtx(ctxWindow?: number): string {
+	if (!ctxWindow || ctxWindow <= 0) return "";
+	if (ctxWindow >= 1_000_000) {
+		const val = +(ctxWindow / 1_000_000).toFixed(1);
+		return `${val}M ctx`;
+	}
+	return `${Math.round(ctxWindow / 1_000)}K ctx`;
+}
+
+export function buildModelDescription(
+	m: { cost?: { input?: number; output?: number }; reasoning?: boolean; contextWindow?: number },
+	isCurrentEffective = false,
+): string | undefined {
+	const parts: string[] = [];
+
+	// 1. cost（无 cost 或均为 0 时整段省略）
+	const cost = m.cost;
+	if (cost && ((cost.input && cost.input > 0) || (cost.output && cost.output > 0))) {
+		parts.push(formatModelCost(cost.input, cost.output));
+	}
+
+	// 2. reasoning 标记（非 reasoning 省略）
+	if (m.reasoning) {
+		parts.push("reasoning");
+	}
+
+	// 3. 上下文窗口
+	const ctxStr = formatModelCtx(m.contextWindow);
+	if (ctxStr) {
+		parts.push(ctxStr);
+	}
+
+	if (parts.length === 0) {
+		return isCurrentEffective ? "✓ 当前生效" : undefined;
+	}
+
+	const meta = parts.join(" · ");
+	return isCurrentEffective ? `✓ ${meta}` : meta;
+}
+
+export function parseClassifierModelArgs(args: string): ClassifierModelCommand {
+	const text = (args ?? "").trim();
+	if (text === "") return { kind: "status" };
+
+	const tokens = text.split(/\s+/).filter(Boolean);
+	const first = tokens[0];
+
+	// help 必须单独出现（C8）
+	if (first === "help") {
+		if (tokens.length > 1) {
+			return { kind: "error", message: `"help" 必须单独使用，不能与其他参数同现` };
+		}
+		return { kind: "help" };
+	}
+
+	// clear 子命令（首 token）
+	if (first === "clear") {
+		const targets: ClassifierSetFlag[] = [];
+		for (const t of tokens.slice(1)) {
+			if (!t.startsWith("--")) {
+				return { kind: "error", message: `clear 后面仅接受目标 flag（--stage1/--stage2/--both），不支持位置入参 "${t}"` };
+			}
+			const lower = t.toLowerCase();
+			if (CLASSIFIER_SET_FLAGS.includes(lower as ClassifierSetFlag) && t !== lower) {
+				return { kind: "error", message: `flag 严格小写，不接受 "${t}"（可用：--stage1 / --stage2 / --both）` };
+			}
+			if (!CLASSIFIER_SET_FLAGS.includes(t as ClassifierSetFlag)) {
+				return { kind: "error", message: `未知 flag "${t}"（flag 严格小写，可用：--stage1 / --stage2 / --both）` };
+			}
+			const flag = t as ClassifierSetFlag;
+			if (targets.includes(flag)) {
+				return { kind: "error", message: `重复 flag "${t}"（同一条命令只能出现一次）` };
+			}
+			if (flag === "--both" && targets.length > 0) {
+				return { kind: "error", message: `"--both" 与目标 flag 互斥，不能在 clear 中同现` };
+			}
+			if (flag !== "--both" && targets.includes("--both")) {
+				return { kind: "error", message: `"--both" 与目标 flag 互斥，不能在 clear 中同现` };
+			}
+			targets.push(flag);
+		}
+		return { kind: "clear", targets };
+	}
+
+	// 设置 flags 序列
+	const pairs: { flag: ClassifierSetFlag; model: string }[] = [];
+	const seen: ClassifierSetFlag[] = [];
+	let i = 0;
+
+	while (i < tokens.length) {
+		const tok = tokens[i];
+
+		if (tok === "clear") {
+			return { kind: "error", message: `"clear" 只能作为首 token 子命令，不能与设置 flag 混用` };
+		}
+		if (tok === "help") {
+			return { kind: "error", message: `"help" 必须单独使用，不能与设置 flag 混用` };
+		}
+		if (!tok.startsWith("--")) {
+			return { kind: "error", message: `不支持位置入参 "${tok}"（旧语法已移除：设置用 --both <m>，重置用 clear）` };
+		}
+
+		const lower = tok.toLowerCase();
+		if (CLASSIFIER_SET_FLAGS.includes(lower as ClassifierSetFlag) && tok !== lower) {
+			return { kind: "error", message: `flag 严格小写，不接受 "${tok}"（可用：--stage1 / --stage2 / --both）` };
+		}
+		if (!CLASSIFIER_SET_FLAGS.includes(tok as ClassifierSetFlag)) {
+			return { kind: "error", message: `未知 flag "${tok}"（flag 严格小写，可用：--stage1 / --stage2 / --both）` };
+		}
+
+		const flag = tok as ClassifierSetFlag;
+		if (seen.includes(flag)) {
+			return { kind: "error", message: `重复 flag "${flag}"（同一条命令只能出现一次）` };
+		}
+		if (flag === "--both" && seen.length > 0) {
+			return { kind: "error", message: `"--both" 与 --stage1/--stage2 互斥，不能出现在同一条命令` };
+		}
+		if (flag !== "--both" && seen.includes("--both")) {
+			return { kind: "error", message: `"--both" 与 --stage1/--stage2 互斥，不能出现在同一条命令` };
+		}
+
+		const val = tokens[i + 1];
+		if (val === undefined) {
+			return { kind: "error", message: `"${flag}" 缺少模型值` };
+		}
+		if (val.startsWith("--")) {
+			return { kind: "error", message: `"${flag}" 的值不能以 "--" 开头（"${val}"）——是否缺少模型值？` };
+		}
+		if (val === "clear") {
+			return { kind: "error", message: `"clear" 不能作为 flag 的值` };
+		}
+		if (val === "help") {
+			return { kind: "error", message: `"help" 不能作为 flag 的值（help 必须单独出现）` };
+		}
+
+		pairs.push({ flag, model: val });
+		seen.push(flag);
+		i += 2;
+	}
+
+	return { kind: "set", pairs };
+}
+
+/**
+ * 审批弹窗单行渲染：按视口宽度自适应换行，替代逐行截断省略。
+ *
+ * 首行前置 indent，续行前置 contIndent（保持与首行的缩进对齐）；换行交给
+ * pi-tui 的 wrapTextWithAnsi —— 按词换行、跨行保留活动 ANSI 样式、无词边界的
+ * 超长 shell 命令按字符断行，每行可见宽度 ≤ width（indent 占位计入）。
+ *
+ * @param str 待展示内容（可含 ANSI 样式与 \n）
+ * @param width 当前视口宽度（渲染侧已做下限保护）
+ * @param indent 首行缩进
+ * @param contIndent 续行缩进（默认与 indent 相同；传前缀类 indent 时应给等宽空格）
+ */
+export function wrapDialogLine(str: string, width: number, indent = "", contIndent = indent): string[] {
+	const reserve = Math.max(visibleWidth(indent), visibleWidth(contIndent));
+	const wrapWidth = Math.max(1, width - reserve);
+	return wrapTextWithAnsi(str, wrapWidth).map((line, i) => (i === 0 ? indent : contIndent) + line);
+}
+
 export default function approvalModeExtension(pi: ExtensionAPI): void {
 	let currentMode: ApprovalMode = "auto";
 	let toolsBeforePlanMode: string[] | undefined;
@@ -277,6 +585,8 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 	let customClassifierStage1Model: string | undefined;
 	let customClassifierStage2Model: string | undefined;
 	let classifierTimeoutMs = 1500;
+	let classifierStage2TimeoutMs = 3000;
+	let latestCtx: ExtensionContext | undefined;
 
 	// Qwen Code 四态权限规则管理器
 	let permissionManager: PermissionManager;
@@ -311,7 +621,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		const badges: Record<ApprovalMode, string> = {
 			manual: theme.fg("success", "🛡️ manual"),
 			"auto-edit": theme.fg("accent", "📝 auto-edit"),
-			auto: theme.fg("borderAccent", "🤖 auto"),
+			auto: theme.fg("borderAccent", "⚖️ auto"),
 			yolo: theme.fg("error", "⚡ yolo"),
 			plan: theme.fg("warning", "📋 plan"),
 		};
@@ -343,6 +653,9 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		currentMode = newMode;
 
 		loopDetector.reset();
+		// 与 loopDetector 对称重置 denialTracker，跨模式不带旧债
+		// （plan 连拒切 auto 开局即清零，含 totalBlock/totalUnavailable/指纹）。
+		denialTracker.resetAll();
 		applyModeTools(newMode);
 
 		// auto 护栏：进入 auto 暂存危险 allow 规则，离开 auto 恢复
@@ -380,6 +693,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 
 	// 2. 会话启动初始化与恢复 (包含生命周期安全降级与优先级裁决)
 	pi.on("session_start", async (event, ctx) => {
+		latestCtx = ctx;
 		const isReload = event.reason === "reload";
 		const isTrusted = typeof ctx.isProjectTrusted === "function" ? ctx.isProjectTrusted() : true;
 
@@ -418,9 +732,9 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		if (fileConfig.classifierStage2Model) {
 			customClassifierStage2Model = fileConfig.classifierStage2Model;
 		}
-		if (typeof fileConfig.classifierTimeoutMs === "number" && fileConfig.classifierTimeoutMs > 0) {
-			classifierTimeoutMs = fileConfig.classifierTimeoutMs;
-		}
+		const timeoutConfig = applyClassifierTimeoutConfig(fileConfig, ctx);
+		classifierTimeoutMs = timeoutConfig.stage1;
+		classifierStage2TimeoutMs = timeoutConfig.stage2;
 		if (fileConfig.loopDetection) {
 			loopDetector.updateThresholds(fileConfig.loopDetection);
 		}
@@ -666,37 +980,253 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		},
 	});
 
+	function buildClassifierStatusReport(ctx: ExtensionContext): string {
+		const r1 = resolveClassifierModel(ctx, customClassifierStage1Model, customClassifierModel, false, "Stage 1");
+		const r2 = resolveClassifierModel(ctx, customClassifierStage2Model, customClassifierModel, false, "Stage 2");
+
+		const s1Msg = `Stage 1: 配置值 ${r1.configValue || "未配置"} → 生效值 ${r1.label}` + (r1.fallbackReason ? ` (回退原因: ${r1.fallbackReason})` : "");
+		const s2Msg = `Stage 2: 配置值 ${r2.configValue || "未配置"} → 生效值 ${r2.label}` + (r2.fallbackReason ? ` (回退原因: ${r2.fallbackReason})` : "");
+
+		return `当前审批分类器模型状态:\n${s1Msg}\n${s2Msg}\n配置文件: ~/.pi/agent/approval-config.json\n\n${CLASSIFIER_USAGE}`;
+	}
+
+	function validateClassifierModelRef(ctx: ExtensionContext, modelRef: string): { ok: boolean; reason?: string } {
+		if (modelRef.includes("/")) {
+			const slashIdx = modelRef.indexOf("/");
+			const provider = modelRef.slice(0, slashIdx);
+			const id = modelRef.slice(slashIdx + 1);
+			const found = ctx.modelRegistry.find(provider, id);
+			if (found && ctx.modelRegistry.hasConfiguredAuth(found)) {
+				return { ok: true };
+			}
+			return { ok: false, reason: "未找到该模型或未配置有效认证" };
+		}
+		for (const m of ctx.modelRegistry.getAll()) {
+			if (m.id === modelRef && ctx.modelRegistry.hasConfiguredAuth(m)) {
+				return { ok: true };
+			}
+		}
+		return { ok: false, reason: "未找到该模型或未配置有效认证" };
+	}
+
+	function getClassifierModelCompletions(argumentPrefix: string): AutocompleteItem[] | null {
+		const raw = argumentPrefix ?? "";
+		const trailingSpace = /\s$/.test(raw);
+		const tokens = raw.trim().split(/\s+/).filter(Boolean);
+		const completed = trailingSpace ? tokens : tokens.slice(0, -1);
+		const partial = trailingSpace ? "" : (tokens.length > 0 ? tokens[tokens.length - 1] : "");
+
+		// 1. START 槽位（未完成任何 token）
+		if (completed.length === 0) {
+			const startOptions = [...CLASSIFIER_SET_FLAGS, "clear", "help"] as const;
+			const matched = startOptions.filter((opt) => opt.startsWith(partial));
+			if (matched.length === 0) return null;
+			return matched.map((opt) => ({
+				value: opt,
+				label: opt,
+				description: CLASSIFIER_FLAG_DESCRIPTIONS[opt],
+			}));
+		}
+
+		const head = completed[0];
+
+		// 2. HELP 分支
+		if (head === "help") {
+			return null;
+		}
+
+		// 3. CLEAR 分支
+		if (head === "clear") {
+			const usedTargets: ClassifierSetFlag[] = [];
+			for (const t of completed.slice(1)) {
+				if (!CLASSIFIER_SET_FLAGS.includes(t as ClassifierSetFlag)) {
+					return null;
+				}
+				const flag = t as ClassifierSetFlag;
+				if (usedTargets.includes(flag)) return null;
+				if (flag === "--both" && usedTargets.length > 0) return null;
+				if (flag !== "--both" && usedTargets.includes("--both")) return null;
+				usedTargets.push(flag);
+			}
+
+			let candidateFlags: ClassifierSetFlag[] = [];
+			if (usedTargets.length === 0) {
+				candidateFlags = [...CLASSIFIER_SET_FLAGS];
+			} else if (usedTargets.includes("--both")) {
+				return null;
+			} else {
+				candidateFlags = CLASSIFIER_SET_FLAGS.filter((f) => f !== "--both" && !usedTargets.includes(f));
+			}
+
+			const matched = candidateFlags.filter((f) => f.startsWith(partial));
+			if (matched.length === 0) return null;
+			const base = completed.join(" ");
+			return matched.map((f) => ({
+				value: `${base} ${f}`,
+				label: f,
+				description: CLASSIFIER_CLEAR_TARGET_DESCRIPTIONS[f],
+			}));
+		}
+
+		// 4. 设置 flags 序列
+		const usedFlags: ClassifierSetFlag[] = [];
+		let i = 0;
+		while (i < completed.length) {
+			const flagTok = completed[i];
+			if (!CLASSIFIER_SET_FLAGS.includes(flagTok as ClassifierSetFlag)) {
+				return null;
+			}
+			const flag = flagTok as ClassifierSetFlag;
+			if (usedFlags.includes(flag)) return null;
+			if (flag === "--both" && usedFlags.length > 0) return null;
+			if (flag !== "--both" && usedFlags.includes("--both")) return null;
+
+			// 若当前 flag 处于最后一个 completed token，说明正在输入其模型值（SET_VALUE）
+			if (i + 1 >= completed.length) {
+				const models = latestCtx?.modelRegistry?.getAll() ?? [];
+				const base = completed.join(" ");
+
+				let currentEffectiveLabel: string | undefined;
+				if (latestCtx) {
+					if (flag === "--stage1") {
+						currentEffectiveLabel = resolveClassifierModel(latestCtx, customClassifierStage1Model, customClassifierModel, false, "Stage 1").label;
+					} else if (flag === "--stage2") {
+						currentEffectiveLabel = resolveClassifierModel(latestCtx, customClassifierStage2Model, customClassifierModel, false, "Stage 2").label;
+					} else {
+						const r1 = resolveClassifierModel(latestCtx, customClassifierStage1Model, customClassifierModel, false, "Stage 1").label;
+						const r2 = resolveClassifierModel(latestCtx, customClassifierStage2Model, customClassifierModel, false, "Stage 2").label;
+						if (r1 === r2) currentEffectiveLabel = r1;
+					}
+				}
+
+				const items: AutocompleteItem[] = [];
+				for (const m of models) {
+					const ref = `${m.provider}/${m.id}`;
+					if (!ref.startsWith(partial)) continue;
+					const isCurrent = ref === currentEffectiveLabel;
+					const desc = buildModelDescription(m, isCurrent);
+					items.push({
+						value: `${base} ${ref}`,
+						label: ref,
+						...(desc ? { description: desc } : {}),
+					});
+				}
+				return items.length > 0 ? items : null;
+			}
+
+			const val = completed[i + 1];
+			if (val.startsWith("--") || val === "clear" || val === "help") {
+				return null;
+			}
+
+			usedFlags.push(flag);
+			i += 2;
+		}
+
+		// 5. 完整成对后，输入下一个 flag（SET_FLAG）
+		if (i === completed.length) {
+			let candidateFlags: ClassifierSetFlag[] = [];
+			if (usedFlags.includes("--both")) {
+				return null;
+			} else {
+				candidateFlags = CLASSIFIER_SET_FLAGS.filter((f) => f !== "--both" && !usedFlags.includes(f));
+			}
+
+			const matched = candidateFlags.filter((f) => f.startsWith(partial));
+			if (matched.length === 0) return null;
+			const base = completed.join(" ");
+			return matched.map((f) => ({
+				value: `${base} ${f}`,
+				label: f,
+				description: CLASSIFIER_FLAG_DESCRIPTIONS[f],
+			}));
+		}
+
+		return null;
+	}
+
 	// 配置分类器模型：/classifier-model
 	pi.registerCommand("classifier-model", {
-		description: "查看或保存 Auto 模式下的快速分类器模型 (/classifier-model [provider/model|default])",
+		description: "查看/设置分类器模型（--stage1/--stage2/--both；clear/help）",
+		getArgumentCompletions: (argumentPrefix) => getClassifierModelCompletions(argumentPrefix),
 		handler: async (args, ctx) => {
-			if (!args?.trim()) {
-				const r1 = resolveClassifierModel(ctx, customClassifierStage1Model, customClassifierModel, false, "Stage 1");
-				const r2 = resolveClassifierModel(ctx, customClassifierStage2Model, customClassifierModel, false, "Stage 2");
+			const parsed = parseClassifierModelArgs(args ?? "");
 
-				const s1Msg = `Stage 1: 配置值 ${r1.configValue || "未配置"} → 生效值 ${r1.label}` + (r1.fallbackReason ? ` (回退原因: ${r1.fallbackReason})` : "");
-				const s2Msg = `Stage 2: 配置值 ${r2.configValue || "未配置"} → 生效值 ${r2.label}` + (r2.fallbackReason ? ` (回退原因: ${r2.fallbackReason})` : "");
-				
-				ctx.ui.notify(`当前审批分类器模型状态:\n${s1Msg}\n${s2Msg}\n配置文件: ~/.pi/agent/approval-config.json`, "info");
+			if (parsed.kind === "error") {
+				ctx.ui.notify(`${parsed.message}\n\n${CLASSIFIER_USAGE}`, "error");
 				return;
 			}
 
-			const target = args.trim();
-			if (target === "default") {
-				customClassifierModel = undefined;
-				customClassifierStage1Model = undefined;
-				customClassifierStage2Model = undefined;
-				saveGlobalApprovalConfig({ classifierModel: undefined, classifierStage1Model: undefined, classifierStage2Model: undefined });
-				const resetResolved = resolveClassifierModel(ctx, undefined, undefined, false, "Stage 1");
-				ctx.ui.notify(`已重置为默认分类器模型: ${resetResolved.label}`, "info");
+			if (parsed.kind === "status") {
+				ctx.ui.notify(buildClassifierStatusReport(ctx), "info");
 				return;
 			}
 
-			customClassifierModel = target;
-			customClassifierStage1Model = undefined;
-			customClassifierStage2Model = undefined;
-			saveGlobalApprovalConfig({ classifierModel: target, classifierStage1Model: undefined, classifierStage2Model: undefined });
-			ctx.ui.notify(`已强制覆盖保存分类器模型配置 (${target}) 到 ~/.pi/agent/approval-config.json`, "info");
+			if (parsed.kind === "help") {
+				ctx.ui.notify(CLASSIFIER_HELP_TEXT, "info");
+				return;
+			}
+
+			if (parsed.kind === "clear") {
+				const patch: Partial<ApprovalConfigFile> = {};
+				const clearAll = parsed.targets.length === 0 || parsed.targets.includes("--both");
+
+				if (clearAll || parsed.targets.includes("--stage1")) {
+					customClassifierStage1Model = undefined;
+					patch.classifierStage1Model = undefined;
+				}
+				if (clearAll || parsed.targets.includes("--stage2")) {
+					customClassifierStage2Model = undefined;
+					patch.classifierStage2Model = undefined;
+				}
+				if (clearAll) {
+					customClassifierModel = undefined;
+					patch.classifierModel = undefined;
+				}
+
+				saveGlobalApprovalConfig(patch);
+				const clearedDesc = clearAll ? "全部分类器模型配置" : parsed.targets.join(" ");
+				ctx.ui.notify(`已清除分类器模型配置 (${clearedDesc})\n\n${buildClassifierStatusReport(ctx)}`, "info");
+				return;
+			}
+
+			if (parsed.kind === "set") {
+				// D1: 全有或全无校验
+				for (const pair of parsed.pairs) {
+					const check = validateClassifierModelRef(ctx, pair.model);
+					if (!check.ok) {
+						ctx.ui.notify(
+							`"${pair.flag}" 的模型值 "${pair.model}" 无效：${check.reason}（期望 <provider>/<model>）\n整条命令未保存（全有或全无）\n\n${CLASSIFIER_USAGE}`,
+							"error",
+						);
+						return;
+					}
+				}
+
+				// 全部有效后生效并落盘
+				const patch: Partial<ApprovalConfigFile> = {};
+				for (const pair of parsed.pairs) {
+					if (pair.flag === "--stage1") {
+						customClassifierStage1Model = pair.model;
+						patch.classifierStage1Model = pair.model;
+					} else if (pair.flag === "--stage2") {
+						customClassifierStage2Model = pair.model;
+						patch.classifierStage2Model = pair.model;
+					} else if (pair.flag === "--both") {
+						customClassifierModel = pair.model;
+						customClassifierStage1Model = undefined;
+						customClassifierStage2Model = undefined;
+						patch.classifierModel = pair.model;
+						patch.classifierStage1Model = undefined;
+						patch.classifierStage2Model = undefined;
+					}
+				}
+
+				saveGlobalApprovalConfig(patch);
+				const savedDesc = parsed.pairs.map((p) => `${p.flag} → ${p.model}`).join(", ");
+				ctx.ui.notify(`已保存分类器模型配置: ${savedDesc}\n\n${buildClassifierStatusReport(ctx)}`, "info");
+				return;
+			}
 		},
 	});
 
@@ -844,7 +1374,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 				{ cacheRetention: "none" },
 			);
 
-			stage2Response = await withTimeout(stage2Promise, classifierTimeoutMs * 2, null);
+			stage2Response = await withTimeout(stage2Promise, classifierStage2TimeoutMs, null);
 		} catch (err) {
 			denialTracker.recordUnavailable();
 			return {
@@ -859,7 +1389,26 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 			denialTracker.recordUnavailable();
 			return {
 				shouldBlock: true,
-				reason: DENIAL_MESSAGES.singleUnavailable(`stage2_timeout(${classifierTimeoutMs * 2}ms)`),
+				reason: DENIAL_MESSAGES.singleUnavailable(`stage2_timeout(${classifierStage2TimeoutMs}ms)`),
+				stage: "fallback",
+				outage: true
+			};
+		}
+
+		// 上游错误 ≠ 解析失败。stopReason=error（如 content_filter）是
+		// provider 对请求本身的拒绝，不是 JSON 解析问题——分型归因避免排障被误导。
+		const s2Err =
+			(stage2Response as any).stopReason === "error" || (stage2Response as any).errorMessage
+				? String((stage2Response as any).errorMessage || "unknown upstream error")
+				: null;
+		if (s2Err !== null) {
+			denialTracker.recordUnavailable();
+			const upstreamCode = (s2Err.match(/finish_reason:\s*([\w]+)/i)?.[1] || s2Err).slice(0, 60);
+			return {
+				shouldBlock: true,
+				reason: s2Err.includes("content_filter")
+					? DENIAL_MESSAGES.classifierContentFilter(toolName)
+					: DENIAL_MESSAGES.classifierUpstreamError(upstreamCode, toolName),
 				stage: "fallback",
 				outage: true
 			};
@@ -897,12 +1446,14 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		title: string,
 		details: Array<{ label: string; content: string }>,
 		isLoop = false,
+		denyByDefault = false,
 	): Promise<ApprovalAction> {
 		const options: ApprovalOption[] = isLoop ? [...APPROVAL_OPTIONS, LOOP_ABORT_OPTION] : APPROVAL_OPTIONS;
 
 		if (ctx.mode === "tui") {
 			const result = await ctx.ui.custom<ApprovalAction | null>((tui, theme, _kb, done) => {
-				let selectedIndex = 0;
+				// 指纹短路弹窗默认拒绝态（光标停在 Block；Esc 本就=拒绝）
+				let selectedIndex = denyByDefault ? Math.max(0, options.findIndex((o) => o.action === "block")) : 0;
 
 				function refresh() {
 					tui.requestRender();
@@ -953,26 +1504,27 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 						const safeWidth = Math.max(10, width);
 						const lines: string[] = [];
 
-						const addLine = (str: string) => {
-							lines.push(truncateToWidth(str, safeWidth));
+						// 视口宽度内自适应换行（不再按行截断省略），续行按缩进对齐
+						const addLine = (str: string, indent = "", contIndent = indent) => {
+							for (const l of wrapDialogLine(str, safeWidth, indent, contIndent)) lines.push(l);
 						};
 
 						// 顶部线条与标题
 						addLine(theme.fg("accent", "─".repeat(safeWidth)));
-						addLine(` ${theme.fg("accent", theme.bold(title))}`);
-						addLine(` ${theme.fg("accent", `当前审批模式: ${currentMode}  (按 Ctrl+Alt+A 可切换)`)}`);
+						addLine(theme.fg("accent", theme.bold(title)), " ");
+						addLine(theme.fg("accent", `当前审批模式: ${currentMode}  (按 Ctrl+Alt+A 可切换)`), " ");
 						addLine("");
 
 						// 详细信息展示区
 						for (const item of details) {
-							addLine(`  ${theme.fg("muted", item.label)}:`);
+							addLine(`${theme.fg("muted", item.label)}:`, "  ");
 							for (const cl of item.content.split("\n")) {
-								addLine(`    ${theme.fg("text", cl)}`);
+								addLine(theme.fg("text", cl), "    ");
 							}
 						}
 
 						addLine("");
-						addLine(theme.fg("muted", `  请选择审批动作 (支持直接按数字键 1-${options.length} 快速选择):`));
+						addLine(theme.fg("muted", `请选择审批动作 (支持直接按数字键 1-${options.length} 快速选择):`), "  ");
 						addLine("");
 
 						// 渲染编号选项
@@ -983,14 +1535,16 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 							const numTag = theme.fg(isSelected ? "accent" : "muted", `${i + 1}. `);
 							const labelText = theme.fg(isSelected ? "accent" : "text", opt.label);
 
-							addLine(`${prefix}${numTag}${labelText}`);
+							// 前缀（光标箭头 + 编号）作为首行缩进，续行用等宽空格对齐到 label 起始列
+							const firstPrefix = `${prefix}${numTag}`;
+							addLine(labelText, firstPrefix, " ".repeat(visibleWidth(firstPrefix)));
 							if (opt.description) {
-								addLine(`     ${theme.fg("dim", opt.description)}`);
+								addLine(theme.fg("dim", opt.description), "     ");
 							}
 						}
 
 						addLine("");
-						addLine(theme.fg("muted", `  [快捷提示] 按 1-${options.length} 直接选择 | ↑/↓ 移动 | Enter 确认 | Esc 拒绝 | Ctrl+Alt+A 切换模式`));
+						addLine(theme.fg("muted", `[快捷提示] 按 1-${options.length} 直接选择 | ↑/↓ 移动 | Enter 确认 | Esc 拒绝 | Ctrl+Alt+A 切换模式`), "  ");
 						addLine(theme.fg("accent", "─".repeat(safeWidth)));
 
 						return lines;
@@ -1023,6 +1577,18 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		return undefined;
 	}
 
+	/**
+	 * 分类器连续不可用熔断是否已触顶（交互降级启发式的判据）
+	 *
+	 * 不能复用 checkFallback().kind：后人工拒绝也计入 consecutiveBlock，
+	 * 而 consecutiveBlock 触顶时 kind 会是 consecutive_block，把“不可用”降级电路顶掉，
+	 * 故障窗口的重复弹窗抑制（本单预期的实现路径）随之失效。故直接读不可用计数。
+	 */
+	function unavailableCircuitTripped(): boolean {
+		const stats = denialTracker.getStats();
+		return stats.consecutiveUnavailable >= denialTracker.getLimits().maxConsecutiveUnavailable;
+	}
+
 	function blockCall(
 		toolName: string,
 		input: Record<string, any>,
@@ -1030,8 +1596,11 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		terminate = false,
 		countAsDenial = true,
 	): ToolCallEventResult {
-		// 统计归属：分类器故障引发的阻塞只计入“不可用”计数，
+		// 统计归属：分类器故障引发的**自动拦截**只计入“不可用”计数，
 		// 不灌入“拒绝”类统计（consecutiveBlock/totalBlock/loop 连续被拒）——两套计数各司其职。
+		// 仅无头自动拦截可用此豁免；用户在弹窗中的拒绝一律入账。
+		// 口径：拒绝类 = 一切明确说 no 的拦截（用户拒绝 / deny 规则 /
+		// plan 拦截 / 熔断自拦）；“不可用”豁免仅限分类器 outage 的自动拦截（基线 M11 口径句）。
 		if (countAsDenial) {
 			loopDetector.recordDenial(toolName, input);
 			const fingerprint = DenialTracker.createFingerprint(toolName, input);
@@ -1046,6 +1615,9 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 
 	/**
 	 * 处理用户的审批选择并持久化为标准 Qwen Code DSL 规则
+	 *
+	 * 本函数只承载“人在弹窗里的决定”，因此拒绝一律计入拒绝侧统计；
+	 * 分类器故障的豁免只适用于无头自动拦截（blockCall 的 countAsDenial）。
 	 */
 	async function handleOutcome(
 		action: ApprovalAction,
@@ -1054,8 +1626,19 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		label: string,
 		toolName: string,
 		input: Record<string, any>,
-		countAsDenial = true,
+		fromCircuitFallback = false, // 本次弹窗是否因熔断跳过分类器而产生（Qwen wasAutoModeFallback 同款判据）
 	): Promise<ToolCallEventResult | undefined> {
+		// （Qwen Code v2 同款）：仅「触顶后跳过分类器的 fallback 弹窗」上的
+		// 人工批准是自愈触发器——清连击计数，下次判定重新交分类器；
+		// 分类器真实跑过但失败的故障弹窗批准不清（0027-A/D1 语义保持）；
+		// 拒绝路径不清（拒绝视为分类器判对）。
+		if (
+			(action === "allow_once" || action === "allow_session" ||
+			 action === "allow_project" || action === "allow_user") &&
+			fromCircuitFallback && unavailableCircuitTripped()
+		) {
+			denialTracker.recordFallbackApprove();
+		}
 		switch (action) {
 			case "allow_once":
 				return allowCall(toolName, input);
@@ -1101,13 +1684,11 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 					toolName,
 					input,
 					`[User Directive] The user explicitly rejected this action and commanded you to halt this direction immediately. Reflect on the blocker, step back, and pursue a completely different approach.`,
-					false,
-					countAsDenial,
 				);
 
 			case "block":
 			default:
-				return blockCall(toolName, input, DENIAL_MESSAGES.userDenied(label), false, countAsDenial);
+				return blockCall(toolName, input, DENIAL_MESSAGES.userDenied(label));
 		}
 	}
 
@@ -1126,23 +1707,30 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		// ==============================================================
 		const loopCheck = loopDetector.checkBeforeExecution(toolName, input);
 		if (loopCheck.isLoop) {
+			// 无头语境下模型既没有弹窗可点、也没有“策略”可转——会话已被
+			// loop 熔断先手拦截后续一切调用（且拦截自灌 recordDenial，除非人工介入不会归零）。
+			// 因此无头 reason 一律改用熔断口径：明示会话已停 + 需人工介入，
+			// 不再复用 warningMessage 里“转换策略 / 选择拒绝并指示停止”这类只对交互侧成立的行动指引。
+			const headlessFused = DENIAL_MESSAGES.headlessCircuitFused(
+				loopCheck.loopType || "loop",
+				loopCheck.streak,
+			);
+
 			// 硬上限触发：即使在交互模式下也直接强行熔断，不再弹窗骚扰用户
 			if (loopCheck.isHardLimit) {
 				ctx.ui.notify(loopCheck.warningMessage || "死循环已达硬上限，已强制熔断！", "error");
 				return blockCall(
 					toolName,
 					input,
-					DENIAL_MESSAGES.circuitBreaker(loopCheck.warningMessage || "Hard limit reached"),
+					ctx.hasUI
+						? DENIAL_MESSAGES.circuitBreaker(loopCheck.warningMessage || "Hard limit reached")
+						: headlessFused,
 				);
 			}
 
 			// 在无头模式 (Headless / !ctx.hasUI) 下：直接快速失败，强制阻断死循环！
 			if (!ctx.hasUI) {
-				return blockCall(
-					toolName,
-					input,
-					DENIAL_MESSAGES.circuitBreaker(loopCheck.warningMessage || "Loop detected"),
-				);
+				return blockCall(toolName, input, headlessFused);
 			}
 		}
 
@@ -1285,8 +1873,40 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 					return blockCall(toolName, input, fallback.reasonText || "Blocked", terminate, fallback.kind !== "consecutive_unavailable");
 				}
 
+				// 交互侧按优先级消费 fallback——
+				// ① total_denial 达顶 → 直接拒绝（不跑分类器）+ 解除指引；② 不可用触顶 → 既有启发式降级保持；
+				// ③ classifier_blocked_retry 指纹命中 → 跳过分类器直接人审弹窗（基线 M10：不重复研判/不重复弹窗，默认拒绝态）；
+				// ④ 其余 → 跑分类器（现状）。consecutive_block 交互侧不消费（0027 非目标，由 ① 的上限与弹窗承接）。
+				if (ctx.hasUI && fallback.kind === "total_denial") {
+					ctx.ui.notify(
+						"⛔ 已达会话拒绝上限，后续被判风险的操作将直接拒绝；如需解除请配置 allow 规则或切换审批模式。",
+						"warning",
+					);
+					return blockCall(toolName, input, fallback.reasonText || "Blocked: session denial cap reached");
+				}
+
+				if (ctx.hasUI && !unavailableCircuitTripped() && fallback.kind === "classifier_blocked_retry") {
+					denialTracker.consumePendingFingerprint();
+					const retryDialog: Array<{ label: string; content: string }> = [];
+					if (loopCheck.isLoop && loopCheck.warningMessage) {
+						retryDialog.push({ label: "🚨 死循环预警", content: loopCheck.warningMessage });
+					}
+					retryDialog.push({ label: "读取目标", content: label });
+					retryDialog.push({ label: "重复被拦短路（已跳过分类器，原样重试不再重复研判）", content: fallback.reasonText || DENIAL_MESSAGES.classifierBlockedRetry() });
+					const retryAction = await promptApprovalDialog(
+						ctx,
+						formatDialogTitle("⚖️ [重复被拦读取人工核准 (Auto Mode)]", "重复读取被拦", loopCheck),
+						retryDialog,
+						loopCheck.isLoop,
+						true,
+					);
+					return handleOutcome(retryAction, dslRule, ctx, label, toolName, input);
+				}
+
+				// 在触顶判断时点捕获（弹窗时现算会被失败计数翻转污染）
+				const circuitFallbackRead = unavailableCircuitTripped();
 				let decision: { shouldBlock: boolean; reason: string; stage: "fast" | "thinking" | "fallback"; outage?: boolean };
-				if (fallback.shouldFallback && fallback.kind === "consecutive_unavailable") {
+				if (circuitFallbackRead) {
 					decision = fallbackHeuristicCheck(toolName, input);
 				} else {
 					decision = await runTwoStageClassifier(ctx, toolName, input);
@@ -1306,17 +1926,25 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 				if (loopCheck.isLoop && loopCheck.warningMessage) {
 					classifierDialog.push({ label: "🚨 死循环预警", content: loopCheck.warningMessage });
 				}
+				// 降级态的弹窗不是分类器结论——明示降级状态与自愈方式，
+				// 避免把启发式规则的判断误认为分类器研判（含上游 filter 场景）。
+				if (decision.stage === "fallback") {
+					classifierDialog.push({
+						label: "⚠️ 分类器无判决（降级为规则研判）",
+						content: "分类器本次未能给出判决，已按启发式规则研判；人工批准一次即恢复分类器判定（连续无判决将自动熔断）。",
+					});
+				}
 				classifierDialog.push({ label: "读取目标", content: label });
 				classifierDialog.push({ label: "分类器研判风险", content: decision.reason });
 
 				const classifierAction = await promptApprovalDialog(
 					ctx,
-					formatDialogTitle("🤖 [读取安全分类器研判 (Auto Mode)]", "读取风险", loopCheck),
+					formatDialogTitle("⚖️ [读取安全分类器研判 (Auto Mode)]", "读取风险", loopCheck),
 					classifierDialog,
 					loopCheck.isLoop,
 				);
 
-				return handleOutcome(classifierAction, dslRule, ctx, label, toolName, input, !decision.outage);
+				return handleOutcome(classifierAction, dslRule, ctx, label, toolName, input, circuitFallbackRead);
 			}
 
 			// auto-edit / default：人工确认
@@ -1394,6 +2022,57 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 						return blockCall(toolName, input, fallback.reasonText || "Blocked", terminate, fallback.kind !== "consecutive_unavailable");
 					}
 
+					// 交互侧按优先级消费 fallback——
+					// ① total_denial 达顶 → 直接拒绝（不跑分类器）+ 解除指引；
+					// ②不可用触顶 → 跳过分类器直呈人工核准（保护等级不降，只甩掉挂掉的 LLM 等待，默认拒绝态）；
+					// ③ classifier_blocked_retry 指纹命中 → 跳过分类器直接人审弹窗（基线 M10：不重复研判/不重复弹窗，默认拒绝态）；
+					// ④ 其余 → 跑分类器（现状）。consecutive_block 交互侧不消费（0027 非目标，由 ① 的上限与弹窗承接）。
+					if (ctx.hasUI && fallback.kind === "total_denial") {
+						ctx.ui.notify(
+							"⛔ 已达会话拒绝上限，后续被判风险的操作将直接拒绝；如需解除请配置 allow 规则或切换审批模式。",
+							"warning",
+						);
+						return blockCall(toolName, input, fallback.reasonText || "Blocked: session denial cap reached");
+					}
+
+					// ② 不可用熔断触顶（直读计数，不看 kind——b/u 同涨时 kind 不可靠）→
+					//    跳过分类器直呈人工核准
+					if (ctx.hasUI && unavailableCircuitTripped()) {
+						denialTracker.consumePendingFingerprint();
+						const degradedDialog: Array<{ label: string; content: string }> = [];
+						if (loopCheck.isLoop && loopCheck.warningMessage) {
+							degradedDialog.push({ label: "🚨 死循环预警", content: loopCheck.warningMessage });
+						}
+						degradedDialog.push({ label: "目标文件", content: relPath });
+						degradedDialog.push({ label: "熔断降级", content: "分类器连续不可用已熔断，本调用已跳过分类器，保护路径直呈人工核准（默认拒绝态）。" });
+						const degradedAction = await promptApprovalDialog(
+							ctx,
+							formatDialogTitle("⚖️ [受保护路径熔断人工核准 (Auto Mode)]", "保护路径熔断降级", loopCheck),
+							degradedDialog,
+							loopCheck.isLoop,
+							true, // denyByDefault：光标停 Block（M10），同 C-3 机制
+						);
+						return handleOutcome(degradedAction, dslRule, ctx, relPath, toolName, input, true); // 触顶专用分支：跳过分类器的 fallback 弹窗
+					}
+
+					if (ctx.hasUI && !unavailableCircuitTripped() && fallback.kind === "classifier_blocked_retry") {
+						denialTracker.consumePendingFingerprint();
+						const retryDialog: Array<{ label: string; content: string }> = [];
+						if (loopCheck.isLoop && loopCheck.warningMessage) {
+							retryDialog.push({ label: "🚨 死循环预警", content: loopCheck.warningMessage });
+						}
+						retryDialog.push({ label: "目标文件", content: relPath });
+						retryDialog.push({ label: "重复被拦短路（已跳过分类器，原样重试不再重复研判）", content: fallback.reasonText || DENIAL_MESSAGES.classifierBlockedRetry() });
+						const retryAction = await promptApprovalDialog(
+							ctx,
+							formatDialogTitle("⚖️ [重复被拦敏感路径修改人工核准 (Auto Mode)]", "重复敏感路径被拦", loopCheck),
+							retryDialog,
+							loopCheck.isLoop,
+							true,
+						);
+						return handleOutcome(retryAction, dslRule, ctx, relPath, toolName, input);
+					}
+
 					const decision = await runTwoStageClassifier(ctx, toolName, input);
 					if (!decision.shouldBlock) {
 						return allowCall(toolName, input);
@@ -1416,32 +2095,37 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 						dialogDetails.push({ label: "🚨 死循环预警", content: loopCheck.warningMessage });
 					}
 					dialogDetails.push({ label: "目标文件", content: relPath });
+					// 降级态标注（与 read/bash 分支同款——非分类器结论）
+					if (decision.stage === "fallback") {
+						dialogDetails.push({
+							label: "⚠️ 分类器无判决（降级为规则研判）",
+							content: "分类器本次未能给出判决，已按启发式规则研判；人工批准一次即恢复分类器判定（连续无判决将自动熔断）。",
+						});
+					}
 					dialogDetails.push({ label: "拦截原因", content: decision.reason });
 
 					const action = await promptApprovalDialog(
 						ctx,
-						formatDialogTitle("🤖 [受保护敏感路径修改审批 (Auto Mode)]", "敏感路径修改", loopCheck),
+						formatDialogTitle("⚖️ [受保护敏感路径修改审批 (Auto Mode)]", "敏感路径修改", loopCheck),
 						dialogDetails,
 						loopCheck.isLoop,
 					);
 
-					return handleOutcome(action, dslRule, ctx, relPath, toolName, input, !decision.outage);
+					return handleOutcome(action, dslRule, ctx, relPath, toolName, input);
 				}
 
 				// 常规工作区内部文件编辑/写入：快路径自动放行！
 				return allowCall(toolName, input);
 			}
 
-			// Shell 命令处理 (Layer 2 & Layer 3)
+			// Shell 命令处理 (Layer 3 分类器；Layer 2 只读免审已下线，分析仅余展示用途)
 			if (toolName === "bash") {
 				const cmd = (input.command || "").trim();
 				const dslRule = `Bash(${cmd})`;
 
-				// Layer 2: 工业级 Shell 状态机只读检测（彻底防御重定向、管道、复合注入）
+				// Layer 2 只读免审快路径下线——auto 下非规则命中的 bash 一律进分类器（交互与无头同口径）。
+				// 分析调用保留，仅供弹窗"静态结构特征"展示行消费（展示≠裁决）。
 				const shellAnalysis = analyzeShellCommand(cmd);
-				if (shellAnalysis.isReadOnly) {
-					return allowCall(toolName, input);
-				}
 
 				// Layer 3: 双阶段 LLM 安全分类器研判
 				const fingerprint = DenialTracker.createFingerprint(toolName, input);
@@ -1451,8 +2135,40 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 					return blockCall(toolName, input, fallback.reasonText || "Blocked", terminate, fallback.kind !== "consecutive_unavailable");
 				}
 
+				// 交互侧按优先级消费 fallback——
+				// ① total_denial 达顶 → 直接拒绝（不跑分类器）+ 解除指引；② 不可用触顶 → 既有启发式降级保持；
+				// ③ classifier_blocked_retry 指纹命中 → 跳过分类器直接人审弹窗（基线 M10：不重复研判/不重复弹窗，默认拒绝态）；
+				// ④ 其余 → 跑分类器（现状）。consecutive_block 交互侧不消费（0027 非目标，由 ① 的上限与弹窗承接）。
+				if (ctx.hasUI && fallback.kind === "total_denial") {
+					ctx.ui.notify(
+						"⛔ 已达会话拒绝上限，后续被判风险的操作将直接拒绝；如需解除请配置 allow 规则或切换审批模式。",
+						"warning",
+					);
+					return blockCall(toolName, input, fallback.reasonText || "Blocked: session denial cap reached");
+				}
+
+				if (ctx.hasUI && !unavailableCircuitTripped() && fallback.kind === "classifier_blocked_retry") {
+					denialTracker.consumePendingFingerprint();
+					const retryDialog: Array<{ label: string; content: string }> = [];
+					if (loopCheck.isLoop && loopCheck.warningMessage) {
+						retryDialog.push({ label: "🚨 死循环预警", content: loopCheck.warningMessage });
+					}
+					retryDialog.push({ label: "准备执行命令", content: cmd });
+					retryDialog.push({ label: "重复被拦短路（已跳过分类器，原样重试不再重复研判）", content: fallback.reasonText || DENIAL_MESSAGES.classifierBlockedRetry() });
+					const retryAction = await promptApprovalDialog(
+						ctx,
+						formatDialogTitle("⚖️ [重复被拦命令人工核准 (Auto Mode)]", "重复命令被拦", loopCheck),
+						retryDialog,
+						loopCheck.isLoop,
+						true,
+					);
+					return handleOutcome(retryAction, dslRule, ctx, cmd, toolName, input);
+				}
+
 				let decision: { shouldBlock: boolean; reason: string; stage: "fast" | "thinking" | "fallback"; outage?: boolean };
-				if (fallback.shouldFallback && fallback.kind === "consecutive_unavailable") {
+				// 触顶判断时点捕获（同 read 分支）
+				const circuitFallbackBash = unavailableCircuitTripped();
+				if (circuitFallbackBash) {
 					decision = fallbackHeuristicCheck(toolName, input);
 				} else {
 					decision = await runTwoStageClassifier(ctx, "bash", input);
@@ -1479,17 +2195,24 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 					dialogDetails.push({ label: "🚨 死循环预警", content: loopCheck.warningMessage });
 				}
 				dialogDetails.push({ label: "准备执行命令", content: cmd });
+				// 降级态标注（与 read 分支同款——非分类器结论）
+				if (decision.stage === "fallback") {
+					dialogDetails.push({
+						label: "⚠️ 分类器无判决（降级为规则研判）",
+						content: "分类器本次未能给出判决，已按启发式规则研判；人工批准一次即恢复分类器判定（连续无判决将自动熔断）。",
+					});
+				}
 				dialogDetails.push({ label: "分类器研判风险", content: decision.reason });
 				dialogDetails.push({ label: "静态结构特征", content: shellAnalysis.reason || "非安全只读命令" });
 
 				const action = await promptApprovalDialog(
 					ctx,
-					formatDialogTitle("🤖 [安全分类器风险拦截 (Auto Mode)]", "Shell 执行", loopCheck),
+					formatDialogTitle("⚖️ [安全分类器风险拦截 (Auto Mode)]", "Shell 执行", loopCheck),
 					dialogDetails,
 					loopCheck.isLoop,
 				);
 
-				return handleOutcome(action, dslRule, ctx, cmd, toolName, input, !decision.outage);
+				return handleOutcome(action, dslRule, ctx, cmd, toolName, input, circuitFallbackBash);
 			}
 
 			return allowCall(toolName, input);

@@ -148,7 +148,7 @@ test("PermissionManager - 宏元分类覆盖 (Read, Edit, Bash)", () => {
 	}
 });
 
-test("PermissionManager - 跨层冲突检测与压死警告", () => {
+test("PermissionManager - 跨层冲突检测与压死警告 ", () => {
 	const tmpDir = mkdtempSync(join(tmpdir(), "pi-perm-test-"));
 	try {
 		const pm = new PermissionManager(tmpDir, tmpDir);

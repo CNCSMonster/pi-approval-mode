@@ -11,6 +11,10 @@
  * 3. 同一操作停滞 (Same-Operation Stagnation):
  *    - 连续 6 次重复同一 (工具, 参数) 且处于非成功状态时触发停滞熔断；参数变化或成功即清零，
  *      因此同一工具的不同用法（如 cat file1 → file2）属于正常推进，不会误判。
+ *    - **默认配置下不可达，属配置空间防护**：检查 1/2/3 顺序固定，而停滞计数与同名同参计数由同一次
+ *      `recordDenial` 锁步递增、连续拒绝计数同步增长，因此停滞分支只有在两道前置检查都不先撞线时才可达，
+ *      完整条件为 `identicalThreshold > stagnationThreshold` **且** `denialThreshold > stagnationThreshold`
+ *      （默认 3/3/6 由 identical_call_loop 或 consecutive_denials 先手）。调整检查顺序前请先读检查 3 处的说明。
  *
  * 响应策略：
  * - 无头模式 (Headless / !ctx.hasUI): 直接快速失败 (Fast-Fail)，向模型返回致命熔断原因，避免后台死刷 Token；
@@ -150,12 +154,19 @@ export class LoopDetector {
 		}
 
 		// 检查 3: 同一操作反复重试且无进展 (同工具 + 同参数；参数变化或成功即视为推进，不计停滞)
+		//
+		// 可达性（默认配置下不可达，属配置空间防护）：本分支要求检查 1 与检查 2 都不先撞线，
+		// 完整前置条件为 `identicalThreshold > stagnationThreshold` 且 `denialThreshold > stagnationThreshold`。
+		// 原因是三者同签名锁步递增：同签名连续拒绝 N 次时 identicalStreak 与 sameToolStreak 同为 N，
+		// consecutiveDenials 亦为 N，于是检查 1（nextIdenticalStreak ≥ identicalThreshold）或检查 2
+		// （consecutiveDenials ≥ denialThreshold）必在检查 3（nextSameToolStreak ≥ stagnationThreshold）之前返回。
+		// 默认 3/3/6 即由 identical_call_loop / consecutive_denials 先手。检查顺序与 qwen 对齐语义保持不变。
 		let nextSameToolStreak = 1;
 		if (this.lastToolName === toolName && this.lastInputKey === currentKey) {
 			nextSameToolStreak = this.sameToolStreak + 1;
 		}
 		if (nextSameToolStreak >= this.stagnationThreshold) {
-			const hardLimit = this.stagnationThreshold * 2;
+			const hardLimit = this.stagnationThreshold * this.hardLimitMultiplier;
 			const isHardLimit = nextSameToolStreak >= hardLimit;
 			const warningMessage = isHardLimit
 				? `【停滞硬上限触发】模型已连续 ${nextSameToolStreak} 次重复同一操作 (${toolName}) 且无进展，超过安全硬上限 (${hardLimit})！已强制自动熔断。`
