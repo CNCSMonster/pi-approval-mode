@@ -89,6 +89,33 @@ export class LoopDetector {
 	}
 
 	/**
+	 * 重置并动态更新熔断阈值（支持从配置文件加载自定义阈值，缺省字段回退默认基线值 3/3/6/3）
+	 */
+	public resetThresholds(options?: {
+		identicalThreshold?: number;
+		denialThreshold?: number;
+		stagnationThreshold?: number;
+		hardLimitMultiplier?: number;
+	}): void {
+		this.identicalThreshold =
+			typeof options?.identicalThreshold === "number" && options.identicalThreshold > 0
+				? options.identicalThreshold
+				: 3;
+		this.denialThreshold =
+			typeof options?.denialThreshold === "number" && options.denialThreshold > 0
+				? options.denialThreshold
+				: 3;
+		this.stagnationThreshold =
+			typeof options?.stagnationThreshold === "number" && options.stagnationThreshold > 0
+				? options.stagnationThreshold
+				: 6;
+		this.hardLimitMultiplier =
+			typeof options?.hardLimitMultiplier === "number" && options.hardLimitMultiplier > 0
+				? options.hardLimitMultiplier
+				: 3;
+	}
+
+	/**
 	 * 将工具输入参数序列化为稳定的特征 Key (去除无害空白，排序 keys)
 	 */
 	public static createInputKey(input: Record<string, any>): string {

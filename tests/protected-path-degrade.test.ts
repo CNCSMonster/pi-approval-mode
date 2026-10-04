@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import approvalModeExtension from "../extensions/approval-mode.ts";
@@ -82,6 +82,13 @@ async function setup(opts: {
 		sessionManager: { getBranch: () => [] },
 	};
 
+	const agentDir = join(sandboxHome, ".pi", "agent");
+	mkdirSync(agentDir, { recursive: true });
+	writeFileSync(
+		join(agentDir, "approval-config.json"),
+		JSON.stringify({ denialLimits: { maxTotalDenials: 20 } }),
+	);
+
 	await handlers["session_start"]({ reason: "start" }, ctx);
 	return { handlers, commands, dialogs, notices, ctx, classifyCalls: () => classifyCalls };
 }
@@ -161,7 +168,7 @@ test("受保护路径熔断降级 D4: 会话拒绝上限达顶优先于不可用
 	});
 
 	let capped: { callsAt: number; dialogsAt: number; noticesAt: number; r: any } | null = null;
-	for (let i = 1; i <= 40; i++) {
+	for (let i = 1; i <= 100; i++) {
 		const callsAt = h.classifyCalls();
 		const dialogsAt = h.dialogs.length;
 		const noticesAt = h.notices.length;
@@ -172,7 +179,7 @@ test("受保护路径熔断降级 D4: 会话拒绝上限达顶优先于不可用
 		}
 	}
 
-	assert.ok(capped, "40 次内必须命中 total_denial 达顶直拒");
+	assert.ok(capped, "100 次内必须命中 total_denial 达顶直拒");
 	assert.strictEqual(h.classifyCalls(), capped!.callsAt, "达顶后不得再调用分类器");
 	assert.strictEqual(h.dialogs.length, capped!.dialogsAt, "达顶直拒不得弹窗（① 先于 ②，含熔断窗）");
 	assert.ok(

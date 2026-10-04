@@ -143,7 +143,7 @@ test("DENIAL_MESSAGES - 英文文案标准化与全场景覆盖", () => {
 	assert.match(planBash, /Plan mode is read-only: non-read-only command blocked/i);
 });
 
-// u 的语义是"分类器连续 N 次不可用"（M11），快路径放行没碰过分类器，无权治愈故障计数。
+// -A：u 的语义是"分类器连续 N 次不可用"（M11），快路径放行没碰过分类器，无权治愈故障计数。
 test("recordAllow 不重置 consecutiveUnavailable；仅 recordClassifierActive/resetAll 有权重置", () => {
 	const tracker = new DenialTracker();
 
@@ -169,7 +169,7 @@ test("recordAllow 不重置 consecutiveUnavailable；仅 recordClassifierActive/
 	assert.equal(tracker.getStats().consecutiveUnavailable, 0, "resetAll 仍可全清");
 });
 
-// total_denial 达顶不再向模型承诺"unrelated safe work may continue"
+// -B-2：total_denial 达顶不再向模型承诺"unrelated safe work may continue"
 // （无头语境被 loop 先手会话级熔断否决、交互语境达顶直接拒绝——文案必须说实话）。
 test("total_denial 文案删除可绕行承诺，改为人解除指引", () => {
 	const tracker = new DenialTracker({ limits: { maxTotalDenials: 1 } });
@@ -192,17 +192,17 @@ test("total_denial 文案删除可绕行承诺，改为人解除指引", () => {
 	assert.doesNotMatch(fused, /转换策略|switch (your )?strategy|continue with unrelated/i);
 });
 
-// 双系统分账锚定——DenialTracker 族默认 3/3/20（基线 M11 登记值），改动默认值必红。
-test("DenialTracker - 默认阈值锚定 3/3/20（基线 M11 双系统分账，改动默认值必红）", () => {
+// / ：双系统分账锚定——DenialTracker 族默认 3/3/50（提升总摩擦预算至 50）。
+test("DenialTracker - 默认阈值锚定 3/3/50（双系统分账）", () => {
 	const tracker = new DenialTracker();
 	assert.deepStrictEqual(tracker.getLimits(), {
 		maxConsecutiveBlock: 3,
 		maxConsecutiveUnavailable: 3,
-		maxTotalDenials: 20,
+		maxTotalDenials: 50,
 	});
 });
 
-// 降级态人工批准 = 自愈触发器（Qwen Code recordFallbackApprove 同款语义）
+// -A'：降级态人工批准 = 自愈触发器（Qwen Code recordFallbackApprove 同款语义）
 test("DenialTracker - recordFallbackApprove 清两类连击计数（0034-A' 自愈）", () => {
 	const tracker = new DenialTracker();
 	// 制造降级态：3 次不可用触顶 + 若干连拦
@@ -227,4 +227,68 @@ test("DenialTracker - 快路径放行仍不清 unavailable（0027-A 防洗白不
 	tracker.recordUnavailable();
 	tracker.recordAllow(); // 规则/快路径放行
 	assert.strictEqual(tracker.getStats().consecutiveUnavailable, 1, "0027-A：快路径无权治愈故障计数");
+});
+
+test("DenialTracker - updateConfig 与 isTotalCapReached 及 DENIAL_MESSAGES 全分支", () => {
+	const tracker = new DenialTracker();
+
+	// updateConfig 增量更新与异常边界
+	tracker.updateConfig({
+		limits: {
+			maxConsecutiveBlock: 5,
+			maxConsecutiveUnavailable: 6,
+			maxTotalDenials: 20,
+		},
+		abortOnDenialCap: true,
+	});
+	assert.deepEqual(tracker.getLimits(), {
+		maxConsecutiveBlock: 5,
+		maxConsecutiveUnavailable: 6,
+		maxTotalDenials: 20,
+	});
+	assert.equal(tracker.shouldAbortOnCap(), true);
+
+	// 非正数或缺省值不覆盖
+	tracker.updateConfig({
+		limits: {
+			maxConsecutiveBlock: -1 as any,
+			maxConsecutiveUnavailable: 0 as any,
+		},
+	});
+	assert.equal(tracker.getLimits().maxConsecutiveBlock, 5);
+	assert.equal(tracker.getLimits().maxConsecutiveUnavailable, 6);
+
+	// isTotalCapReached
+	assert.equal(tracker.isTotalCapReached(), false);
+	for (let i = 0; i < 20; i++) {
+		tracker.recordBlock(`test-${i}`);
+	}
+	assert.equal(tracker.isTotalCapReached(), true);
+
+	// DENIAL_MESSAGES 各种模板生成覆盖
+	assert.match(DENIAL_MESSAGES.singleUnavailable("1"), /could not classify this action \(1\)/);
+	assert.match(DENIAL_MESSAGES.manualWriteHeadless("main.ts"), /File writes require approval/);
+	assert.match(DENIAL_MESSAGES.userDenied("rm -rf"), /the user denied/);
+	assert.match(DENIAL_MESSAGES.circuitBreaker("too many failures"), /fast-fail/);
+	assert.match(DENIAL_MESSAGES.presetDeny("Deny(Bash)"), /Blocked by preset rule/);
+	assert.match(DENIAL_MESSAGES.presetAskHeadless("Ask(Bash)"), /requires interactive confirmation/);
+	assert.match(DENIAL_MESSAGES.planModeToolDisabled("edit"), /disabled/);
+	assert.match(DENIAL_MESSAGES.planModeCommandBlocked("rm -f", "destructive"), /destructive/);
+	assert.match(DENIAL_MESSAGES.autoProtectedPath("safety", ".env"), /target: \.env/);
+	assert.match(DENIAL_MESSAGES.autoCommandBlocked("dangerous", "dd"), /dd/);
+	assert.match(DENIAL_MESSAGES.autoReadBlocked("forbidden", "id_rsa"), /id_rsa/);
+	assert.match(DENIAL_MESSAGES.autoEditReadHeadless("secret.txt"), /secret\.txt/);
+	assert.match(DENIAL_MESSAGES.manualReadHeadless("secret.txt"), /secret\.txt/);
+	assert.match(DENIAL_MESSAGES.autoEditHeadless("cargo build"), /cargo build/);
+	assert.match(DENIAL_MESSAGES.autoEditProtectedPathHeadless("config.json"), /config\.json/);
+	assert.match(DENIAL_MESSAGES.manualEditHeadless("foo.ts"), /foo\.ts/);
+	assert.match(DENIAL_MESSAGES.manualBashHeadless("rm -rf /"), /rm -rf \//);
+	assert.match(DENIAL_MESSAGES.heuristicFallback("rm -rf"), /deterministic/);
+	assert.match(DENIAL_MESSAGES.classifierBlockedRetry(), /previously blocked/);
+	assert.match(DENIAL_MESSAGES.consecutiveBlock("risk"), /consecutive denial limit/);
+	assert.match(DENIAL_MESSAGES.consecutiveUnavailable(3), /x3/);
+	assert.match(DENIAL_MESSAGES.totalDenial(50), /50/);
+	assert.match(DENIAL_MESSAGES.headlessCircuitFused("loop", 5), /loop: 5/);
+	assert.match(DENIAL_MESSAGES.classifierContentFilter("bash"), /content filter/);
+	assert.match(DENIAL_MESSAGES.classifierUpstreamError("500", "bash"), /500/);
 });

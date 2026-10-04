@@ -167,3 +167,87 @@ export function buildTranscript(entries: TranscriptEntryLike[], cwd: string): st
 
 	return items;
 }
+
+// ==============================================================
+// Stage 1 独立健康状态追踪
+// ==============================================================
+
+export type Stage1FailureReason = "timeout" | "exception" | "upstream_error" | "invalid_response";
+
+export interface Stage1HealthStatus {
+	status: "healthy" | "degraded";
+	consecutiveFailures: number;
+	totalFailures: number;
+	lastFailureReason?: Stage1FailureReason;
+	lastFailureAt?: number;
+}
+
+export const STAGE1_ESCALATE_THRESHOLD = 5;
+
+export class StageHealthTracker {
+	private status: "healthy" | "degraded" = "healthy";
+	private consecutiveFailures = 0;
+	private totalFailures = 0;
+	private lastFailureReason?: Stage1FailureReason;
+	private lastFailureAt?: number;
+	private warnedDegraded = false;
+	private escalated = false;
+
+	public recordStage1Failure(reason: Stage1FailureReason): { transitioned: boolean; escalated: boolean } {
+		this.consecutiveFailures++;
+		this.totalFailures++;
+		this.lastFailureReason = reason;
+		this.lastFailureAt = Date.now();
+
+		const transitioned = this.status === "healthy";
+		this.status = "degraded";
+
+		let escalated = false;
+		if (this.consecutiveFailures >= STAGE1_ESCALATE_THRESHOLD && !this.escalated) {
+			this.escalated = true;
+			escalated = true;
+		}
+
+		return { transitioned, escalated };
+	}
+
+	public recordStage1Success(): void {
+		this.consecutiveFailures = 0;
+		this.status = "healthy";
+		this.warnedDegraded = false;
+		this.escalated = false;
+	}
+
+	public getStatus(): Stage1HealthStatus {
+		return {
+			status: this.status,
+			consecutiveFailures: this.consecutiveFailures,
+			totalFailures: this.totalFailures,
+			lastFailureReason: this.lastFailureReason,
+			lastFailureAt: this.lastFailureAt,
+		};
+	}
+
+	public hasWarnedDegraded(): boolean {
+		return this.warnedDegraded;
+	}
+
+	public setWarnedDegraded(warned: boolean): void {
+		this.warnedDegraded = warned;
+	}
+
+	public hasEscalated(): boolean {
+		return this.escalated;
+	}
+
+	public reset(): void {
+		this.status = "healthy";
+		this.consecutiveFailures = 0;
+		this.totalFailures = 0;
+		this.lastFailureReason = undefined;
+		this.lastFailureAt = undefined;
+		this.warnedDegraded = false;
+		this.escalated = false;
+	}
+}
+

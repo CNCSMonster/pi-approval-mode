@@ -3,7 +3,7 @@
  *
  * 启发式安全规则与离线兜底引擎 (单一来源规范架构)
  *
- * 核心设计规范 :
+ * 核心设计规范:
  * 1. CLASSIFIER_BASE_PROMPT (两阶段 LLM 分类器提示词) 与确定性启发式风控规则基于 SECURITY_POLICY_RULES 单一数据结构定义。
  * 2. 新增或修改任何安全风控规则时，必须在此统一注册，由 buildClassifierBasePrompt() 动态生成提示词，
  *    并通过一致性自动化测试套件双向检验正反例，杜绝语义漂移。
@@ -257,7 +257,7 @@ export function isDangerousRmCommand(cmd: string): boolean {
 
 		const args = commandWords.slice(1);
 		let isRecursive = false;
-		let isForce = false;
+		let _isForce = false;
 		const targets: string[] = [];
 
 		for (let j = 0; j < args.length; j++) {
@@ -269,7 +269,7 @@ export function isDangerousRmCommand(cmd: string): boolean {
 			if (arg === "-r" || arg === "-R" || arg === "--recursive") {
 				isRecursive = true;
 			} else if (arg === "-f" || arg === "--force") {
-				isForce = true;
+				_isForce = true;
 			} else if (arg.startsWith("--")) {
 				// 其它长选项
 			} else if (arg.startsWith("-")) {
@@ -278,7 +278,7 @@ export function isDangerousRmCommand(cmd: string): boolean {
 					isRecursive = true;
 				}
 				if (flags.includes("f")) {
-					isForce = true;
+					_isForce = true;
 				}
 			} else {
 				targets.push(arg);
@@ -339,25 +339,75 @@ export function isDangerousCommand(cmd: string): { isDangerous: boolean; reason?
 	return { isDangerous: false };
 }
 
+export type FallbackAction = "allow" | "require_approval";
+
+const READ_LIKE_TOOLS = new Set(["read", "read_file", "grep", "grep_search", "find", "ls"]);
+
 /**
- * 离线/降级安全兜底规则校验 (启发式风控)
+ * 降级态分流处置矩阵
+ * 1. bash: 调用现有 isDangerousCommand；命中高危 require_approval，未命中 allow
+ * 2. read: 凡是流经此处的敏感读取一律 require_approval（交互人审、无头阻断）
+ * 3. edit / write: 检查 isProtectedPath 或 isEscapingWorkspace，命中 require_approval，常规工作区编辑 allow
+ * 4. 未知工具: 默认回退 require_approval，禁止任何未知工具在降级态静默 allow
+ */
+export function evaluateFallbackAction(
+	toolName: string,
+	input: Record<string, unknown>,
+	context: { cwd: string },
+): { action: FallbackAction; reason: string } {
+	const lower = toolName.toLowerCase();
+
+	if (lower === "bash") {
+		const cmd = typeof input.command === "string" ? input.command.trim() : "";
+		const check = isDangerousCommand(cmd);
+		if (check.isDangerous) {
+			return {
+				action: "require_approval",
+				reason: check.reason || "检测到高危破坏性指令 (启发式规则引擎命中)",
+			};
+		}
+		return { action: "allow", reason: "" };
+	}
+
+	if (READ_LIKE_TOOLS.has(lower) || lower === "read") {
+		return {
+			action: "require_approval",
+			reason: "分类器不可用，敏感读取操作需人工确认 (降级处置矩阵)",
+		};
+	}
+
+	if (lower === "edit" || lower === "write") {
+		const filePath = (input.path || input.target_file || input.file_path || "").toString();
+		const relPath = relative(context.cwd, filePath).replace(/\\/g, "/");
+		if (isProtectedPath(filePath) || isProtectedPath(relPath) || isEscapingWorkspace(context.cwd, filePath)) {
+			return {
+				action: "require_approval",
+				reason: "分类器不可用，受保护路径或越界修改需人工确认 (降级处置矩阵)",
+			};
+		}
+		return { action: "allow", reason: "" };
+	}
+
+	return {
+		action: "require_approval",
+		reason: `分类器不可用，未知工具 (${toolName}) 需人工确认 (降级处置矩阵)`,
+	};
+}
+
+/**
+ * 离线/降级安全兜底规则校验 (启发式风控，基于 evaluateFallbackAction)
  */
 export function fallbackHeuristicCheck(
 	toolName: string,
 	toolInput: Record<string, any>,
+	cwd: string = process.cwd(),
 ): { shouldBlock: boolean; reason: string; stage: "fallback" } {
-	if (toolName === "bash") {
-		const cmd = (toolInput.command || "").trim();
-		const check = isDangerousCommand(cmd);
-		if (check.isDangerous) {
-			return {
-				shouldBlock: true,
-				reason: check.reason || "检测到高危破坏性指令 (启发式规则引擎命中)",
-				stage: "fallback",
-			};
-		}
-	}
-	return { shouldBlock: false, reason: "", stage: "fallback" };
+	const res = evaluateFallbackAction(toolName, toolInput, { cwd });
+	return {
+		shouldBlock: res.action === "require_approval",
+		reason: res.reason,
+		stage: "fallback",
+	};
 }
 
 

@@ -47,7 +47,7 @@ Options `2`–`4` write an `allow` rule at the corresponding tier, so the same a
 - **`Ctrl+Alt+A`** — cycle `manual ➔ auto-edit ➔ auto ➔ yolo ➔ plan`;
 - **`/approval-mode [mode]`** — jump directly to a mode (Tab-completed, e.g. `/approval-mode auto`).
 
-The current mode is always visible in the status bar (e.g. `[⚖️ auto]`).
+The current mode is always visible in the status bar (e.g. `[⚖️ auto]`; or `[⚖️ auto | S1⚠️]` if Stage 1 is degraded, see §4.4 and §5.7).
 
 > ⚠️ **Note**: the `(auto)` after the context usage on status-bar line 2 is **Pi's native
 > auto-compaction indicator** (`compaction.enabled`, see Pi's `docs/settings.md`) and has
@@ -242,6 +242,19 @@ In **`auto`** mode, every rule-unmatched shell call (the read-only fast path is 
   (destructive `rm`, `curl | sh`, force-push, credential paths …) still block;
 - a *heuristic allow* therefore does **not** prove the classifier answered — see §5.2.
 
+### 4.4 Stage 1 Health Visibility & Troubleshooting
+
+Stage 1 fast screening is engineered to allow over 95% of benign tool calls in ~200ms with negligible token overhead. When Stage 1 encounters a failure (timeout, network drop, upstream error, or invalid JSON response):
+
+1. **Non-blocking Invariant**: The workflow automatically cascades to Stage 2 deep reasoning. **The Agent's tool execution is never blocked**, and the shared unavailable circuit breaker counter is not incremented;
+2. **Persistent Status Bar Visibility**: The status bar badge automatically transitions from `[⚖️ auto]` to **`[⚖️ auto | S1⚠️]`**, giving ambient awareness without log scouring;
+3. **Escalated Warning**: If Stage 1 consecutively fails **5 times** (indicating the model is persistently offline, quota-exhausted, or under-configured), a dedicated notification is raised warning that tool execution latency and token cost have increased;
+4. **Self-Healing & Reset**: Once Stage 1 responds successfully, the badge reverts back to `[⚖️ auto]` and consecutive failure counters reset to zero;
+5. **Troubleshooting Steps**:
+   - Run `/classifier-model` to inspect Stage 1 consecutive failure count and recent failure reason (`lastFailureReason`);
+   - Run `/classifier-model --stage1 <provider/model>` to switch to a more responsive, reliable model;
+   - If failures are due to network latency, raise `classifierTimeoutMs` in `~/.pi/agent/approval-config.json`.
+
 ---
 
 ## 5. FAQ & Troubleshooting
@@ -320,7 +333,8 @@ No — different semantics, different location, different owner:
 | Display | Meaning | Controlled by |
 | :--- | :--- | :--- |
 | Line 2, `0.0%/262k (auto)` | **Pi native** auto-compaction indicator: shown when the context is auto-compacted as it nears the window limit | `compaction.enabled` in `settings.json` (built into Pi) |
-| Extension status line, `[⚖️ auto]` | **This plugin's** approval-mode badge: ⚖️ (scale) stands for the two-stage LLM classifier auto-adjudicating allow/block | `/approval-mode` command, `Ctrl+Alt+A`, `--approval-mode` flag |
+| Extension status line, `[⚖️ auto]` | **This plugin's** approval-mode badge (Healthy): ⚖️ stands for the two-stage LLM classifier with Stage 1 fast screening online | `/approval-mode` command, `Ctrl+Alt+A`, `--approval-mode` flag |
+| Extension status line, `[⚖️ auto \| S1⚠️]` | **This plugin's** approval-mode badge (Stage 1 Degraded): Stage 1 is offline or failing; Stage 2 deep review handles calls. Agent is unblocked, but tool latency is higher | Plugin runtime health state machine (active on degraded, restores on success) |
 
 Pi deliberately ships no approval mechanism of its own (the official docs state it
 "intentionally does not include ... permission popups"), so all approval capability comes

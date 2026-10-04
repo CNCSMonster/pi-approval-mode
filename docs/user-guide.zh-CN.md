@@ -45,7 +45,7 @@ pi install git:github.com/CNCSMonster/pi-approval-mode
 - **`Ctrl+Alt+A`** — 循环切换 `manual ➔ auto-edit ➔ auto ➔ yolo ➔ plan`；
 - **`/approval-mode [mode]`** — 直达指定模式（支持 Tab 补全，如 `/approval-mode auto`）。
 
-当前模式常驻状态栏（如 `[⚖️ auto]`）。
+当前模式常驻状态栏（如 `[⚖️ auto]`；若 Stage 1 快筛离线则常驻显示 `[⚖️ auto | S1⚠️]`，见 §4.4 与 §5.7）。
 
 > ⚠️ **注意区分**：状态栏第 2 行上下文用量后的 `(auto)` 是 **Pi 原生的上下文自动压缩指示**（`compaction.enabled`，见 Pi 官方 `docs/settings.md`），与本插件无关；本插件的审批模式徽标位于扩展状态行（如 `[⚖️ auto]`）。两者详见 §5.7。
 
@@ -230,6 +230,19 @@ $$\text{Deny} > \text{Ask} > \text{Default} > \text{Allow}$$
   破坏性 `rm`、`curl | sh`、force-push、凭据路径等高危模式依然拦截；
 - 因此启发式放行**不等于**分类器真的回答过——区分方法见 §5.2。
 
+### 4.4 Stage 1 健康感知与持续失效排查
+
+Stage 1 快速快筛设计初衷是以 ~200ms 的极速与极低 Token 消耗放行 95% 以上的安全工具调用。当 Stage 1 发生故障（超时、网络断连、上游拦截或解析异常）时：
+
+1. **不阻塞原则**：系统自动将审批流转由 Stage 2 深度复核接管，**绝对不阻塞 Agent 执行**，也不会误触不可用熔断；
+2. **状态栏常驻感知**：底部状态栏会自动从 `[⚖️ auto]` 切换为常驻的 **`[⚖️ auto | S1⚠️]`**，用户无需翻阅历史日志即可一眼感知；
+3. **阶梯式升级提醒**：若 Stage 1 连续失败达 **5 次**（表明快筛模型可能持续离线、配额耗尽或超时过短），系统会弹出明确的升级告警，提示当前单次工具调用的审批延迟与 Token 开销已显著增加；
+4. **自愈与复位**：只要 Stage 1 成功响应一次，状态栏立即自动复原为 `[⚖️ auto]`，连续失败计数清零；
+5. **排查操作**：
+   - 运行 `/classifier-model` 查看 Stage 1 当前的连续失败次数与最近一次失败原因（`lastFailureReason`）；
+   - 执行 `/classifier-model --stage1 <provider/model>` 切换到响应更快、更稳定的模型；
+   - 若因网络抖动超时，在 `~/.pi/agent/approval-config.json` 中适当调大 `classifierTimeoutMs`。
+
 ---
 
 ## 5. 常见问题与排查
@@ -295,7 +308,8 @@ v0.3.0 起更名为 **`manual`**。新会话默认 `auto` 后，`default` 这个
 | 显示 | 含义 | 由谁控制 |
 | :--- | :--- | :--- |
 | 第 2 行 `0.0%/262k (auto)` | **Pi 原生**的上下文自动压缩（auto-compaction）开关指示——显示即表示上下文接近上限时会自动压缩 | `settings.json` 的 `compaction.enabled`（Pi 内置，项目配置也可关） |
-| 扩展状态行 `[⚖️ auto]` | **本插件**的审批模式徽标：⚖️ 天平代表两阶段 LLM 分类器自动裁决放行/拦截 | `/approval-mode` 命令、`Ctrl+Alt+A`、`--approval-mode` flag |
+| 扩展状态行 `[⚖️ auto]` | **本插件**的审批模式徽标（健康态）：⚖️ 天平代表两阶段 LLM 分类器正常运转，Stage 1 极速快筛在线 | `/approval-mode` 命令、`Ctrl+Alt+A`、`--approval-mode` flag |
+| 扩展状态行 `[⚖️ auto \| S1⚠️]` | **本插件**的审批模式徽标（Stage 1 降级态）：Stage 1 快筛离线或异常，已由 Stage 2 深度复核接管。Agent 不受阻塞，但单次工具审批延迟增加 | 本插件运行状态机（Stage 1 degraded 自动常驻，恢复后复原） |
 
 Pi 本身不内置审批机制（官方文档明示 intentionally does not include permission popups），审批能力全部由本插件提供；两个 "auto" 分属完全不同的子系统，仅是文字撞名。
 

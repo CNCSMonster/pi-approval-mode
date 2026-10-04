@@ -6,12 +6,12 @@
  * 与 pendingManualRetryFingerprint 动作指纹短路
  */
 
-import { LoopDetector } from "./loop-detector.ts";
+import { LoopDetector, type LoopCheckResult } from "./loop-detector.ts";
 
 export interface DenialLimits {
 	maxConsecutiveBlock: number; // 连续拦截阈值 (默认 3)
 	maxConsecutiveUnavailable: number; // 连续分类器不可用阈值 (默认 3，对齐设计基线 M11)
-	maxTotalDenials: number; // 会话累计拦截上限 (默认 20)
+	maxTotalDenials: number; // 会话累计拦截上限 (默认 50)
 }
 
 export type FallbackKind =
@@ -32,6 +32,7 @@ export class DenialTracker {
 	private consecutiveUnavailable = 0;
 	private totalBlock = 0;
 	private totalUnavailable = 0;
+	private consecutiveSuccess = 0;
 
 	private pendingManualRetryFingerprint: string | null = null;
 	private limits: DenialLimits;
@@ -44,7 +45,7 @@ export class DenialTracker {
 		this.limits = {
 			maxConsecutiveBlock: options?.limits?.maxConsecutiveBlock ?? 3,
 			maxConsecutiveUnavailable: options?.limits?.maxConsecutiveUnavailable ?? 3,
-			maxTotalDenials: options?.limits?.maxTotalDenials ?? 20,
+			maxTotalDenials: options?.limits?.maxTotalDenials ?? 50,
 		};
 		this.abortOnDenialCap = options?.abortOnDenialCap ?? false;
 	}
@@ -72,6 +73,31 @@ export class DenialTracker {
 		}
 	}
 
+	/**
+	 * 重置配置（支持从配置文件加载自定义限额，缺省字段回退默认基线值 3/3/50）
+	 */
+	public resetConfig(options?: {
+		limits?: Partial<DenialLimits>;
+		abortOnDenialCap?: boolean;
+	}): void {
+		this.limits = {
+			maxConsecutiveBlock:
+				typeof options?.limits?.maxConsecutiveBlock === "number" && options.limits.maxConsecutiveBlock > 0
+					? options.limits.maxConsecutiveBlock
+					: 3,
+			maxConsecutiveUnavailable:
+				typeof options?.limits?.maxConsecutiveUnavailable === "number" &&
+				options.limits.maxConsecutiveUnavailable > 0
+					? options.limits.maxConsecutiveUnavailable
+					: 3,
+			maxTotalDenials:
+				typeof options?.limits?.maxTotalDenials === "number" && options.limits.maxTotalDenials > 0
+					? options.limits.maxTotalDenials
+					: 50,
+		};
+		this.abortOnDenialCap = typeof options?.abortOnDenialCap === "boolean" ? options.abortOnDenialCap : false;
+	}
+
 	public getLimits(): DenialLimits {
 		return { ...this.limits };
 	}
@@ -80,11 +106,16 @@ export class DenialTracker {
 		return this.abortOnDenialCap;
 	}
 
+	public isTotalCapReached(): boolean {
+		return this.totalBlock + this.totalUnavailable >= this.limits.maxTotalDenials;
+	}
+
 	public getStats(): {
 		consecutiveBlock: number;
 		consecutiveUnavailable: number;
 		totalBlock: number;
 		totalUnavailable: number;
+		consecutiveSuccess: number;
 		pendingFingerprint: string | null;
 	} {
 		return {
@@ -92,6 +123,7 @@ export class DenialTracker {
 			consecutiveUnavailable: this.consecutiveUnavailable,
 			totalBlock: this.totalBlock,
 			totalUnavailable: this.totalUnavailable,
+			consecutiveSuccess: this.consecutiveSuccess,
 			pendingFingerprint: this.pendingManualRetryFingerprint,
 		};
 	}
@@ -113,7 +145,7 @@ export class DenialTracker {
 				shouldFallback: true,
 				kind: "total_denial",
 				// 不向模型承诺 "unrelated safe work may continue"——无头语境下该承诺
-				// 被 loop 先手的会话级熔断否决；交互语境达顶同样直接拒绝（0027-C-1）。
+				// 被 loop 先手的会话级熔断否决；交互语境达顶同样直接拒绝。
 				// 文案只说实话并告知人如何解除（allow 规则 / 重启会话）。
 				reasonText: `Auto mode reached its session denial cap (${this.limits.maxTotalDenials}). Further flagged actions will be denied without classification. This cannot be cleared from the model side: a human must add an explicit allow rule (or restart the session) to resume flagged work.`,
 			};
@@ -127,7 +159,7 @@ export class DenialTracker {
 		// recordDenial + recordBlock 锁步灌入）、同阈值（默认 3），故第 4 次连拒
 		// 必然先命中 loop 的 consecutive_denials 熔断，本 kind 只在交互侧（loop
 		// 不拦截、弹窗继续）或阈值被配置分叉时才可达。
-		// 交互侧暂不消费本 kind。
+		// 交互侧暂不消费本 kind，其计数由 total_denial 上限与弹窗承接。
 		if (this.consecutiveBlock >= this.limits.maxConsecutiveBlock) {
 			return {
 				shouldFallback: true,
@@ -167,6 +199,7 @@ export class DenialTracker {
 		this.consecutiveBlock++;
 		this.totalBlock++;
 		this.pendingManualRetryFingerprint = fingerprint;
+		this.consecutiveSuccess = 0;
 	}
 
 	/**
@@ -178,26 +211,37 @@ export class DenialTracker {
 	}
 
 	/**
-	 * （Qwen Code denialTracking.ts recordFallbackApprove 同款语义）：
-	 * 降级/熔断期间用户在人工弹窗上批准任意一次 → 清两类连击计数 →
+	 * 降级/熔断期间用户在人工弹窗上批准任意一次 → 清两类连击计数与动作指纹短路缓存 →
 	 * 下次判定重新交分类器；若分类器仍故障则再次失败重新计数（同一恢复曲线，
 	 * 无永久锁死）。拒绝路径不调用本方法（拒绝视为分类器判对，计数保持）。
-	 * 快路径/规则放行仍不调用（0027-A 防洗白语义不变）。
+	 * 快路径/规则放行仍不调用（防洗白语义不变）。
 	 */
 	public recordFallbackApprove(): void {
 		this.consecutiveBlock = 0;
 		this.consecutiveUnavailable = 0;
+		this.pendingManualRetryFingerprint = null;
 	}
 
 	/**
 	 * 记录一次成功放行 (重置拒绝侧连续计数与动作指纹)
 	 *
-	 * consecutiveUnavailable 不在此重置——快路径放行（区内 edit、
-	 * 只读 bash、规则 allow）根本没碰分类器，无权治愈"分类器连续不可用"故障计数。
-	 * u 的重置入口：recordClassifierActive()（分类器成功）、recordFallbackApprove()
-	 * （降级态人工批准，）与 resetAll()。
+	 * 连续 3 次合规放行无违规后，扣减 totalBlock 3 次 (Math.max(0, totalBlock - 3))，
+	 * 奖励模型自愈推进，消除长会话前半程试错摩擦的累积惩罚。
 	 */
 	public recordAllow(): void {
+		this.consecutiveBlock = 0;
+		this.pendingManualRetryFingerprint = null;
+		this.consecutiveSuccess++;
+		if (this.consecutiveSuccess >= 3) {
+			this.totalBlock = Math.max(0, this.totalBlock - 3);
+			this.consecutiveSuccess = 0;
+		}
+	}
+
+	/**
+	 * 重置新一轮任务的摩擦预算 (Turn Start)
+	 */
+	public resetTurnDenials(): void {
 		this.consecutiveBlock = 0;
 		this.pendingManualRetryFingerprint = null;
 	}
@@ -227,11 +271,12 @@ export class DenialTracker {
 		this.totalBlock = 0;
 		this.totalUnavailable = 0;
 		this.pendingManualRetryFingerprint = null;
+		this.consecutiveSuccess = 0;
 	}
 }
 
 // ==============================================================
-// 2. 统一英文引导文案表 
+// 2. 统一英文引导文案表
 // ==============================================================
 
 export const DENIAL_MESSAGES = {
@@ -310,3 +355,27 @@ export const DENIAL_MESSAGES = {
 	classifierUpstreamError: (code: string, toolName: string): string =>
 		`Classifier request failed upstream (${code}) — this is NOT a verdict on the action. Falling back for human review of ${toolName}; approving once restores classifier verdicts.`,
 };
+
+// ==============================================================
+// 3. 双通道 Agent 结构化报错文案生成器
+// ==============================================================
+
+export function formatDenyReasonForAgent(rule: string): string {
+	const cleanRule = rule.startsWith("Deny(") ? rule : `Deny(${rule})`;
+	return `[Approval Policy: BLOCKED]\n- Error: Execution denied by rule ${cleanRule}.\n- Constraint: Operations matching this pattern are permanently disallowed by user policy. Do not attempt semantic bypass, flag variation, or alternate tools to execute this.\n- Next Steps: Choose an alternative approach that completely avoids this operation. If the task cannot proceed without it, stop and explain the blocker to the user.`;
+}
+
+export function formatLoopReasonForAgent(loopCheck: LoopCheckResult): string {
+	const streak = loopCheck.streak || 3;
+	return `[Execution Loop: STAGNATION]\n- Error: ${streak} consecutive calls used identical tool and parameters with no forward progress.\n- Constraint: Further identical retries of this command are blocked.\n- Next Steps: Inspect previous outputs, determine why the approach failed to make progress, and switch to a materially different strategy, command, or parameter set.`;
+}
+
+export function formatUserRejectionReasonForAgent(label?: string): string {
+	const detail = label ? ` (the user denied "${label}")` : "";
+	return `[User Decision: REJECTED]\n- Action: The user manually rejected this tool execution in the approval prompt${detail}.\n- Next Steps: Respect the user's rejection. Do not retry the exact same action. Adjust your plan or ask the user for guidance on preferred alternatives.`;
+}
+
+export function formatUserAbortReasonForAgent(): string {
+	return `[User Directive: ABORT_DIRECTION]\n- Action: The user rejected this tool call and explicitly commanded an immediate halt to this operational direction.\n- Next Steps: Do NOT continue this line of reasoning or related commands. Summarize the current state, explain where the blocker occurred, and wait for user instruction.`;
+}
+

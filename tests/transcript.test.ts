@@ -80,3 +80,48 @@ test("transcript - 窗口只取最近 N 条 message，custom entry 跳过不计�
 	assert.equal(items[0], `msg-${total - MAX_TRANSCRIPT_MESSAGES}`);
 	assert.equal(items[items.length - 1], `msg-${total - 1}`);
 });
+
+test("transcript - 消息 content 结构多样性与防御分支", () => {
+	const entries: TranscriptEntryLike[] = [
+		// 1. 无效或畸变 entry 过滤
+		null as any,
+		{ type: "other" } as any,
+		{ type: "message" } as any, // 缺 message 属性
+		// 2. user content 为 text block 数组，且夹杂非 text / null
+		{
+			type: "message",
+			message: {
+				role: "user",
+				content: [
+					null,
+					{ type: "image", data: "..." },
+					{ type: "text", text: "multi-part line 1" },
+					{ type: "text", text: "multi-part line 2" },
+					{ type: "text", text: 123 }, // 非 string text
+				],
+			},
+		},
+		// 3. user content 为纯空白或非 string/array
+		{ type: "message", message: { role: "user", content: "   " } },
+		{ type: "message", message: { role: "user", content: 12345 } },
+		// 4. assistant content 非数组（如纯字符串）或夹杂畸变 part
+		{ type: "message", message: { role: "assistant", content: "raw string thinking" } },
+		{
+			type: "message",
+			message: {
+				role: "assistant",
+				content: [
+					null,
+					{ type: "toolCall", name: 123 }, // 非 string name
+					{ type: "toolCall", name: "bash" }, // 缺 arguments
+					{ type: "thinking", text: "internal reasoning" },
+				],
+			},
+		},
+	];
+
+	const items = buildTranscript(entries, "/p");
+	assert.ok(items.length >= 2);
+	assert.ok(items.some((i) => i.includes("multi-part line 1\nmulti-part line 2")));
+	assert.ok(items.some((i) => i.includes('Prior action: bash({"command":"","cwd":"/p"})')));
+});

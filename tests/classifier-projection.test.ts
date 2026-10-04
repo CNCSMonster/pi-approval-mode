@@ -57,7 +57,54 @@ test("投影 - 未知工具回退最小化投影 { toolName }", () => {
 	assert.deepEqual(out, { toolName: "task" });
 });
 
-test("投影 - read 只暴露 path，不暴露 offset/limit 等无关参数", () => {
+test("投影 - read 只暴露 path，不暴露 offset/limit 等无关参数（）", () => {
 	const out = projectToolInput("read", { path: "/etc/passwd", offset: 5, limit: 10 }, "/p");
 	assert.deepEqual(out, { path: "/etc/passwd" });
+});
+
+test("投影 - grep / find / ls 读类工具投影与缺省边界", () => {
+	const grepOut = projectToolInput("grep", { path: "/p/src", pattern: "export" }, "/p");
+	assert.deepEqual(grepOut, { path: "/p/src", pattern: "export" });
+
+	const findOut = projectToolInput("find", { path: "/p", pattern: "*.ts" }, "/p");
+	assert.deepEqual(findOut, { path: "/p", pattern: "*.ts" });
+
+	const lsOut = projectToolInput("ls", { path: "/p" }, "/p");
+	assert.deepEqual(lsOut, { path: "/p" });
+
+	// 缺省参数或非字符串类型回退空字符串兜底
+	const defaultGrep = projectToolInput("grep", {}, "/p");
+	assert.deepEqual(defaultGrep, { path: "", pattern: "" });
+
+	const defaultLs = projectToolInput("ls", {}, "/p");
+	assert.deepEqual(defaultLs, { path: "" });
+
+	const defaultRead = projectToolInput("read", { path: 123 }, "/p");
+	assert.deepEqual(defaultRead, { path: "" });
+
+	const defaultBash = projectToolInput("bash", {}, "/p");
+	assert.deepEqual(defaultBash, { command: "", cwd: "/p" });
+});
+
+test("投影 - edit 与 write 异常输入边界分支防御", () => {
+	// edits 为非数组
+	const invalidEdits = projectToolInput("edit", { edits: null }, "/p");
+	assert.deepEqual(invalidEdits, { path: "", edits_count: 0, edits_preview: [] });
+
+	// edit 项缺少 oldText / newText 或包含 null
+	const partialEdits = projectToolInput("edit", {
+		path: "/p/a.ts",
+		edits: [null, {}, { oldText: "valid" }, { newText: "valid" }],
+	}, "/p");
+	assert.equal(partialEdits.edits_count, 4);
+	assert.equal(partialEdits.edits_preview.length, 4);
+
+	// write content 缺省或非字符串
+	const defaultWrite = projectToolInput("write", {}, "/p");
+	assert.deepEqual(defaultWrite, {
+		path: "",
+		byte_count: 0,
+		content_preview: "",
+		content_truncated: false,
+	});
 });

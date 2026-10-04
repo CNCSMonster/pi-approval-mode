@@ -167,7 +167,7 @@ test("C4 关系违规：stage1=5000 + stage2=3000 → 告警并整对回退默�
 // C5 边界非法逐值：各自独立 → 告警 + effective 回退默认
 // ============================================================
 test("C5 边界非法逐值：各非法值独立触发告警并回退 1500/3000", () => {
-	const bad = [0, -1, 0.5, NaN, Infinity, 1e999, 2147483648, "5000"];
+	const bad = [0, -1, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 100, 2147483648, "5000"];
 	for (const v of bad) {
 		const { ret, warns } = callApply({ classifierTimeoutMs: v });
 		assert.strictEqual(ret.violated, true, `值 ${String(v)} 应判违规`);

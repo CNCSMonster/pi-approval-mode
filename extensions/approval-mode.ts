@@ -12,7 +12,7 @@
  *                  • Stage 1 (Fast Path): ~300ms 快速研判 (带 1500ms 超时熔断)
  *                  • Stage 2 (Review Path): 仅当 Stage 1 标记可疑时触发深度推理，消除误报
  *                  • 降级容灾：若分类器离线/超时/不可用，自动平滑回退至高危规则启发式风控
- * 4. yolo      - 全自动模式：所有工具调用无条件直接执行（Pi 默认行为）。
+ * 4. yolo      - 全自动模式：除显式 deny 规则与死循环熔断外无条件执行所有工具。
  * 5. plan      - 只读规划模式：禁用 edit/write 工具，bash 仅放行只读白名单命令，动态注入只读规划提示词。
  *
  * 规则体系与优先状态机 (Qwen Code 对齐)：
@@ -27,14 +27,21 @@
  * - 四级免审作用域 (单次 / 会话 / 项目级持久化 / 用户级持久化 / 拒绝)
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, realpathSync } from "node:fs";
-import { dirname, join, relative, resolve, isAbsolute } from "node:path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join, relative } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolCallEventResult } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, wrapTextWithAnsi, visibleWidth, type AutocompleteItem } from "@earendil-works/pi-tui";
 
 import { analyzeShellCommand } from "./shell-analyzer.ts";
-import { fallbackHeuristicCheck, isProtectedPath, isEscapingWorkspace, CLASSIFIER_BASE_PROMPT } from "./heuristic-guard.ts";
+import {
+	fallbackHeuristicCheck,
+	evaluateFallbackAction,
+	isProtectedPath,
+	isEscapingWorkspace,
+	CLASSIFIER_BASE_PROMPT,
+	type FallbackAction,
+} from "./heuristic-guard.ts";
 import {
 	PermissionManager,
 	buildReadDslRule,
@@ -42,11 +49,24 @@ import {
 	getToolDefaultPermission,
 	isReadOnlyTool,
 	resolveReadDisposition,
-	type DecisionType,
 } from "./permission-engine.ts";
 import { LoopDetector, type LoopCheckResult } from "./loop-detector.ts";
-import { DenialTracker, DENIAL_MESSAGES } from "./denial-tracker.ts";
-import { projectToolInput, buildTranscript } from "./classifier-projection.ts";
+import {
+	DenialTracker,
+	DENIAL_MESSAGES,
+	formatDenyReasonForAgent,
+	formatLoopReasonForAgent,
+	formatUserRejectionReasonForAgent,
+	formatUserAbortReasonForAgent,
+} from "./denial-tracker.ts";
+import {
+	projectToolInput,
+	buildTranscript,
+	StageHealthTracker,
+	STAGE1_ESCALATE_THRESHOLD,
+	type Stage1FailureReason,
+	type Stage1HealthStatus,
+} from "./classifier-projection.ts";
 import {
 	ALL_MODES,
 	normalizeMode,
@@ -54,17 +74,37 @@ import {
 	type ApprovalMode,
 	type ApprovalConfigFile,
 } from "./approval-config.ts";
+import { sanitizeUntrustedDetail, type SanitizedDetailResult } from "./detail-sanitizer.ts";
 
 // 对外 API 再导出（历史习惯从 approval-mode 取这些符号）
-export { ALL_MODES, normalizeMode, loadApprovalConfig };
-export type { ApprovalMode, ApprovalConfigFile };
+export {
+	ALL_MODES,
+	normalizeMode,
+	loadApprovalConfig,
+	sanitizeUntrustedDetail,
+	StageHealthTracker,
+	STAGE1_ESCALATE_THRESHOLD,
+	evaluateFallbackAction,
+	formatDenyReasonForAgent,
+	formatLoopReasonForAgent,
+	formatUserRejectionReasonForAgent,
+	formatUserAbortReasonForAgent,
+};
+export type {
+	ApprovalMode,
+	ApprovalConfigFile,
+	SanitizedDetailResult,
+	Stage1FailureReason,
+	Stage1HealthStatus,
+	FallbackAction,
+};
 
 // 模式说明文案
 const MODE_DESCRIPTIONS: Record<ApprovalMode, string> = {
 	manual: "🛡️ manual - 人审模式（文件修改与 Shell 命令均需人工审批）",
 	"auto-edit": "📝 auto-edit - 自动批准文件编辑（仅 Shell 命令需审批）",
 	auto: "⚖️ auto - 智能分类器模式（双阶段 LLM 自动判定意图与风险）",
-	yolo: "⚡ yolo - 全自动模式（无条件直接执行所有工具）",
+	yolo: "⚡ yolo - 全自动模式（除显式 deny 规则与死循环熔断外直接执行）",
 	plan: "📋 plan - 只读分析模式（禁用编辑/写入工具，仅放行只读命令）",
 };
 
@@ -361,7 +401,7 @@ export function applyClassifierTimeoutConfig(
 }
 
 // ==========================================
-// /classifier-model 参数解析、帮助与自动补全纯逻辑
+//  /classifier-model 参数解析、帮助与自动补全纯逻辑
 // ==========================================
 
 export const CLASSIFIER_SET_FLAGS = ["--stage1", "--stage2", "--both"] as const;
@@ -596,6 +636,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 
 	// 无头拦截状态机与动作指纹短路追踪器 (Qwen Code 对齐)
 	const denialTracker = new DenialTracker();
+	const stageHealthTracker = new StageHealthTracker();
 	const notifiedFallbacks = new Set<string>();
 
 	// 1. 注册 CLI 命令行启动参数
@@ -617,11 +658,20 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 
 	// 更新 TUI 底部状态栏指示器
 	function updateStatus(ctx: ExtensionContext): void {
+		if (!ctx?.ui?.setStatus) return;
 		const theme = ctx.ui.theme;
+		let autoBadge = theme.fg("borderAccent", "⚖️ auto");
+		if (currentMode === "auto") {
+			const s1Health = stageHealthTracker.getStatus();
+			if (s1Health.status === "degraded") {
+				autoBadge = theme.fg("warning", "⚖️ auto | S1⚠️");
+			}
+		}
+
 		const badges: Record<ApprovalMode, string> = {
 			manual: theme.fg("success", "🛡️ manual"),
 			"auto-edit": theme.fg("accent", "📝 auto-edit"),
-			auto: theme.fg("borderAccent", "⚖️ auto"),
+			auto: autoBadge,
 			yolo: theme.fg("error", "⚡ yolo"),
 			plan: theme.fg("warning", "📋 plan"),
 		};
@@ -653,9 +703,10 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		currentMode = newMode;
 
 		loopDetector.reset();
-		// 与 loopDetector 对称重置 denialTracker，跨模式不带旧债
-		// （plan 连拒切 auto 开局即清零，含 totalBlock/totalUnavailable/指纹）。
+		// -D / 与 loopDetector 对称重置 denialTracker，跨模式不带旧债
+		// （plan 连拒切 auto 开局即清零，含 totalBlock/totalUnavailable/指纹/自愈连击）。
 		denialTracker.resetAll();
+		stageHealthTracker.reset();
 		applyModeTools(newMode);
 
 		// auto 护栏：进入 auto 暂存危险 allow 规则，离开 auto 恢复
@@ -723,27 +774,20 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 				"warning",
 			);
 		}
-		if (fileConfig.classifierModel) {
-			customClassifierModel = fileConfig.classifierModel;
-		}
-		if (fileConfig.classifierStage1Model) {
-			customClassifierStage1Model = fileConfig.classifierStage1Model;
-		}
-		if (fileConfig.classifierStage2Model) {
-			customClassifierStage2Model = fileConfig.classifierStage2Model;
-		}
+		customClassifierModel = fileConfig.classifierModel;
+		customClassifierStage1Model = fileConfig.classifierStage1Model;
+		customClassifierStage2Model = fileConfig.classifierStage2Model;
 		const timeoutConfig = applyClassifierTimeoutConfig(fileConfig, ctx);
 		classifierTimeoutMs = timeoutConfig.stage1;
 		classifierStage2TimeoutMs = timeoutConfig.stage2;
-		if (fileConfig.loopDetection) {
-			loopDetector.updateThresholds(fileConfig.loopDetection);
-		}
-		if (fileConfig.denialLimits || typeof fileConfig.headlessAbortOnDenialCap === "boolean") {
-			denialTracker.updateConfig({
-				limits: fileConfig.denialLimits,
-				abortOnDenialCap: fileConfig.headlessAbortOnDenialCap,
-			});
-		}
+		loopDetector.resetThresholds(fileConfig.loopDetection);
+		denialTracker.resetConfig({
+			limits: fileConfig.denialLimits,
+			abortOnDenialCap: fileConfig.headlessAbortOnDenialCap,
+		});
+		denialTracker.resetAll();
+		loopDetector.reset();
+		stageHealthTracker.reset();
 
 		// 基线默认模式（内置回退 auto；旧配置值 default 经别名映射为 manual）
 		const baselineMode: ApprovalMode = normalizeMode(fileConfig.defaultMode) ?? "auto";
@@ -873,7 +917,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		manual: "人审模式（文件修改与 Shell 命令均需人工审批）",
 		"auto-edit": "自动批准文件编辑（仅 Shell 命令需审批）",
 		auto: "智能分类器模式（双阶段 LLM 自动判定风险）",
-		yolo: "全自动模式（无条件直接执行所有工具）",
+		yolo: "全自动模式（除显式 deny 规则与死循环熔断外直接执行）",
 		plan: "只读规划模式（禁用编辑/写入，仅放行只读命令）",
 	};
 
@@ -987,7 +1031,10 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		const s1Msg = `Stage 1: 配置值 ${r1.configValue || "未配置"} → 生效值 ${r1.label}` + (r1.fallbackReason ? ` (回退原因: ${r1.fallbackReason})` : "");
 		const s2Msg = `Stage 2: 配置值 ${r2.configValue || "未配置"} → 生效值 ${r2.label}` + (r2.fallbackReason ? ` (回退原因: ${r2.fallbackReason})` : "");
 
-		return `当前审批分类器模型状态:\n${s1Msg}\n${s2Msg}\n配置文件: ~/.pi/agent/approval-config.json\n\n${CLASSIFIER_USAGE}`;
+		const s1Health = stageHealthTracker.getStatus();
+		const s1HealthMsg = `Stage 1 运行健康: ${s1Health.status} (连续失败 ${s1Health.consecutiveFailures} 次，累计 ${s1Health.totalFailures} 次)`;
+
+		return `当前审批分类器模型状态:\n${s1Msg}\n${s2Msg}\n${s1HealthMsg}\n配置文件: ~/.pi/agent/approval-config.json\n\n${CLASSIFIER_USAGE}`;
 	}
 
 	function validateClassifierModelRef(ctx: ExtensionContext, modelRef: string): { ok: boolean; reason?: string } {
@@ -1238,8 +1285,10 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		},
 	});
 
-	// 5. 提示词动态增强（针对 Plan 模式）
+	// 5. 提示词动态增强（针对 Plan 模式）与新一轮摩擦预算重置
 	pi.on("before_agent_start", async () => {
+		denialTracker.resetTurnDenials();
+
 		if (currentMode === "plan") {
 			return {
 				message: {
@@ -1308,9 +1357,10 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 			`## Pending tool call to classify\n\n` +
 			`Tool: ${toolName}\nArguments:\n${JSON.stringify(projectedInput, null, 2)}`;
 
-		// === Stage 1: 极速初筛 (带超时熔断保护) ===
+		// === Stage 1: 极速初筛 (带超时熔断保护与独立健康追踪， Module A) ===
 		if (s1Model && ctx.modelRegistry.hasConfiguredAuth(s1Model)) {
 			let stage1Response: any = null;
+			let s1Failure: Stage1FailureReason | null = null;
 			try {
 				const stage1Promise = ctx.modelRegistry.complete(
 					s1Model,
@@ -1327,20 +1377,66 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 					{ cacheRetention: "none" },
 				);
 				stage1Response = await withTimeout(stage1Promise, classifierTimeoutMs, null);
-			} catch (err) {
-				// stage1 fails -> proceed to stage2
+				if (!stage1Response) {
+					s1Failure = "timeout";
+				}
+			} catch {
+				s1Failure = "exception";
 			}
 
 			if (stage1Response) {
-				const stage1Text = stage1Response.content
-					.filter((c: any): c is { type: "text"; text: string } => c.type === "text")
-					.map((c: any) => c.text)
-					.join("\n");
-				const stage1Json = parseClassifierJson(stage1Text);
-				if (stage1Json && stage1Json.shouldBlock === false) {
-					denialTracker.recordClassifierActive();
-					return { shouldBlock: false, reason: "", stage: "fast" };
+				const s1Err =
+					(stage1Response as any).stopReason === "error" || (stage1Response as any).errorMessage
+						? String((stage1Response as any).errorMessage || "unknown upstream error")
+						: null;
+				if (s1Err !== null) {
+					s1Failure = "upstream_error";
+				} else {
+					const stage1Text = stage1Response.content
+						.filter((c: any): c is { type: "text"; text: string } => c.type === "text")
+						.map((c: any) => c.text)
+						.join("\n");
+					const stage1Json = parseClassifierJson(stage1Text);
+					if (stage1Json && typeof stage1Json.shouldBlock === "boolean") {
+						const prevStatus = stageHealthTracker.getStatus().status;
+						stageHealthTracker.recordStage1Success();
+						if (prevStatus === "degraded") {
+							updateStatus(ctx);
+						}
+						if (stage1Json.shouldBlock === false) {
+							denialTracker.recordClassifierActive();
+							return { shouldBlock: false, reason: "", stage: "fast" };
+						}
+						// shouldBlock === true: Stage 1 标记可疑，流转 Stage 2 深度复核
+					} else {
+						s1Failure = "invalid_response";
+					}
 				}
+			}
+
+			if (s1Failure !== null) {
+				const { transitioned, escalated } = stageHealthTracker.recordStage1Failure(s1Failure);
+				if (transitioned) {
+					updateStatus(ctx);
+					if (!stageHealthTracker.hasWarnedDegraded()) {
+						stageHealthTracker.setWarnedDegraded(true);
+						if (ctx.ui?.notify) {
+							ctx.ui.notify(
+								`⚠️ 分类器 Stage 1 快速快筛响应异常 (${s1Failure})，已自动由 Stage 2 深度复核接管。`,
+								"warning",
+							);
+						}
+					}
+				}
+				if (escalated) {
+					if (ctx.ui?.notify) {
+						ctx.ui.notify(
+							`⚠️ 分类器 Stage 1 快速快筛已连续失败 5 次 (当前所有调用均由 Stage 2 深度复核接管，审批延迟增加)。建议执行 /classifier-model 检查或切换 Stage 1 快筛模型。`,
+							"warning",
+						);
+					}
+				}
+				// 严禁误计入共享 consecutiveUnavailable! (Stage 2 成功仍保证分类器整体可用)
 			}
 		}
 
@@ -1349,10 +1445,10 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		// 检查 Stage 2 模型是否可用
 		if (!s2Model || !ctx.modelRegistry.hasConfiguredAuth(s2Model)) {
 			denialTracker.recordUnavailable();
-			const heuristic = fallbackHeuristicCheck(toolName, toolInput);
+			const heuristic = fallbackHeuristicCheck(toolName, toolInput, ctx.cwd);
 			return {
 				...heuristic,
-				stage: "fallback"
+				stage: "fallback",
 			};
 		}
 
@@ -1375,7 +1471,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 			);
 
 			stage2Response = await withTimeout(stage2Promise, classifierStage2TimeoutMs, null);
-		} catch (err) {
+		} catch {
 			denialTracker.recordUnavailable();
 			return {
 				shouldBlock: true,
@@ -1450,6 +1546,20 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 	): Promise<ApprovalAction> {
 		const options: ApprovalOption[] = isLoop ? [...APPROVAL_OPTIONS, LOOP_ABORT_OPTION] : APPROVAL_OPTIONS;
 
+		//  展示前安全转义不可信详情内容（防御终端注入、消除 Tab 宽度漂移、阻断 Bidi 视觉欺骗）
+		let totalControl = 0;
+		let totalTab = 0;
+		let totalBidi = 0;
+		const sanitizedDetails = details.map((item) => {
+			const res = sanitizeUntrustedDetail(item.content);
+			totalControl += res.escapedControlCount;
+			totalTab += res.escapedTabCount;
+			totalBidi += res.escapedBidiCount;
+			return { label: item.label, content: res.text };
+		});
+		const totalEscaped = totalControl + totalTab + totalBidi;
+		const hasSanitized = totalEscaped > 0;
+
 		if (ctx.mode === "tui") {
 			const result = await ctx.ui.custom<ApprovalAction | null>((tui, theme, _kb, done) => {
 				// 指纹短路弹窗默认拒绝态（光标停在 Block；Esc 本就=拒绝）
@@ -1513,10 +1623,19 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 						addLine(theme.fg("accent", "─".repeat(safeWidth)));
 						addLine(theme.fg("accent", theme.bold(title)), " ");
 						addLine(theme.fg("accent", `当前审批模式: ${currentMode}  (按 Ctrl+Alt+A 可切换)`), " ");
+						if (hasSanitized) {
+							addLine(
+								theme.fg(
+									"warning",
+									`⚠️ 展示安全提醒：检测到 ${totalEscaped} 处特殊控制字符（已转义展示）。批准后将按原始参数执行。`,
+								),
+								" ",
+							);
+						}
 						addLine("");
 
 						// 详细信息展示区
-						for (const item of details) {
+						for (const item of sanitizedDetails) {
 							addLine(`${theme.fg("muted", item.label)}:`, "  ");
 							for (const cl of item.content.split("\n")) {
 								addLine(theme.fg("text", cl), "    ");
@@ -1558,7 +1677,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		// RPC 或无完整 TUI 终端模式时的优雅降级
 		if (ctx.hasUI) {
 			const items = options.map((opt, i) => `${i + 1}. ${opt.label} (${opt.description})`);
-			const promptBody = `${title}\n\n${details.map((d) => `${d.label}:\n  ${d.content}`).join("\n")}`;
+			const promptBody = `${title}\n\n${sanitizedDetails.map((d) => `${d.label}:\n  ${d.content}`).join("\n")}`;
 			const selected = await ctx.ui.select(promptBody, items);
 			if (!selected) return "block";
 
@@ -1580,7 +1699,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 	/**
 	 * 分类器连续不可用熔断是否已触顶（交互降级启发式的判据）
 	 *
-	 * 不能复用 checkFallback().kind：后人工拒绝也计入 consecutiveBlock，
+	 * 不能复用 checkFallback().kind： 后人工拒绝也计入 consecutiveBlock，
 	 * 而 consecutiveBlock 触顶时 kind 会是 consecutive_block，把“不可用”降级电路顶掉，
 	 * 故障窗口的重复弹窗抑制（本单预期的实现路径）随之失效。故直接读不可用计数。
 	 */
@@ -1628,7 +1747,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		input: Record<string, any>,
 		fromCircuitFallback = false, // 本次弹窗是否因熔断跳过分类器而产生（Qwen wasAutoModeFallback 同款判据）
 	): Promise<ToolCallEventResult | undefined> {
-		// （Qwen Code v2 同款）：仅「触顶后跳过分类器的 fallback 弹窗」上的
+		// -A'（Qwen Code v2 同款）：仅「触顶后跳过分类器的 fallback 弹窗」上的
 		// 人工批准是自愈触发器——清连击计数，下次判定重新交分类器；
 		// 分类器真实跑过但失败的故障弹窗批准不清（0027-A/D1 语义保持）；
 		// 拒绝路径不清（拒绝视为分类器判对）。
@@ -1680,15 +1799,21 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 			}
 
 			case "block_and_abort":
+				if (ctx.ui?.setStatus) {
+					ctx.ui.setStatus("用户拒绝执行并要求中止当前推进方向");
+				}
 				return blockCall(
 					toolName,
 					input,
-					`[User Directive] The user explicitly rejected this action and commanded you to halt this direction immediately. Reflect on the blocker, step back, and pursue a completely different approach.`,
+					formatUserAbortReasonForAgent(),
 				);
 
 			case "block":
 			default:
-				return blockCall(toolName, input, DENIAL_MESSAGES.userDenied(label));
+				if (ctx.ui?.setStatus) {
+					ctx.ui.setStatus("已由用户手动拒绝执行");
+				}
+				return blockCall(toolName, input, formatUserRejectionReasonForAgent(label));
 		}
 	}
 
@@ -1725,7 +1850,18 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 					ctx.hasUI
 						? DENIAL_MESSAGES.circuitBreaker(loopCheck.warningMessage || "Hard limit reached")
 						: headlessFused,
+					false,
 				);
+			}
+
+			//  处于 yolo 模式下一律即刻阻断，不穿透放行！
+			// terminate 恒为 false，将结构化 Agent 报错注入上下文赋予 Model 自主决策与纠错空间。
+			if (currentMode === "yolo") {
+				if (ctx.hasUI) {
+					ctx.ui.notify("🚨 检测到连续 3 次相同工具调用，已暂停并交由模型调整", "warning");
+				}
+				const agentReason = formatLoopReasonForAgent(loopCheck);
+				return blockCall(toolName, input, agentReason, false);
 			}
 
 			// 在无头模式 (Headless / !ctx.hasUI) 下：直接快速失败，强制阻断死循环！
@@ -1745,10 +1881,13 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 
 		// 1) 命中 Deny 规则：最高优先级硬性阻断，不弹窗，直接向模型反馈错误
 		if (permDecision.decision === "deny") {
+			if (ctx.hasUI) {
+				ctx.ui.notify(`🛑 命中禁止规则: ${permDecision.matchedRule}，已阻断执行`, "error");
+			}
 			return blockCall(
 				toolName,
 				input,
-				DENIAL_MESSAGES.presetDeny(permDecision.matchedRule || ""),
+				formatDenyReasonForAgent(permDecision.matchedRule || ""),
 			);
 		}
 
@@ -1907,7 +2046,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 				const circuitFallbackRead = unavailableCircuitTripped();
 				let decision: { shouldBlock: boolean; reason: string; stage: "fast" | "thinking" | "fallback"; outage?: boolean };
 				if (circuitFallbackRead) {
-					decision = fallbackHeuristicCheck(toolName, input);
+					decision = fallbackHeuristicCheck(toolName, input, ctx.cwd);
 				} else {
 					decision = await runTwoStageClassifier(ctx, toolName, input);
 				}
@@ -1976,7 +2115,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 			return handleOutcome(readAction, dslRule, ctx, label, toolName, input);
 		}
 
-		// 1) yolo 模式：无条件直接放行
+		// 1) yolo 模式：除显式 deny 规则与死循环熔断已在前置拦截外，其余调用直接放行
 		if (currentMode === "yolo") {
 			return allowCall(toolName, input);
 		}
@@ -2123,7 +2262,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 				const cmd = (input.command || "").trim();
 				const dslRule = `Bash(${cmd})`;
 
-				// Layer 2 只读免审快路径下线——auto 下非规则命中的 bash 一律进分类器（交互与无头同口径）。
+				//  Layer 2 只读免审快路径下线——auto 下非规则命中的 bash 一律进分类器（交互与无头同口径）。
 				// 分析调用保留，仅供弹窗"静态结构特征"展示行消费（展示≠裁决）。
 				const shellAnalysis = analyzeShellCommand(cmd);
 
@@ -2169,7 +2308,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 				// 触顶判断时点捕获（同 read 分支）
 				const circuitFallbackBash = unavailableCircuitTripped();
 				if (circuitFallbackBash) {
-					decision = fallbackHeuristicCheck(toolName, input);
+					decision = fallbackHeuristicCheck(toolName, input, ctx.cwd);
 				} else {
 					decision = await runTwoStageClassifier(ctx, "bash", input);
 				}
@@ -2213,6 +2352,30 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 				);
 
 				return handleOutcome(action, dslRule, ctx, cmd, toolName, input, circuitFallbackBash);
+			}
+
+			// 未知工具安全处置 (Module B: 降级态绝对禁止静默放行)
+			if (unavailableCircuitTripped()) {
+				const fallback = evaluateFallbackAction(toolName, input, { cwd: ctx.cwd });
+				if (fallback.action === "require_approval") {
+					if (!ctx.hasUI) {
+						return blockCall(toolName, input, fallback.reason, false, false);
+					}
+					const unknownDialog: Array<{ label: string; content: string }> = [];
+					if (loopCheck.isLoop && loopCheck.warningMessage) {
+						unknownDialog.push({ label: "🚨 死循环预警", content: loopCheck.warningMessage });
+					}
+					unknownDialog.push({ label: "未知工具", content: toolName });
+					unknownDialog.push({ label: "调用参数", content: JSON.stringify(input) });
+					unknownDialog.push({ label: "降级原因", content: fallback.reason });
+					const unknownAction = await promptApprovalDialog(
+						ctx,
+						formatDialogTitle("⚠️ [未知工具降级审批 (Auto Mode)]", "未知工具", loopCheck),
+						unknownDialog,
+						loopCheck.isLoop,
+					);
+					return handleOutcome(unknownAction, toolName, ctx, toolName, toolName, input, true);
+				}
 			}
 
 			return allowCall(toolName, input);
