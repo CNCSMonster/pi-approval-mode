@@ -4,6 +4,8 @@ import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import approvalModeExtension from "../extensions/approval-mode.ts";
+import { type DenialLimits } from "../extensions/denial-tracker.ts";
+import { MICRO_TEST_LIMITS } from "./test-harness.ts";
 
 // 环境隔离：HOME / USERPROFILE 重定向到 mkdtemp，绝不写真实 ~/.pi
 const sandboxHome = mkdtempSync(join(tmpdir(), "pi-issue-0027-home-"));
@@ -24,6 +26,7 @@ async function setup(opts: {
 	hasUI: boolean;
 	complete: "block" | "outage";
 	selectReply?: (n: number) => string | null; // 第 n 次弹窗的应答（null/undefined → 默认拒绝）
+	limits?: Partial<DenialLimits>;
 }): Promise<Harness> {
 	const handlers: Record<string, any> = {};
 	const commands: Record<string, any> = {};
@@ -84,9 +87,12 @@ async function setup(opts: {
 
 	const agentDir = join(sandboxHome, ".pi", "agent");
 	mkdirSync(agentDir, { recursive: true });
+	const limitsToPersist = opts.limits
+		? { ...MICRO_TEST_LIMITS, ...opts.limits }
+		: { maxTotalDenials: 50 };
 	writeFileSync(
 		join(agentDir, "approval-config.json"),
-		JSON.stringify({ denialLimits: { maxTotalDenials: 20 } }),
+		JSON.stringify({ denialLimits: limitsToPersist }),
 	);
 
 	await handlers["session_start"]({ reason: "start" }, ctx);
@@ -97,10 +103,10 @@ const cmd = (n: number) => `sudo rm -rf /tmp/issue-0027-${n}`;
 
 // ============================================================
 // A：快路径放行不得"治愈"分类器故障计数（混合流量下不可用熔断必须仍可达）
-// 翻转：auto 只读 bash 免审快路径下线——ls 同样进分类器、故障同样 fail-closed；
+//  翻转：auto 只读 bash 免审快路径下线——ls 同样进分类器、故障同样 fail-closed；
 // 熔断可达性锚定在新口径下依然成立（三次故障来源均计入 u）。
 // ============================================================
-test("混合流量（outage ×2 → 只读 bash 进分类器故障 → 触顶）不可用熔断可达", async () => {
+test("e2e: 混合流量（outage ×2 → 只读 bash 进分类器故障 → 触顶）不可用熔断可达", async () => {
 	const h = await setup({ hasUI: false, complete: "outage" });
 
 	for (const n of [1, 2]) {
@@ -130,7 +136,7 @@ test("混合流量（outage ×2 → 只读 bash 进分类器故障 → 触顶）
 // ============================================================
 // B：无头 loop 拦截 reason 为熔断口径 + loop 先手于 tracker consecutive_block 的 e2e 钉住
 // ============================================================
-test("无头真实连拒 3 次 → 第 4 次拦截来自 loop 熔断而非 tracker consecutive_block", async () => {
+test("e2e: 无头真实连拒 3 次 → 第 4 次拦截来自 loop 熔断而非 tracker consecutive_block", async () => {
 	const h = await setup({ hasUI: false, complete: "block" });
 
 	// 三次不同参数的真实拒绝（分类器判拦 → blockCall 双灌 loop + tracker）
@@ -193,29 +199,30 @@ test("受保护路径 edit 指纹命中同样跳过分类器直接人审", async
 // C-1：total_denial 达顶 → 交互侧直接拒绝 + 解除提示（不跑分类器、不弹窗）
 // ============================================================
 test("交互侧会话拒绝上限达顶后直接拒绝并提示 allow 规则解除", async () => {
-	// 默认 maxTotalDenials=50（提升）；用"拒绝→放行"交替把 totalBlock 灌到 50（第 1~99 次调用 = 50 拒 + 49 放，
-	// 第 99 次奇数弹窗拒绝恰好凑满 50），同时避开 loop 连拒熔断（allowCall 的 recordSuccess 清零连续被拒计数）
+	// 显式注入 MICRO_TEST_LIMITS (maxTotalDenials: 4)；用"拒绝→放行"交替把 totalBlock 灌到 4（第 1~7 次调用 = 4 拒 + 3 放，
+	// 第 7 次奇数弹窗拒绝恰好凑满 4），同时避开 loop 连拒熔断（allowCall 的 recordSuccess 清零连续被拒计数）
 	const h = await setup({
 		hasUI: true,
 		complete: "block",
 		selectReply: (n) => (n % 2 === 1 ? null : "1"), // 奇数次弹窗拒绝、偶数次放行
+		limits: MICRO_TEST_LIMITS,
 	});
 
-	for (let i = 1; i <= 99; i++) {
+	for (let i = 1; i <= 7; i++) {
 		const r = await h.handlers["tool_call"]({ toolName: "bash", input: { command: cmd(i) } }, h.ctx);
 		if (i % 2 === 1) assert.strictEqual(r?.block, true, `第 ${i} 次弹窗拒绝应拦截`);
 		else assert.strictEqual(r, undefined, `第 ${i} 次弹窗放行应通过`);
 	}
-	assert.strictEqual(h.dialogs.length, 99, "达顶前应每次经分类器+弹窗（第 99 次拒绝恰好凑满 cap 50）");
+	assert.strictEqual(h.dialogs.length, 7, "达顶前应每次经分类器+弹窗（第 7 次拒绝恰好凑满 cap 4）");
 	const callsAtCap = h.classifyCalls();
 	const noticesAtCap = h.notices.length;
 
-	// 达顶后（totalBlock=50 ≥ cap 50）：不跑分类器、不弹窗，直接拒绝 + 提示
-	const r = await h.handlers["tool_call"]({ toolName: "bash", input: { command: cmd(100) } }, h.ctx);
+	// 达顶后（totalBlock=4 ≥ cap 4）：不跑分类器、不弹窗，直接拒绝 + 提示
+	const r = await h.handlers["tool_call"]({ toolName: "bash", input: { command: cmd(8) } }, h.ctx);
 	assert.strictEqual(r?.block, true, "达顶交互侧必须直接拒绝");
 	assert.match(String(r?.reason), /session denial cap/, "block reason 走 total_denial 熔断口径");
 	assert.strictEqual(h.classifyCalls(), callsAtCap, "达顶后不得再调用分类器");
-	assert.strictEqual(h.dialogs.length, 99, "达顶后不得再弹窗");
+	assert.strictEqual(h.dialogs.length, 7, "达顶后不得再弹窗");
 	assert.ok(
 		h.notices.length > noticesAtCap && h.notices[h.notices.length - 1].includes("allow 规则"),
 		"必须提示人可用 allow 规则解除",

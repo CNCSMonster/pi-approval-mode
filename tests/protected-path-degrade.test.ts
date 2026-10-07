@@ -4,6 +4,8 @@ import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import approvalModeExtension from "../extensions/approval-mode.ts";
+import { type DenialLimits } from "../extensions/denial-tracker.ts";
+import { MICRO_TEST_LIMITS } from "./test-harness.ts";
 
 // 环境隔离：HOME / USERPROFILE 重定向到 mkdtemp，绝不写真实 ~/.pi
 const sandboxHome = mkdtempSync(join(tmpdir(), "pi-protected-degrade-home-"));
@@ -24,6 +26,7 @@ async function setup(opts: {
 	hasUI: boolean;
 	complete: "block" | "outage";
 	selectReply?: (n: number) => string | null; // 第 n 次弹窗的应答（null/undefined → 默认拒绝）
+	limits?: Partial<DenialLimits>;
 }): Promise<Harness> {
 	const handlers: Record<string, any> = {};
 	const commands: Record<string, any> = {};
@@ -84,9 +87,12 @@ async function setup(opts: {
 
 	const agentDir = join(sandboxHome, ".pi", "agent");
 	mkdirSync(agentDir, { recursive: true });
+	const limitsToPersist = opts.limits
+		? { ...MICRO_TEST_LIMITS, ...opts.limits }
+		: { maxTotalDenials: 20 };
 	writeFileSync(
 		join(agentDir, "approval-config.json"),
-		JSON.stringify({ denialLimits: { maxTotalDenials: 20 } }),
+		JSON.stringify({ denialLimits: limitsToPersist }),
 	);
 
 	await handlers["session_start"]({ reason: "start" }, ctx);
@@ -104,7 +110,7 @@ async function callWrite(h: Harness, n: number) {
 // D1：不可用熔断触顶（u≥3）→ ② 跳过分类器直呈人工核准，默认拒绝态
 // ============================================================
 test("受保护路径熔断降级 D1: u≥3 时分类器零调用、熔断弹窗出现、默认拒绝出口", async () => {
-	// 前三次故障弹窗全部放行 → u=1..3（allow 不治愈 u，语义）
+	// 前三次故障弹窗全部放行 → u=1..3（allow 不治愈 u， 语义）
 	const h = await setup({ hasUI: true, complete: "outage", selectReply: (n) => (n <= 3 ? "1" : null) });
 
 	for (const i of [1, 2, 3]) {
@@ -161,27 +167,31 @@ test("受保护路径熔断降级 D3: u<3 时分类器照常研判，弹窗为�
 // ============================================================
 test("受保护路径熔断降级 D4: 会话拒绝上限达顶优先于不可用熔断——直拒、不弹窗、不调分类器", async () => {
 	// 前 3 个弹窗放行（灌 u 到 3）；此后 2 拒 1 放循环：totalBlock 增长且避开 loop 连拒熔断
+	// 使用显式 MICRO_TEST_LIMITS (maxTotalDenials: 4)，在第 10 次调用确定性命中直拒
 	const h = await setup({
 		hasUI: true,
 		complete: "outage",
 		selectReply: (n) => (n <= 3 || n % 3 === 1 ? "1" : null),
+		limits: MICRO_TEST_LIMITS,
 	});
 
-	let capped: { callsAt: number; dialogsAt: number; noticesAt: number; r: any } | null = null;
-	for (let i = 1; i <= 100; i++) {
+	let capped: { callsAt: number; dialogsAt: number; noticesAt: number; r: any; i: number } | null = null;
+	for (let i = 1; i <= 15; i++) {
 		const callsAt = h.classifyCalls();
 		const dialogsAt = h.dialogs.length;
 		const noticesAt = h.notices.length;
 		const r = await callWrite(h, 100 + i);
 		if (r?.block && /session denial cap/.test(String(r.reason))) {
-			capped = { callsAt, dialogsAt, noticesAt, r };
+			capped = { callsAt, dialogsAt, noticesAt, r, i };
 			break;
 		}
 	}
 
-	assert.ok(capped, "100 次内必须命中 total_denial 达顶直拒");
+	assert.ok(capped, "15 次内必须命中 total_denial 达顶直拒");
+	assert.strictEqual(capped!.i, 6, "首次无弹窗达顶直拒在第 6 次调用精确触发（3次outage故障 + 1次人工放行 + 1次人工拒绝 = 4次达顶）");
 	assert.strictEqual(h.classifyCalls(), capped!.callsAt, "达顶后不得再调用分类器");
 	assert.strictEqual(h.dialogs.length, capped!.dialogsAt, "达顶直拒不得弹窗（① 先于 ②，含熔断窗）");
+	assert.strictEqual(capped!.dialogsAt, 5, "达顶前发生 5 次弹窗（前 4 次放行 + 第 5 次拒绝）");
 	assert.ok(
 		h.notices.length > capped!.noticesAt && h.notices[h.notices.length - 1].includes("allow 规则"),
 		"必须提示人可用 allow 规则解除",

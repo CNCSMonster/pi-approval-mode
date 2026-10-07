@@ -60,6 +60,7 @@ test("DenialTracker - 分类器不可用与连续失败熔断 (consecutive_unava
 	assert.equal(tracker.checkFallback("fp").shouldFallback, false);
 });
 
+// [Baseline Anchor Test] 仅此类测试允许断言生产环境缺省默认常量，防范非预期漂移
 test("DenialTracker - 默认连续不可用阈值 = 3（设计基线 M11 锚定，）", () => {
 	const tracker = new DenialTracker(); // 无显式配置 → 走默认值，防 2↔3 回归
 
@@ -143,7 +144,7 @@ test("DENIAL_MESSAGES - 英文文案标准化与全场景覆盖", () => {
 	assert.match(planBash, /Plan mode is read-only: non-read-only command blocked/i);
 });
 
-// -A：u 的语义是"分类器连续 N 次不可用"（M11），快路径放行没碰过分类器，无权治愈故障计数。
+// u 的语义是"分类器连续 N 次不可用"（M11），快路径放行没碰过分类器，无权治愈故障计数。
 test("recordAllow 不重置 consecutiveUnavailable；仅 recordClassifierActive/resetAll 有权重置", () => {
 	const tracker = new DenialTracker();
 
@@ -169,7 +170,7 @@ test("recordAllow 不重置 consecutiveUnavailable；仅 recordClassifierActive/
 	assert.equal(tracker.getStats().consecutiveUnavailable, 0, "resetAll 仍可全清");
 });
 
-// -B-2：total_denial 达顶不再向模型承诺"unrelated safe work may continue"
+// total_denial 达顶不再向模型承诺"unrelated safe work may continue"
 // （无头语境被 loop 先手会话级熔断否决、交互语境达顶直接拒绝——文案必须说实话）。
 test("total_denial 文案删除可绕行承诺，改为人解除指引", () => {
 	const tracker = new DenialTracker({ limits: { maxTotalDenials: 1 } });
@@ -192,8 +193,9 @@ test("total_denial 文案删除可绕行承诺，改为人解除指引", () => {
 	assert.doesNotMatch(fused, /转换策略|switch (your )?strategy|continue with unrelated/i);
 });
 
-// / ：双系统分账锚定——DenialTracker 族默认 3/3/50（提升总摩擦预算至 50）。
-test("DenialTracker - 默认阈值锚定 3/3/50（双系统分账）", () => {
+// [Baseline Anchor Test] 仅此类测试允许断言生产环境缺省默认常量，防范非预期漂移
+// 双系统分账锚定——DenialTracker 族默认 3/3/50（ 提升总摩擦预算至 50）。
+test("DenialTracker - 默认阈值锚定 3/3/50（ 双系统分账）", () => {
 	const tracker = new DenialTracker();
 	assert.deepStrictEqual(tracker.getLimits(), {
 		maxConsecutiveBlock: 3,
@@ -202,7 +204,7 @@ test("DenialTracker - 默认阈值锚定 3/3/50（双系统分账）", () => {
 	});
 });
 
-// -A'：降级态人工批准 = 自愈触发器（Qwen Code recordFallbackApprove 同款语义）
+// 降级态人工批准 = 自愈触发器（Qwen Code recordFallbackApprove 同款语义）
 test("DenialTracker - recordFallbackApprove 清两类连击计数（0034-A' 自愈）", () => {
 	const tracker = new DenialTracker();
 	// 制造降级态：3 次不可用触顶 + 若干连拦

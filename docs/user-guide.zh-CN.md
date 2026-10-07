@@ -40,6 +40,11 @@ pi install git:github.com/CNCSMonster/pi-approval-mode
 
 选择 `2`–`4` 会在对应层级写入一条 `allow` 规则，同款操作以后在该范围内不再打扰你。
 
+**弹窗交互与展示保护**：
+- **详情折叠与快捷键**：长命令或大体积参数受垂直高度预算保护，$\ge 7$ 视觉行时默认折叠展示（头 3 尾 2 视觉行），单行超长内容自动首尾双显截断。随时按 **`v`** 或 **`Ctrl+O`** 即可在折叠态与完整展开态之间即时切换；
+- **批次进度指示**：当模型单轮连续派发多个工具调用时，弹窗标题自动标注 `(批次 X/Y)`，呈现当前处于批次第几个待审动作；
+- **矮终端降级保护**：在视口行数过小（$\le 28$ 行）的终端下自动启用紧凑版式，隐藏冗余修饰行与选项详细描述，确保 1-5 审批选项与底栏操作提示完整可见、绝不被视口截断。
+
 ### 1.4 切换模式
 
 - **`Ctrl+Alt+A`** — 循环切换 `manual ➔ auto-edit ➔ auto ➔ yolo ➔ plan`；
@@ -222,6 +227,39 @@ $$\text{Deny} > \text{Ask} > \text{Default} > \text{Allow}$$
   - **语法迁移说明**：旧语法位置参数 `/classifier-model <model>` 与 `/classifier-model default` 已移除，请分别迁移为 `--both <model>` 与 `clear`。
 - `defaultMode` 设定启动模式；项目级 `.pi/approval-config.json` 按顶层键整体覆盖全局
   （且仅在**受信任**项目生效——见 §5.4）。
+
+#### 4.2.1 配置拓扑形态与三方共存冲突治理
+
+双阶段分类器体系支持三种模型指定字段：
+1. `classifierModel`（公共底座 / 缺省共享通用 LLM 模型）；
+2. `classifierStage1Model`（Stage 1 极速快筛专属模型，支持通用 LLM 或专职分类器）；
+3. `classifierStage2Model`（Stage 2 深度复核专属模型，仅限通用 LLM）。
+
+系统支持以下三种合法拓扑形态：
+
+| 形态 | 字段组合 | 运行时解析与继承规则 |
+| :--- | :--- | :--- |
+| **形态一：纯共享底座** | 仅 `classifierModel` | Stage 1 与 Stage 2 均继承该通用 LLM 底座 |
+| **形态二：快筛专属 + 底座继承** | `classifierStage1Model` + `classifierModel` | Stage 1 运行专属模型；Stage 2 继承通用 LLM 底座 |
+| **形态三：双阶段专属** | `classifierStage1Model` + `classifierStage2Model` | Stage 1 与 Stage 2 各自独立运行专属模型，无共享底座 |
+
+**三方共存冲突治理（就地显式忽略 Loud Ignore）**：
+当配置文件中 `classifierModel`、`classifierStage1Model` 与 `classifierStage2Model` 三者同时存在时，判定为非法拓扑冲突。系统按以下铁律防御：
+- **就地显式告警**：启动与重载时控制台输出 `console.warn` 并通过界面通知明确告警：
+  `⚠️ [ApprovalMode] 检测到分类器模型配置冲突：classifierModel、classifierStage1Model 与 classifierStage2Model 同时存在。处理策略：按 Stage 1 与 Stage 2 专属模型执行，全局 classifierModel ("<val>") 已被就地忽略（未修改磁盘文件）。`
+- **磁盘纯洁性（Zero Disk Mutation）**：绝对不重写或篡改用户磁盘配置文件，完整保留用户的原始排版与注释。
+- **内存切断穿透备胎**：内存调度中公共底座置为无效旁路。Stage 1 与 Stage 2 严格按各自专属模型执行；若专属模型失效，直接回退到内置默认或主模型，**绝不穿透回退到被忽略的底座**，彻底消除容灾穿透崩溃。
+- **状态报告透明标注**：执行 `/classifier-model` 查看状态时，公共底座行明确标注：
+  `公共底座: 配置值 <model> [⚠️ 冲突已忽略：两阶段均已单独指定，此项未启用]`。
+
+#### 4.2.2 专职分类器能力契约铁律（Strict Capability Boundary）
+
+专职分类器（State Classifier，如 Jev 等原生分类器）采用特定决策协议，仅具备布尔分类能力，不提供通用 Chat/Completions 接口：
+1. **专属边界**：专职分类器仅允许配置在 `classifierStage1Model`；
+2. **底座与复核禁入**：公共底座 `classifierModel` 与复核专属 `classifierStage2Model` 必须且只能是通用 LLM（因为 Stage 2 必须输出人类可读的自然语言复核理由，系统严禁对专职分类器调用 `complete()`）；
+3. **全链路防呆**：
+   - 文件加载侧若检测到底座配置为专职分类器，立即发出告警并阻断 Stage 2 对其继承（Stage 2 回退到内置默认）；
+   - `/classifier-model` 命令行交互中，`--stage2` 与 `--both` 参数严格阻断专职分类器配置，Tab 自动补全仅在 `--stage1` 呈现专职分类器候选。
 
 ### 4.3 超时与优雅降级
 

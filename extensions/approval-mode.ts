@@ -31,8 +31,9 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolCallEventResult } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { Key, matchesKey, wrapTextWithAnsi, visibleWidth, type AutocompleteItem } from "@earendil-works/pi-tui";
+import { Key, matchesKey, visibleWidth, type AutocompleteItem } from "@earendil-works/pi-tui";
 
+import { classifyStage1, findClassifierModel } from "./stage1-classifier.ts";
 import { analyzeShellCommand } from "./shell-analyzer.ts";
 import {
 	fallbackHeuristicCheck,
@@ -75,6 +76,18 @@ import {
 	type ApprovalConfigFile,
 } from "./approval-config.ts";
 import { sanitizeUntrustedDetail, type SanitizedDetailResult } from "./detail-sanitizer.ts";
+import {
+	wrapDialogLine,
+	consolidateBlankLines,
+	truncateLongLogicLine,
+	formatFoldableDetail,
+	calculateHeightBudget,
+	resolveBatchProgress,
+	formatDialogTitleWithBatch,
+	type BatchProgress,
+	type HeightBudget,
+	type FoldedDetailResult,
+} from "./dialog-folding.ts";
 
 // 对外 API 再导出（历史习惯从 approval-mode 取这些符号）
 export {
@@ -89,6 +102,13 @@ export {
 	formatLoopReasonForAgent,
 	formatUserRejectionReasonForAgent,
 	formatUserAbortReasonForAgent,
+	wrapDialogLine,
+	consolidateBlankLines,
+	truncateLongLogicLine,
+	formatFoldableDetail,
+	calculateHeightBudget,
+	resolveBatchProgress,
+	formatDialogTitleWithBatch,
 };
 export type {
 	ApprovalMode,
@@ -97,6 +117,9 @@ export type {
 	Stage1FailureReason,
 	Stage1HealthStatus,
 	FallbackAction,
+	BatchProgress,
+	HeightBudget,
+	FoldedDetailResult,
 };
 
 // 模式说明文案
@@ -249,6 +272,7 @@ export function resolveClassifierModel(
 	sharedModel?: string,
 	notifyFallback = false,
 	stageName = "分类器",
+	allowClassifier = true,
 ): { model: any; label: string; fallbackReason?: string; configValue?: string; stageName: string } {
 	const candidates = [
 		{ pattern: stageSpecificModel, reason: `${stageName}独立配置` },
@@ -275,6 +299,12 @@ export function resolveClassifierModel(
 					break;
 				}
 			}
+		}
+		// chat 目录未命中时回退原生 classifier 目录
+		//（chat find()/getAll() 按设计过滤非 chat 模型，专职决策模型必须走 findOfType）。
+		// Stage 2 传 allowClassifier=false：绝不对 classifier 调 complete()（拍板 #5）。
+		if (!found && allowClassifier) {
+			found = findClassifierModel(ctx.modelRegistry, pattern);
 		}
 		if (found) {
 			return { model: found, label: `${found.provider}/${found.id}`, fallbackReason, configValue, stageName };
@@ -401,7 +431,7 @@ export function applyClassifierTimeoutConfig(
 }
 
 // ==========================================
-//  /classifier-model 参数解析、帮助与自动补全纯逻辑
+// /classifier-model 参数解析、帮助与自动补全纯逻辑
 // ==========================================
 
 export const CLASSIFIER_SET_FLAGS = ["--stage1", "--stage2", "--both"] as const;
@@ -430,6 +460,75 @@ export const CLASSIFIER_CLEAR_TARGET_DESCRIPTIONS: Record<ClassifierSetFlag, str
 	"--stage2": "清除 Stage 2 专属模型配置",
 	"--both": "清除共享与两阶段配置（≡ clear）",
 };
+
+// ==========================================
+// 配置冲突治理纯函数
+// ==========================================
+
+/**
+ * 判定配置中是否处于三方共存冲突拓扑。
+ * 当 classifierModel、classifierStage1Model 与 classifierStage2Model 三者同时存在时判定冲突。
+ */
+export function detectClassifierConflict(config: {
+	classifierModel?: string;
+	classifierStage1Model?: string;
+	classifierStage2Model?: string;
+}): boolean {
+	return Boolean(config.classifierModel && config.classifierStage1Model && config.classifierStage2Model);
+}
+
+/** 构建三方共存冲突就地忽略告警文案 */
+export function buildClassifierConflictWarning(baseModel: string): string {
+	return `⚠️ [ApprovalMode] 检测到分类器模型配置冲突：classifierModel、classifierStage1Model 与 classifierStage2Model 同时存在。处理策略：按 Stage 1 与 Stage 2 专属模型执行，全局 classifierModel ("${baseModel}") 已被就地忽略（未修改磁盘文件）。`;
+}
+
+/** 构建公共底座被错误配置为专职分类器的告警文案 */
+export function buildBaseClassifierWarning(baseModel: string): string {
+	return `⚠️ [ApprovalMode] 公共底座 classifierModel ("${baseModel}") 为专职分类器 (State Classifier)。公共底座必须为通用 LLM；该模型绝不能作为 Stage 2 的继承底座。`;
+}
+
+/** 构建 Stage 2 专属被错误配置为专职分类器的告警文案 */
+export function buildStage2ClassifierWarning(stage2Model: string): string {
+	return `⚠️ [ApprovalMode] Stage 2 专属模型 ("${stage2Model}") 为专职分类器 (State Classifier)。Stage 2 复核需通用 LLM 生成人类可读理由，该配置无效。`;
+}
+
+/**
+ * 校验模型是否为专职分类器（State Classifier，type === "classifier"）。
+ * 支持 provider/id 格式与裸 id 查找。
+ */
+export function isClassifierTypeModel(registry: ModelRegistryLike, pattern?: string): boolean {
+	if (!registry || !pattern) return false;
+
+	// 先走 classifier 目录精确查找
+	const clf = findClassifierModel(registry, pattern);
+	if (clf && clf.type === "classifier") return true;
+
+	// 再走 chat 目录查找（以防万一某些模型同时出现在两个目录）
+	if (pattern.includes("/")) {
+		const slashIdx = pattern.indexOf("/");
+		const provider = pattern.slice(0, slashIdx);
+		const id = pattern.slice(slashIdx + 1);
+		if (typeof registry.find === "function") {
+			try {
+				const m = registry.find(provider, id);
+				if (m && m.type === "classifier") return true;
+			} catch {
+				// ignore
+			}
+		}
+	} else if (typeof registry.getAll === "function") {
+		try {
+			for (const m of registry.getAll()) {
+				if (m && (m.id === pattern || `${m.provider}/${m.id}` === pattern) && m.type === "classifier") {
+					return true;
+				}
+			}
+		} catch {
+			// ignore
+		}
+	}
+	return false;
+}
 
 export const CLASSIFIER_HELP_TEXT = `/classifier-model — 查看或设置 Auto 模式分类器模型
 
@@ -600,30 +699,34 @@ export function parseClassifierModelArgs(args: string): ClassifierModelCommand {
 	return { kind: "set", pairs };
 }
 
-/**
- * 审批弹窗单行渲染：按视口宽度自适应换行，替代逐行截断省略。
- *
- * 首行前置 indent，续行前置 contIndent（保持与首行的缩进对齐）；换行交给
- * pi-tui 的 wrapTextWithAnsi —— 按词换行、跨行保留活动 ANSI 样式、无词边界的
- * 超长 shell 命令按字符断行，每行可见宽度 ≤ width（indent 占位计入）。
- *
- * @param str 待展示内容（可含 ANSI 样式与 \n）
- * @param width 当前视口宽度（渲染侧已做下限保护）
- * @param indent 首行缩进
- * @param contIndent 续行缩进（默认与 indent 相同；传前缀类 indent 时应给等宽空格）
- */
-export function wrapDialogLine(str: string, width: number, indent = "", contIndent = indent): string[] {
-	const reserve = Math.max(visibleWidth(indent), visibleWidth(contIndent));
-	const wrapWidth = Math.max(1, width - reserve);
-	return wrapTextWithAnsi(str, wrapWidth).map((line, i) => (i === 0 ? indent : contIndent) + line);
-}
-
 export default function approvalModeExtension(pi: ExtensionAPI): void {
 	let currentMode: ApprovalMode = "auto";
+	let currentToolCallId: string | undefined;
 	let toolsBeforePlanMode: string[] | undefined;
 	let customClassifierModel: string | undefined;
 	let customClassifierStage1Model: string | undefined;
 	let customClassifierStage2Model: string | undefined;
+
+	/**
+	 * 获取生效的公共底座模型。
+	 * 三方共存时就地忽略底座（切断穿透备胎），返回 undefined。
+	 * Stage 2 场景下若底座为专职分类器也返回 undefined（Strict Capability Boundary）。
+	 */
+	function getEffectiveSharedModel(stageName: "Stage 1" | "Stage 2", ctx?: ExtensionContext): string | undefined {
+		if (customClassifierModel && customClassifierStage1Model && customClassifierStage2Model) {
+			// 三方共存非法拓扑：就地忽略底座，切断穿透备胎
+			return undefined;
+		}
+		if (stageName === "Stage 2") {
+			const reg = ctx?.modelRegistry ?? latestCtx?.modelRegistry;
+			if (reg && isClassifierTypeModel(reg, customClassifierModel)) {
+				// 底座为专职分类器：Strict Capability Boundary，严禁作为 Stage 2 继承底座
+				return undefined;
+			}
+		}
+		return customClassifierModel;
+	}
+
 	let classifierTimeoutMs = 1500;
 	let classifierStage2TimeoutMs = 3000;
 	let latestCtx: ExtensionContext | undefined;
@@ -656,7 +759,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		type: "string",
 	});
 
-	// 更新 TUI 底部状态栏指示器
+	// 更新 TUI 底部状态栏指示器 (: 状态栏支持 Stage 1 degraded 常驻轻量感知)
 	function updateStatus(ctx: ExtensionContext): void {
 		if (!ctx?.ui?.setStatus) return;
 		const theme = ctx.ui.theme;
@@ -703,7 +806,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		currentMode = newMode;
 
 		loopDetector.reset();
-		// -D / 与 loopDetector 对称重置 denialTracker，跨模式不带旧债
+		//  /  Timing 4：与 loopDetector 对称重置 denialTracker，跨模式不带旧债
 		// （plan 连拒切 auto 开局即清零，含 totalBlock/totalUnavailable/指纹/自愈连击）。
 		denialTracker.resetAll();
 		stageHealthTracker.reset();
@@ -777,6 +880,30 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		customClassifierModel = fileConfig.classifierModel;
 		customClassifierStage1Model = fileConfig.classifierStage1Model;
 		customClassifierStage2Model = fileConfig.classifierStage2Model;
+
+		// 分类器配置冲突治理与能力契约对齐
+		if (detectClassifierConflict(fileConfig)) {
+			const conflictMsg = buildClassifierConflictWarning(fileConfig.classifierModel!);
+			console.warn(conflictMsg);
+			if (ctx.hasUI) {
+				ctx.ui.notify(conflictMsg, "warning");
+			}
+		}
+		if (fileConfig.classifierModel && isClassifierTypeModel(ctx.modelRegistry, fileConfig.classifierModel)) {
+			const baseClassifierMsg = buildBaseClassifierWarning(fileConfig.classifierModel);
+			console.warn(baseClassifierMsg);
+			if (ctx.hasUI) {
+				ctx.ui.notify(baseClassifierMsg, "warning");
+			}
+		}
+		if (fileConfig.classifierStage2Model && isClassifierTypeModel(ctx.modelRegistry, fileConfig.classifierStage2Model)) {
+			const s2ClassifierMsg = buildStage2ClassifierWarning(fileConfig.classifierStage2Model);
+			console.warn(s2ClassifierMsg);
+			if (ctx.hasUI) {
+				ctx.ui.notify(s2ClassifierMsg, "warning");
+			}
+		}
+
 		const timeoutConfig = applyClassifierTimeoutConfig(fileConfig, ctx);
 		classifierTimeoutMs = timeoutConfig.stage1;
 		classifierStage2TimeoutMs = timeoutConfig.stage2;
@@ -859,8 +986,8 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 
 		// 若本次为 /reload 触发，且处于交互 UI 界面下，输出状态就绪摘要与模型解析告警
 		if (isReload && ctx.hasUI) {
-			const r1 = resolveClassifierModel(ctx, customClassifierStage1Model, customClassifierModel, true, "Stage 1");
-			const r2 = resolveClassifierModel(ctx, customClassifierStage2Model, customClassifierModel, true, "Stage 2");
+			const r1 = resolveClassifierModel(ctx, customClassifierStage1Model, getEffectiveSharedModel("Stage 1", ctx), true, "Stage 1");
+			const r2 = resolveClassifierModel(ctx, customClassifierStage2Model, getEffectiveSharedModel("Stage 2", ctx), true, "Stage 2", false);
 			const modelLabel = (r1.label === r2.label) ? r1.label : `S1:${r1.label} | S2:${r2.label}`;
 			const sRules = permissionManager.getSessionRules();
 			const pRules = permissionManager.getProjectRules();
@@ -1025,8 +1152,15 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 	});
 
 	function buildClassifierStatusReport(ctx: ExtensionContext): string {
-		const r1 = resolveClassifierModel(ctx, customClassifierStage1Model, customClassifierModel, false, "Stage 1");
-		const r2 = resolveClassifierModel(ctx, customClassifierStage2Model, customClassifierModel, false, "Stage 2");
+		const isConflict = Boolean(customClassifierModel && customClassifierStage1Model && customClassifierStage2Model);
+		const s1Shared = getEffectiveSharedModel("Stage 1", ctx);
+		const s2Shared = getEffectiveSharedModel("Stage 2", ctx);
+		const r1 = resolveClassifierModel(ctx, customClassifierStage1Model, s1Shared, false, "Stage 1");
+		const r2 = resolveClassifierModel(ctx, customClassifierStage2Model, s2Shared, false, "Stage 2", false);
+
+		const baseMsg = isConflict
+			? `公共底座: 配置值 ${customClassifierModel} [⚠️ 冲突已忽略：两阶段均已单独指定，此项未启用]\n`
+			: "";
 
 		const s1Msg = `Stage 1: 配置值 ${r1.configValue || "未配置"} → 生效值 ${r1.label}` + (r1.fallbackReason ? ` (回退原因: ${r1.fallbackReason})` : "");
 		const s2Msg = `Stage 2: 配置值 ${r2.configValue || "未配置"} → 生效值 ${r2.label}` + (r2.fallbackReason ? ` (回退原因: ${r2.fallbackReason})` : "");
@@ -1034,10 +1168,18 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		const s1Health = stageHealthTracker.getStatus();
 		const s1HealthMsg = `Stage 1 运行健康: ${s1Health.status} (连续失败 ${s1Health.consecutiveFailures} 次，累计 ${s1Health.totalFailures} 次)`;
 
-		return `当前审批分类器模型状态:\n${s1Msg}\n${s2Msg}\n${s1HealthMsg}\n配置文件: ~/.pi/agent/approval-config.json\n\n${CLASSIFIER_USAGE}`;
+		return `当前审批分类器模型状态:\n${baseMsg}${s1Msg}\n${s2Msg}\n${s1HealthMsg}\n配置文件: ~/.pi/agent/approval-config.json\n\n${CLASSIFIER_USAGE}`;
 	}
 
-	function validateClassifierModelRef(ctx: ExtensionContext, modelRef: string): { ok: boolean; reason?: string } {
+	function validateClassifierModelRef(ctx: ExtensionContext, modelRef: string, flag: ClassifierSetFlag): { ok: boolean; reason?: string } {
+		// classifier（System One 决策）模型仅服务于 --stage1；Stage 2 需生成人类可读复核理由，恒为通用 LLM（拍板 #5）。
+		const classifierForStage2 = {
+			ok: false,
+			reason: "该模型是 classifier（System One 专职分类器）模型，仅支持 --stage1；Stage 2 复核需通用 LLM 生成人类可读理由",
+		};
+		const accept = (m: any): { ok: boolean; reason?: string } =>
+			m?.type === "classifier" && flag !== "--stage1" ? classifierForStage2 : { ok: true };
+
 		if (modelRef.includes("/")) {
 			const slashIdx = modelRef.indexOf("/");
 			const provider = modelRef.slice(0, slashIdx);
@@ -1046,6 +1188,9 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 			if (found && ctx.modelRegistry.hasConfiguredAuth(found)) {
 				return { ok: true };
 			}
+			// chat 目录未命中 → 原生 classifier 目录（findOfType/全量 ID 匹配）
+			const clf = findClassifierModel(ctx.modelRegistry, modelRef);
+			if (clf) return accept(clf);
 			return { ok: false, reason: "未找到该模型或未配置有效认证" };
 		}
 		for (const m of ctx.modelRegistry.getAll()) {
@@ -1053,6 +1198,8 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 				return { ok: true };
 			}
 		}
+		const clf = findClassifierModel(ctx.modelRegistry, modelRef);
+		if (clf) return accept(clf);
 		return { ok: false, reason: "未找到该模型或未配置有效认证" };
 	}
 
@@ -1136,12 +1283,12 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 				let currentEffectiveLabel: string | undefined;
 				if (latestCtx) {
 					if (flag === "--stage1") {
-						currentEffectiveLabel = resolveClassifierModel(latestCtx, customClassifierStage1Model, customClassifierModel, false, "Stage 1").label;
+						currentEffectiveLabel = resolveClassifierModel(latestCtx, customClassifierStage1Model, getEffectiveSharedModel("Stage 1", latestCtx), false, "Stage 1").label;
 					} else if (flag === "--stage2") {
-						currentEffectiveLabel = resolveClassifierModel(latestCtx, customClassifierStage2Model, customClassifierModel, false, "Stage 2").label;
+						currentEffectiveLabel = resolveClassifierModel(latestCtx, customClassifierStage2Model, getEffectiveSharedModel("Stage 2", latestCtx), false, "Stage 2", false).label;
 					} else {
-						const r1 = resolveClassifierModel(latestCtx, customClassifierStage1Model, customClassifierModel, false, "Stage 1").label;
-						const r2 = resolveClassifierModel(latestCtx, customClassifierStage2Model, customClassifierModel, false, "Stage 2").label;
+						const r1 = resolveClassifierModel(latestCtx, customClassifierStage1Model, getEffectiveSharedModel("Stage 1", latestCtx), false, "Stage 1").label;
+						const r2 = resolveClassifierModel(latestCtx, customClassifierStage2Model, getEffectiveSharedModel("Stage 2", latestCtx), false, "Stage 2", false).label;
 						if (r1 === r2) currentEffectiveLabel = r1;
 					}
 				}
@@ -1157,6 +1304,27 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 						label: ref,
 						...(desc ? { description: desc } : {}),
 					});
+				}
+
+				// 动态枚举原生 classifier 模型目录（仅 --stage1；替代  的硬编码单条补全）
+				if (flag === "--stage1") {
+					let classifiers: any[] = [];
+					try {
+						classifiers = latestCtx?.modelRegistry?.getModelsOfType?.("classifier") ?? [];
+					} catch {
+						classifiers = [];
+					}
+					for (const m of classifiers) {
+						const ref = `${m.provider}/${m.id}`;
+						if (!ref.startsWith(partial)) continue;
+						if (items.some((it) => it.label === ref)) continue;
+						const isCurrent = ref === currentEffectiveLabel;
+						const meta = buildModelDescription(m, false);
+						const parts = ["System One 专职分类器"];
+						if (meta) parts.push(meta);
+						const desc = isCurrent ? `✓ 当前生效 · ${parts.join(" · ")}` : parts.join(" · ");
+						items.push({ value: `${base} ${ref}`, label: ref, description: desc });
+					}
 				}
 				return items.length > 0 ? items : null;
 			}
@@ -1240,7 +1408,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 			if (parsed.kind === "set") {
 				// D1: 全有或全无校验
 				for (const pair of parsed.pairs) {
-					const check = validateClassifierModelRef(ctx, pair.model);
+					const check = validateClassifierModelRef(ctx, pair.model, pair.flag);
 					if (!check.ok) {
 						ctx.ui.notify(
 							`"${pair.flag}" 的模型值 "${pair.model}" 无效：${check.reason}（期望 <provider>/<model>）\n整条命令未保存（全有或全无）\n\n${CLASSIFIER_USAGE}`,
@@ -1329,8 +1497,8 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		toolName: string,
 		toolInput: Record<string, any>,
 	): Promise<{ shouldBlock: boolean; reason: string; stage: "fast" | "thinking" | "fallback"; outage?: boolean }> {
-		const resolvedStage1 = resolveClassifierModel(ctx, customClassifierStage1Model, customClassifierModel, false, "Stage 1");
-		const resolvedStage2 = resolveClassifierModel(ctx, customClassifierStage2Model, customClassifierModel, false, "Stage 2");
+		const resolvedStage1 = resolveClassifierModel(ctx, customClassifierStage1Model, getEffectiveSharedModel("Stage 1", ctx), false, "Stage 1");
+		const resolvedStage2 = resolveClassifierModel(ctx, customClassifierStage2Model, getEffectiveSharedModel("Stage 2", ctx), false, "Stage 2", false);
 
 		if (ctx.hasUI) {
 			for (const res of [resolvedStage1, resolvedStage2]) {
@@ -1357,59 +1525,83 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 			`## Pending tool call to classify\n\n` +
 			`Tool: ${toolName}\nArguments:\n${JSON.stringify(projectedInput, null, 2)}`;
 
-		// === Stage 1: 极速初筛 (带超时熔断保护与独立健康追踪， Module A) ===
-		if (s1Model && ctx.modelRegistry.hasConfiguredAuth(s1Model)) {
-			let stage1Response: any = null;
-			let s1Failure: Stage1FailureReason | null = null;
-			try {
-				const stage1Promise = ctx.modelRegistry.complete(
-					s1Model,
-					{
-						systemPrompt: CLASSIFIER_BASE_PROMPT + STAGE1_SUFFIX,
-						messages: [
-							{
-								role: "user",
-								content: [{ type: "text", text: promptContent }],
-								timestamp: Date.now(),
-							},
-						],
-					},
-					{ cacheRetention: "none" },
-				);
-				stage1Response = await withTimeout(stage1Promise, classifierTimeoutMs, null);
-				if (!stage1Response) {
-					s1Failure = "timeout";
-				}
-			} catch {
-				s1Failure = "exception";
-			}
+		// === Stage 1: 极速初筛 (带超时熔断保护与独立健康追踪， Module A /  原生 classify 派发) ===
+		const isS1Classifier = s1Model?.type === "classifier";
+		const hasS1Auth = Boolean(s1Model && ctx.modelRegistry.hasConfiguredAuth(s1Model));
 
-			if (stage1Response) {
-				const s1Err =
-					(stage1Response as any).stopReason === "error" || (stage1Response as any).errorMessage
-						? String((stage1Response as any).errorMessage || "unknown upstream error")
-						: null;
-				if (s1Err !== null) {
-					s1Failure = "upstream_error";
+		if (s1Model && hasS1Auth) {
+			let s1Failure: Stage1FailureReason | null = null;
+
+			if (isS1Classifier) {
+				// 原生 System One classifier：传输/认证/重试由 registry.classify() 承担（永不 reject），
+				// 超时经 AbortController + 竞速兑底收敛，失败统一归因进独立健康度追踪。
+				const outcome = await classifyStage1(ctx.modelRegistry, s1Model, promptContent, classifierTimeoutMs);
+				if (outcome.ok) {
+					const prevStatus = stageHealthTracker.getStatus().status;
+					stageHealthTracker.recordStage1Success();
+					if (prevStatus === "degraded") {
+						updateStatus(ctx);
+					}
+					if (outcome.shouldBlock === false) {
+						denialTracker.recordClassifierActive();
+						return { shouldBlock: false, reason: "", stage: "fast" };
+					}
+					// shouldBlock === true: Stage 1 标记可疑，流转 Stage 2 深度复核
 				} else {
-					const stage1Text = stage1Response.content
-						.filter((c: any): c is { type: "text"; text: string } => c.type === "text")
-						.map((c: any) => c.text)
-						.join("\n");
-					const stage1Json = parseClassifierJson(stage1Text);
-					if (stage1Json && typeof stage1Json.shouldBlock === "boolean") {
-						const prevStatus = stageHealthTracker.getStatus().status;
-						stageHealthTracker.recordStage1Success();
-						if (prevStatus === "degraded") {
-							updateStatus(ctx);
-						}
-						if (stage1Json.shouldBlock === false) {
-							denialTracker.recordClassifierActive();
-							return { shouldBlock: false, reason: "", stage: "fast" };
-						}
-						// shouldBlock === true: Stage 1 标记可疑，流转 Stage 2 深度复核
+					s1Failure = outcome.failure ?? "upstream_error";
+				}
+			} else {
+				let stage1Response: any = null;
+				try {
+					const stage1Promise = ctx.modelRegistry.complete(
+						s1Model,
+						{
+							systemPrompt: CLASSIFIER_BASE_PROMPT + STAGE1_SUFFIX,
+							messages: [
+								{
+									role: "user",
+									content: [{ type: "text", text: promptContent }],
+									timestamp: Date.now(),
+								},
+							],
+						},
+						{ cacheRetention: "none" },
+					);
+					stage1Response = await withTimeout(stage1Promise, classifierTimeoutMs, null);
+					if (!stage1Response) {
+						s1Failure = "timeout";
+					}
+				} catch {
+					s1Failure = "exception";
+				}
+
+				if (stage1Response) {
+					const s1Err =
+						(stage1Response as any).stopReason === "error" || (stage1Response as any).errorMessage
+							? String((stage1Response as any).errorMessage || "unknown upstream error")
+							: null;
+					if (s1Err !== null) {
+						s1Failure = "upstream_error";
 					} else {
-						s1Failure = "invalid_response";
+						const stage1Text = stage1Response.content
+							.filter((c: any): c is { type: "text"; text: string } => c.type === "text")
+							.map((c: any) => c.text)
+							.join("\n");
+						const stage1Json = parseClassifierJson(stage1Text);
+						if (stage1Json && typeof stage1Json.shouldBlock === "boolean") {
+							const prevStatus = stageHealthTracker.getStatus().status;
+							stageHealthTracker.recordStage1Success();
+							if (prevStatus === "degraded") {
+								updateStatus(ctx);
+							}
+							if (stage1Json.shouldBlock === false) {
+								denialTracker.recordClassifierActive();
+								return { shouldBlock: false, reason: "", stage: "fast" };
+							}
+							// shouldBlock === true: Stage 1 标记可疑，流转 Stage 2 深度复核
+						} else {
+							s1Failure = "invalid_response";
+						}
 					}
 				}
 			}
@@ -1491,7 +1683,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 			};
 		}
 
-		// 上游错误 ≠ 解析失败。stopReason=error（如 content_filter）是
+		// ：上游错误 ≠ 解析失败。stopReason=error（如 content_filter）是
 		// provider 对请求本身的拒绝，不是 JSON 解析问题——分型归因避免排障被误导。
 		const s2Err =
 			(stage2Response as any).stopReason === "error" || (stage2Response as any).errorMessage
@@ -1535,7 +1727,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 	}
 
 	/**
-	 * 弹出支持数字快捷键单键直选的审批面板 (Custom TUI Dialog)
+	 * 弹出支持数字快捷键单键直选、高度预算控制与详情折叠的审批面板 (Custom TUI Dialog)
 	 */
 	async function promptApprovalDialog(
 		ctx: ExtensionContext,
@@ -1543,10 +1735,16 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		details: Array<{ label: string; content: string }>,
 		isLoop = false,
 		denyByDefault = false,
+		toolCallId?: string,
 	): Promise<ApprovalAction> {
 		const options: ApprovalOption[] = isLoop ? [...APPROVAL_OPTIONS, LOOP_ABORT_OPTION] : APPROVAL_OPTIONS;
 
-		//  展示前安全转义不可信详情内容（防御终端注入、消除 Tab 宽度漂移、阻断 Bidi 视觉欺骗）
+		// 可靠解析当前批次进度（若可得）并注入标题
+		const effectiveToolCallId = toolCallId ?? currentToolCallId;
+		const batchProgress = resolveBatchProgress(ctx.sessionManager, effectiveToolCallId);
+		const effectiveTitle = formatDialogTitleWithBatch(title, batchProgress);
+
+		// 展示前安全转义不可信详情内容（防御终端注入、消除 Tab 宽度漂移、阻断 Bidi 视觉欺骗）
 		let totalControl = 0;
 		let totalTab = 0;
 		let totalBidi = 0;
@@ -1562,8 +1760,11 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 
 		if (ctx.mode === "tui") {
 			const result = await ctx.ui.custom<ApprovalAction | null>((tui, theme, _kb, done) => {
-				// 指纹短路弹窗默认拒绝态（光标停在 Block；Esc 本就=拒绝）
+				// ：指纹短路弹窗默认拒绝态（光标停在 Block；Esc 本就=拒绝）
 				let selectedIndex = denyByDefault ? Math.max(0, options.findIndex((o) => o.action === "block")) : 0;
+				// 详情折叠/展开状态
+				let isExpanded = false;
+				let hasFoldableDetails = false;
 
 				function refresh() {
 					tui.requestRender();
@@ -1576,6 +1777,35 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 							cycleApprovalMode(ctx, true);
 							refresh();
 							return;
+						}
+
+						// 折叠/展开快捷键 (v, V, Ctrl+O / \x0f)
+						if (
+							data === "v" ||
+							data === "V" ||
+							data === "\x0f" ||
+							matchesKey(data, Key.ctrl("o"))
+						) {
+							isExpanded = !isExpanded;
+							refresh();
+							return;
+						}
+
+						// 键盘翻页穿透 (特性探测：若无安全可靠扩展 API 则不假装滚动)
+						const scrollApi = (ctx.ui as any)?.scrollTranscript;
+						if (typeof scrollApi === "function") {
+							if (matchesKey(data, Key.pageUp) || data === "\x1b[5~" || data === "\x1b[1;2A") {
+								try {
+									scrollApi.call(ctx.ui, "page-up");
+								} catch {}
+								return;
+							}
+							if (matchesKey(data, Key.pageDown) || data === "\x1b[6~" || data === "\x1b[1;2B") {
+								try {
+									scrollApi.call(ctx.ui, "page-down");
+								} catch {}
+								return;
+							}
 						}
 
 						// 1. 单键直接按数字键 1 - 6 瞬间选择
@@ -1614,15 +1844,21 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 						const safeWidth = Math.max(10, width);
 						const lines: string[] = [];
 
-						// 视口宽度内自适应换行（不再按行截断省略），续行按缩进对齐
+						// 基于终端真实行数动态计算高度预算
+						const terminalRows = tui?.terminal?.rows ?? (process.stdout?.rows || 24);
+						const budget = calculateHeightBudget(terminalRows);
+
+						// ：视口宽度内自适应换行（不再按行截断省略），续行按缩进对齐
 						const addLine = (str: string, indent = "", contIndent = indent) => {
 							for (const l of wrapDialogLine(str, safeWidth, indent, contIndent)) lines.push(l);
 						};
 
 						// 顶部线条与标题
 						addLine(theme.fg("accent", "─".repeat(safeWidth)));
-						addLine(theme.fg("accent", theme.bold(title)), " ");
-						addLine(theme.fg("accent", `当前审批模式: ${currentMode}  (按 Ctrl+Alt+A 可切换)`), " ");
+						addLine(theme.fg("accent", theme.bold(effectiveTitle)), " ");
+						if (!budget.isDegraded) {
+							addLine(theme.fg("accent", `当前审批模式: ${currentMode}  (按 Ctrl+Alt+A 可切换)`), " ");
+						}
 						if (hasSanitized) {
 							addLine(
 								theme.fg(
@@ -1632,21 +1868,40 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 								" ",
 							);
 						}
-						addLine("");
+						if (!budget.isDegraded) {
+							addLine("");
+						}
 
-						// 详细信息展示区
+						// 详细信息展示区（带高度预算折叠、连续空行合并、超长单逻辑行保护）
+						hasFoldableDetails = false;
 						for (const item of sanitizedDetails) {
 							addLine(`${theme.fg("muted", item.label)}:`, "  ");
-							for (const cl of item.content.split("\n")) {
-								addLine(theme.fg("text", cl), "    ");
+							const formatted = formatFoldableDetail(
+								{
+									content: item.content,
+									width: safeWidth,
+									isExpanded,
+									indent: "    ",
+									contIndent: "    ",
+									maxExpandedLines: isExpanded ? 50 : budget.maxDetailsLines,
+								},
+								theme,
+							);
+							if (formatted.isFoldable) {
+								hasFoldableDetails = true;
+							}
+							for (const fl of formatted.lines) {
+								lines.push(fl);
 							}
 						}
 
-						addLine("");
-						addLine(theme.fg("muted", `请选择审批动作 (支持直接按数字键 1-${options.length} 快速选择):`), "  ");
+						if (!budget.isDegraded) {
+							addLine("");
+							addLine(theme.fg("muted", `请选择审批动作 (支持直接按数字键 1-${options.length} 快速选择):`), "  ");
+						}
 						addLine("");
 
-						// 渲染编号选项
+						// 渲染编号选项（矮终端降级模式下省略 description 节省纵向空间，确保核心选项与底栏不被裁切）
 						for (let i = 0; i < options.length; i++) {
 							const opt = options[i];
 							const isSelected = i === selectedIndex;
@@ -1657,13 +1912,34 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 							// 前缀（光标箭头 + 编号）作为首行缩进，续行用等宽空格对齐到 label 起始列
 							const firstPrefix = `${prefix}${numTag}`;
 							addLine(labelText, firstPrefix, " ".repeat(visibleWidth(firstPrefix)));
-							if (opt.description) {
+							if (opt.description && !budget.isDegraded) {
 								addLine(theme.fg("dim", opt.description), "     ");
 							}
 						}
 
-						addLine("");
-						addLine(theme.fg("muted", `[快捷提示] 按 1-${options.length} 直接选择 | ↑/↓ 移动 | Enter 确认 | Esc 拒绝 | Ctrl+Alt+A 切换模式`), "  ");
+						if (!budget.isDegraded) {
+							addLine("");
+						}
+						// 底栏快捷提示：自适应终端高度与能力探测
+						const foldHint = hasFoldableDetails ? " | [v / Ctrl+O] 展开/折叠" : "";
+						const scrollHint = typeof (ctx.ui as any)?.scrollTranscript === "function" ? " | [PgUp/PgDn] 翻阅历史" : "";
+						if (budget.isDegraded) {
+							addLine(
+								theme.fg(
+									"muted",
+									`[快捷提示] 1-${options.length} 选择${hasFoldableDetails ? " | v 展开/折叠" : ""} | ↑/↓ 移动 | Enter 确认 | Esc 拒绝`,
+								),
+								"  ",
+							);
+						} else {
+							addLine(
+								theme.fg(
+									"muted",
+									`[快捷提示] 按 1-${options.length} 直接选择${foldHint} | ↑/↓ 移动 | Enter 确认 | Esc 拒绝 | Ctrl+Alt+A 切换模式${scrollHint}`,
+								),
+								"  ",
+							);
+						}
 						addLine(theme.fg("accent", "─".repeat(safeWidth)));
 
 						return lines;
@@ -1677,7 +1953,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		// RPC 或无完整 TUI 终端模式时的优雅降级
 		if (ctx.hasUI) {
 			const items = options.map((opt, i) => `${i + 1}. ${opt.label} (${opt.description})`);
-			const promptBody = `${title}\n\n${sanitizedDetails.map((d) => `${d.label}:\n  ${d.content}`).join("\n")}`;
+			const promptBody = `${effectiveTitle}\n\n${sanitizedDetails.map((d) => `${d.label}:\n  ${d.content}`).join("\n")}`;
 			const selected = await ctx.ui.select(promptBody, items);
 			if (!selected) return "block";
 
@@ -1718,7 +1994,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		// 统计归属：分类器故障引发的**自动拦截**只计入“不可用”计数，
 		// 不灌入“拒绝”类统计（consecutiveBlock/totalBlock/loop 连续被拒）——两套计数各司其职。
 		// 仅无头自动拦截可用此豁免；用户在弹窗中的拒绝一律入账。
-		// 口径：拒绝类 = 一切明确说 no 的拦截（用户拒绝 / deny 规则 /
+		// 口径（，宽口径保持）：拒绝类 = 一切明确说 no 的拦截（用户拒绝 / deny 规则 /
 		// plan 拦截 / 熔断自拦）；“不可用”豁免仅限分类器 outage 的自动拦截（基线 M11 口径句）。
 		if (countAsDenial) {
 			loopDetector.recordDenial(toolName, input);
@@ -1745,9 +2021,9 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		label: string,
 		toolName: string,
 		input: Record<string, any>,
-		fromCircuitFallback = false, // 本次弹窗是否因熔断跳过分类器而产生（Qwen wasAutoModeFallback 同款判据）
+		fromCircuitFallback = false, // ：本次弹窗是否因熔断跳过分类器而产生（Qwen wasAutoModeFallback 同款判据）
 	): Promise<ToolCallEventResult | undefined> {
-		// -A'（Qwen Code v2 同款）：仅「触顶后跳过分类器的 fallback 弹窗」上的
+		// （Qwen Code v2 同款）：仅「触顶后跳过分类器的 fallback 弹窗」上的
 		// 人工批准是自愈触发器——清连击计数，下次判定重新交分类器；
 		// 分类器真实跑过但失败的故障弹窗批准不清（0027-A/D1 语义保持）；
 		// 拒绝路径不清（拒绝视为分类器判对）。
@@ -1820,6 +2096,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 	// 6. 核心门禁控制：拦截 tool_call
 	pi.on("tool_call", async (event, ctx) => {
 		const { toolName } = event;
+		currentToolCallId = (event as any).toolCallId;
 		const input = (event.input ?? {}) as Record<string, any>;
 
 		if (!permissionManager) {
@@ -1832,7 +2109,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		// ==============================================================
 		const loopCheck = loopDetector.checkBeforeExecution(toolName, input);
 		if (loopCheck.isLoop) {
-			// 无头语境下模型既没有弹窗可点、也没有“策略”可转——会话已被
+			// ：无头语境下模型既没有弹窗可点、也没有“策略”可转——会话已被
 			// loop 熔断先手拦截后续一切调用（且拦截自灌 recordDenial，除非人工介入不会归零）。
 			// 因此无头 reason 一律改用熔断口径：明示会话已停 + 需人工介入，
 			// 不再复用 warningMessage 里“转换策略 / 选择拒绝并指示停止”这类只对交互侧成立的行动指引。
@@ -1854,7 +2131,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 				);
 			}
 
-			//  处于 yolo 模式下一律即刻阻断，不穿透放行！
+			// 处于 yolo 模式下一律即刻阻断，不穿透放行！
 			// terminate 恒为 false，将结构化 Agent 报错注入上下文赋予 Model 自主决策与纠错空间。
 			if (currentMode === "yolo") {
 				if (ctx.hasUI) {
@@ -2012,7 +2289,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 					return blockCall(toolName, input, fallback.reasonText || "Blocked", terminate, fallback.kind !== "consecutive_unavailable");
 				}
 
-				// 交互侧按优先级消费 fallback——
+				// ：交互侧按优先级消费 fallback——
 				// ① total_denial 达顶 → 直接拒绝（不跑分类器）+ 解除指引；② 不可用触顶 → 既有启发式降级保持；
 				// ③ classifier_blocked_retry 指纹命中 → 跳过分类器直接人审弹窗（基线 M10：不重复研判/不重复弹窗，默认拒绝态）；
 				// ④ 其余 → 跑分类器（现状）。consecutive_block 交互侧不消费（0027 非目标，由 ① 的上限与弹窗承接）。
@@ -2042,7 +2319,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 					return handleOutcome(retryAction, dslRule, ctx, label, toolName, input);
 				}
 
-				// 在触顶判断时点捕获（弹窗时现算会被失败计数翻转污染）
+				// ：在触顶判断时点捕获（弹窗时现算会被失败计数翻转污染）
 				const circuitFallbackRead = unavailableCircuitTripped();
 				let decision: { shouldBlock: boolean; reason: string; stage: "fast" | "thinking" | "fallback"; outage?: boolean };
 				if (circuitFallbackRead) {
@@ -2065,7 +2342,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 				if (loopCheck.isLoop && loopCheck.warningMessage) {
 					classifierDialog.push({ label: "🚨 死循环预警", content: loopCheck.warningMessage });
 				}
-				// 降级态的弹窗不是分类器结论——明示降级状态与自愈方式，
+				// ：降级态的弹窗不是分类器结论——明示降级状态与自愈方式，
 				// 避免把启发式规则的判断误认为分类器研判（含上游 filter 场景）。
 				if (decision.stage === "fallback") {
 					classifierDialog.push({
@@ -2161,7 +2438,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 						return blockCall(toolName, input, fallback.reasonText || "Blocked", terminate, fallback.kind !== "consecutive_unavailable");
 					}
 
-					// 交互侧按优先级消费 fallback——
+					// ：交互侧按优先级消费 fallback——
 					// ① total_denial 达顶 → 直接拒绝（不跑分类器）+ 解除指引；
 					// ②不可用触顶 → 跳过分类器直呈人工核准（保护等级不降，只甩掉挂掉的 LLM 等待，默认拒绝态）；
 					// ③ classifier_blocked_retry 指纹命中 → 跳过分类器直接人审弹窗（基线 M10：不重复研判/不重复弹窗，默认拒绝态）；
@@ -2175,7 +2452,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 					}
 
 					// ② 不可用熔断触顶（直读计数，不看 kind——b/u 同涨时 kind 不可靠）→
-					//    跳过分类器直呈人工核准
+					//    跳过分类器直呈人工核准（ 方案A：保护等级不降，只甩掉挂掉的 LLM 等待）
 					if (ctx.hasUI && unavailableCircuitTripped()) {
 						denialTracker.consumePendingFingerprint();
 						const degradedDialog: Array<{ label: string; content: string }> = [];
@@ -2234,7 +2511,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 						dialogDetails.push({ label: "🚨 死循环预警", content: loopCheck.warningMessage });
 					}
 					dialogDetails.push({ label: "目标文件", content: relPath });
-					// 降级态标注（与 read/bash 分支同款——非分类器结论）
+					// ：降级态标注（与 read/bash 分支同款——非分类器结论）
 					if (decision.stage === "fallback") {
 						dialogDetails.push({
 							label: "⚠️ 分类器无判决（降级为规则研判）",
@@ -2262,7 +2539,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 				const cmd = (input.command || "").trim();
 				const dslRule = `Bash(${cmd})`;
 
-				//  Layer 2 只读免审快路径下线——auto 下非规则命中的 bash 一律进分类器（交互与无头同口径）。
+				// Layer 2 只读免审快路径下线——auto 下非规则命中的 bash 一律进分类器（交互与无头同口径）。
 				// 分析调用保留，仅供弹窗"静态结构特征"展示行消费（展示≠裁决）。
 				const shellAnalysis = analyzeShellCommand(cmd);
 
@@ -2274,7 +2551,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 					return blockCall(toolName, input, fallback.reasonText || "Blocked", terminate, fallback.kind !== "consecutive_unavailable");
 				}
 
-				// 交互侧按优先级消费 fallback——
+				// ：交互侧按优先级消费 fallback——
 				// ① total_denial 达顶 → 直接拒绝（不跑分类器）+ 解除指引；② 不可用触顶 → 既有启发式降级保持；
 				// ③ classifier_blocked_retry 指纹命中 → 跳过分类器直接人审弹窗（基线 M10：不重复研判/不重复弹窗，默认拒绝态）；
 				// ④ 其余 → 跑分类器（现状）。consecutive_block 交互侧不消费（0027 非目标，由 ① 的上限与弹窗承接）。
@@ -2305,7 +2582,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 				}
 
 				let decision: { shouldBlock: boolean; reason: string; stage: "fast" | "thinking" | "fallback"; outage?: boolean };
-				// 触顶判断时点捕获（同 read 分支）
+				// ：触顶判断时点捕获（同 read 分支）
 				const circuitFallbackBash = unavailableCircuitTripped();
 				if (circuitFallbackBash) {
 					decision = fallbackHeuristicCheck(toolName, input, ctx.cwd);
@@ -2334,7 +2611,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 					dialogDetails.push({ label: "🚨 死循环预警", content: loopCheck.warningMessage });
 				}
 				dialogDetails.push({ label: "准备执行命令", content: cmd });
-				// 降级态标注（与 read 分支同款——非分类器结论）
+				// ：降级态标注（与 read 分支同款——非分类器结论）
 				if (decision.stage === "fallback") {
 					dialogDetails.push({
 						label: "⚠️ 分类器无判决（降级为规则研判）",

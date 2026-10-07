@@ -18,6 +18,7 @@ import {
 	formatUserRejectionReasonForAgent,
 	formatUserAbortReasonForAgent,
 } from "../extensions/denial-tracker.ts";
+import { MICRO_TEST_LIMITS } from "./test-harness.ts";
 
 // 沙箱目录隔离，防止污染真实环境
 const sandboxHome = mkdtempSync(join(tmpdir(), "pi-issue-0041-home-"));
@@ -395,6 +396,7 @@ test("Module D - e2e: 阻断与用户拒绝触发双通道解耦（User 通道�
 // Module E: Total Denial Cap & Four Reset Timings
 // =========================================================================
 
+// [Baseline Anchor Test] 仅此类测试允许断言生产环境缺省默认常量，防范非预期漂移
 test("Module E - 默认上限为 50，且支持四类重置时机与连续成功额度自愈", async () => {
 	const tracker = new DenialTracker();
 	assert.strictEqual(tracker.getLimits().maxTotalDenials, 50, "默认上限必须为 50");
@@ -458,7 +460,7 @@ test("Module E - 默认上限为 50，且支持四类重置时机与连续成功
 });
 
 test("Module E - 交互模式触顶绝不杀进程（terminate: false），无头模式仅在配置启用时杀进程", async () => {
-	// 1. 交互模式：达到上限 50 次后，持续拒绝但 terminate 绝不为 true
+	// 1. 交互模式：显式注入 MICRO_TEST_LIMITS (maxTotalDenials: 4)，达到上限后持续拒绝但 terminate 绝不为 true
 	const hInteractive = await setupHarness({
 		hasUI: true,
 		mode: "auto",
@@ -466,14 +468,17 @@ test("Module E - 交互模式触顶绝不杀进程（terminate: false），无�
 			content: [{ type: "text", text: '{"shouldBlock": true, "reason": "danger"}' }],
 		}),
 		selectReply: (n) => (n % 2 === 1 ? null : "1"),
+		config: {
+			denialLimits: MICRO_TEST_LIMITS,
+		},
 	});
 
-	// 累积达顶 50 次拒绝 (99 次交互，50 拒 49 放)
-	for (let i = 1; i <= 99; i++) {
+	// 累积达顶 4 次拒绝 (7 次交互，4 拒 3 放)
+	for (let i = 1; i <= 7; i++) {
 		await hInteractive.handlers["tool_call"]({ toolName: "bash", input: { command: `echo ${i}` } }, hInteractive.ctx);
 	}
 
-	// 第 100 次调用触顶：必须返回 terminate 为 falsy
+	// 第 8 次调用触顶：必须返回 terminate 为 falsy
 	const rCapped = await hInteractive.handlers["tool_call"]({ toolName: "bash", input: { command: "echo capped" } }, hInteractive.ctx);
 	assert.strictEqual(rCapped?.block, true);
 	assert.notStrictEqual(rCapped?.terminate, true, "交互模式达顶绝不退出进程");

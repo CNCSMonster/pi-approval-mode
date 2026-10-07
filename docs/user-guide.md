@@ -42,6 +42,11 @@ Every dialog offers five actions — **press the number key `1`–`5` for instan
 
 Options `2`–`4` write an `allow` rule at the corresponding tier, so the same action never bothers you again at that scope.
 
+**Dialog interaction & display protections**:
+- **Details folding & toggle hotkeys**: Long commands or bulky tool inputs are bounded by a dynamic vertical height budget. Calls spanning $\ge 7$ visual lines fold by default (showing head 3 and tail 2 visual lines), with single extra-long lines protected via head-and-tail character truncation. Press **`v`** or Pi-native **`Ctrl+O`** at any time to toggle between folded and expanded views;
+- **Batch progress awareness**: When an assistant turn dispatches multiple tool calls in a batch, the dialog title automatically highlights `(Batch X/Y)` to indicate the current call's position in the sequence;
+- **Short terminal degradation**: In small viewports ($\le 28$ rows), the dialog automatically switches to a compact layout, hiding decorative lines and option descriptions to guarantee that choices 1–5 and keybinding hints are fully visible and never clipped.
+
 ### 1.4 Switching modes
 
 - **`Ctrl+Alt+A`** — cycle `manual ➔ auto-edit ➔ auto ➔ yolo ➔ plan`;
@@ -233,6 +238,39 @@ In **`auto`** mode, every rule-unmatched shell call (the read-only fast path is 
   - **Migration notes**: Positional syntax `/classifier-model <model>` and `/classifier-model default` has been removed. Please migrate to `--both <model>` and `clear` respectively.
 - `defaultMode` sets the startup mode; project-level `.pi/approval-config.json` overrides
   global settings per top-level key (and is only honored in **trusted** projects — see §5.4).
+
+#### 4.2.1 Configuration Topologies and Conflict Governance
+
+The two-stage classifier architecture supports three model specification fields:
+1. `classifierModel` (shared base / default general-purpose LLM);
+2. `classifierStage1Model` (dedicated Stage 1 screening model, supports general LLMs or state classifiers);
+3. `classifierStage2Model` (dedicated Stage 2 deep review model, general-purpose LLM only).
+
+The system recognizes three valid topology patterns:
+
+| Topology | Field Combination | Runtime Resolution & Inheritance |
+| :--- | :--- | :--- |
+| **Pattern 1: Pure Shared Base** | `classifierModel` only | Both Stage 1 and Stage 2 inherit the shared LLM base |
+| **Pattern 2: Stage 1 Override + Base** | `classifierStage1Model` + `classifierModel` | Stage 1 runs its dedicated model; Stage 2 inherits the base |
+| **Pattern 3: Independent Per-stage** | `classifierStage1Model` + `classifierStage2Model` | Stage 1 and Stage 2 run dedicated models independently |
+
+**Three-Way Coexistence Conflict Governance (Loud Ignore)**:
+When `classifierModel`, `classifierStage1Model`, and `classifierStage2Model` are simultaneously specified in configuration, the system flags an invalid topology conflict and enforces:
+- **Loud Explicit Warning**: Emits `console.warn` and a UI notification at startup/reload:
+  `⚠️ [ApprovalMode] 检测到分类器模型配置冲突：classifierModel、classifierStage1Model 与 classifierStage2Model 同时存在。处理策略：按 Stage 1 与 Stage 2 专属模型执行，全局 classifierModel ("<val>") 已被就地忽略（未修改磁盘文件）。`
+- **Zero Disk Mutation**: Never mutates or overwrites the user's config file on disk; original format and comments are strictly preserved.
+- **Bypass Cutoff in Memory**: The base model is deactivated in memory. Stage 1 and Stage 2 strictly execute their dedicated models; if a dedicated model fails, it falls back directly to built-in defaults or the main model, **never penetrating to the ignored base model**.
+- **Transparent Status Reporting**: `/classifier-model` explicitly flags the ignored base model:
+  `公共底座: 配置值 <model> [⚠️ 冲突已忽略：两阶段均已单独指定，此项未启用]`.
+
+#### 4.2.2 Strict Capability Boundary for State Classifiers
+
+Dedicated state classifiers (e.g., Jev) implement decision protocols without chat completion capabilities:
+1. **Screening Boundary**: State classifiers are strictly permitted only for `classifierStage1Model`.
+2. **Review & Base Prohibited**: Public base `classifierModel` and `classifierStage2Model` must always be general-purpose LLMs (Stage 2 requires human-readable reasoning; `complete()` must never be invoked on a classifier).
+3. **End-to-End Enforcement**:
+   - File configuration loading detects classifiers in base config, emits warnings, and blocks Stage 2 inheritance.
+   - CLI command `/classifier-model` rejects state classifiers for `--stage2` and `--both`, and autocompletion prunes them for non-Stage 1 options.
 
 ### 4.3 Timeout & graceful degradation
 
