@@ -11,7 +11,7 @@ import { LoopDetector, type LoopCheckResult } from "./loop-detector.ts";
 export interface DenialLimits {
 	maxConsecutiveBlock: number; // 连续拦截阈值 (默认 3)
 	maxConsecutiveUnavailable: number; // 连续分类器不可用阈值 (默认 3，对齐设计基线 M11)
-	maxTotalDenials: number; // 会话累计拦截上限 (默认 50)
+	maxTotalDenials: number; // 会话累计拦截上限 (默认 50， 提升)
 }
 
 export type FallbackKind =
@@ -144,8 +144,8 @@ export class DenialTracker {
 			return {
 				shouldFallback: true,
 				kind: "total_denial",
-				// 不向模型承诺 "unrelated safe work may continue"——无头语境下该承诺
-				// 被 loop 先手的会话级熔断否决；交互语境达顶同样直接拒绝。
+				// B：不向模型承诺 "unrelated safe work may continue"——无头语境下该承诺
+				// 被 loop 先手的会话级熔断否决；交互语境达顶同样直接拒绝（0027-C-1）。
 				// 文案只说实话并告知人如何解除（allow 规则 / 重启会话）。
 				reasonText: `Auto mode reached its session denial cap (${this.limits.maxTotalDenials}). Further flagged actions will be denied without classification. This cannot be cleared from the model side: a human must add an explicit allow rule (or restart the session) to resume flagged work.`,
 			};
@@ -159,7 +159,7 @@ export class DenialTracker {
 		// recordDenial + recordBlock 锁步灌入）、同阈值（默认 3），故第 4 次连拒
 		// 必然先命中 loop 的 consecutive_denials 熔断，本 kind 只在交互侧（loop
 		// 不拦截、弹窗继续）或阈值被配置分叉时才可达。
-		// 交互侧暂不消费本 kind，其计数由 total_denial 上限与弹窗承接。
+		// 交互侧暂不消费本 kind（ 非目标，其计数由 total_denial 上限与弹窗承接）。
 		if (this.consecutiveBlock >= this.limits.maxConsecutiveBlock) {
 			return {
 				shouldFallback: true,
@@ -211,10 +211,11 @@ export class DenialTracker {
 	}
 
 	/**
+	 * A' /  Timing 2:
 	 * 降级/熔断期间用户在人工弹窗上批准任意一次 → 清两类连击计数与动作指纹短路缓存 →
 	 * 下次判定重新交分类器；若分类器仍故障则再次失败重新计数（同一恢复曲线，
 	 * 无永久锁死）。拒绝路径不调用本方法（拒绝视为分类器判对，计数保持）。
-	 * 快路径/规则放行仍不调用（防洗白语义不变）。
+	 * 快路径/规则放行仍不调用（0027-A 防洗白语义不变）。
 	 */
 	public recordFallbackApprove(): void {
 		this.consecutiveBlock = 0;
@@ -225,6 +226,7 @@ export class DenialTracker {
 	/**
 	 * 记录一次成功放行 (重置拒绝侧连续计数与动作指纹)
 	 *
+	 *  Timing 3 (Self-healing streak):
 	 * 连续 3 次合规放行无违规后，扣减 totalBlock 3 次 (Math.max(0, totalBlock - 3))，
 	 * 奖励模型自愈推进，消除长会话前半程试错摩擦的累积惩罚。
 	 */
@@ -239,7 +241,7 @@ export class DenialTracker {
 	}
 
 	/**
-	 * 重置新一轮任务的摩擦预算 (Turn Start)
+	 *  Timing 1: 重置新一轮任务的摩擦预算 (Turn Start)
 	 */
 	public resetTurnDenials(): void {
 		this.consecutiveBlock = 0;
@@ -249,7 +251,7 @@ export class DenialTracker {
 	/**
 	 * 记录分类器成功作出一次裁决 (不论 allow 还是 block，只要分类器成功响应即消除不可用计数)
 	 *
-	 * 这是 recordAllow 之外唯一可重置 consecutiveUnavailable 的入口。
+	 * A：这是 recordAllow 之外唯一可重置 consecutiveUnavailable 的入口。
 	 */
 	public recordClassifierActive(): void {
 		this.consecutiveUnavailable = 0;
@@ -263,7 +265,7 @@ export class DenialTracker {
 	}
 
 	/**
-	 * 会话重置 (清除全部计数)
+	 * 会话重置 (清除全部计数， Timing 4)
 	 */
 	public resetAll(): void {
 		this.consecutiveBlock = 0;
@@ -276,7 +278,7 @@ export class DenialTracker {
 }
 
 // ==============================================================
-// 2. 统一英文引导文案表
+// 2. 统一英文引导文案表 (Specification 规范)
 // ==============================================================
 
 export const DENIAL_MESSAGES = {
@@ -357,7 +359,7 @@ export const DENIAL_MESSAGES = {
 };
 
 // ==============================================================
-// 3. 双通道 Agent 结构化报错文案生成器
+// 3. 双通道 Agent 结构化报错文案生成器 (Specification / Module D)
 // ==============================================================
 
 export function formatDenyReasonForAgent(rule: string): string {

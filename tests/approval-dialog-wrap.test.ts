@@ -11,13 +11,13 @@ function fingerprint(s: string): string {
 	return stripTerminalSequences(s).replace(/\s+/g, "");
 }
 
-test("弹窗渲染源码不再使用 truncateToWidth 截断", () => {
+test(" 弹窗渲染源码不再使用 truncateToWidth 截断", () => {
 	const src = readFileSync(new URL("../extensions/approval-mode.ts", import.meta.url), "utf8");
 	assert.ok(!src.includes("truncateToWidth"), "审批弹窗渲染路径不得再调用 truncateToWidth");
 	assert.ok(src.includes("wrapDialogLine(str, safeWidth"), "render() 应改用 wrapDialogLine 自适应换行");
 });
 
-test("超宽命令行按视口换行完整展示（不截断、不丢内容）", () => {
+test(" 超宽命令行按视口换行完整展示（不截断、不丢内容）", () => {
 	const cmd =
 		"git -C /home/user/projects/some-very-long-repository-name push origin main --force-with-lease && echo pushed && ls -la /tmp";
 	const width = 60;
@@ -39,7 +39,7 @@ test("超宽命令行按视口换行完整展示（不截断、不丢内容）",
 	}
 });
 
-test("无词边界的超长命令按字符断行（逐字符零丢失）", () => {
+test(" 无词边界的超长命令按字符断行（逐字符零丢失）", () => {
 	// 命令尾部是一整段无空格 token，正是 shell 长路径 / 长参数的典型形态
 	const cmd = "dd if=/dev/zero of=/dev/sda bs=1M count=1024 conv=fsync,notrunc " + "x".repeat(120);
 	const width = 40;
@@ -52,7 +52,7 @@ test("无词边界的超长命令按字符断行（逐字符零丢失）", () =>
 	assert.equal(fingerprint(lines.join("")), fingerprint(cmd));
 });
 
-test("ANSI 样式跨行保持（换行处不丢色）", () => {
+test(" ANSI 样式跨行保持（换行处不丢色）", () => {
 	const styled =
 		"\x1b[38;5;123m" +
 		"alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho" +
@@ -66,18 +66,18 @@ test("ANSI 样式跨行保持（换行处不丢色）", () => {
 	assert.equal(fingerprint(lines.join("")), fingerprint(styled));
 });
 
-test("边框行与空行原样输出（宽度恰好等于视口不折行）", () => {
+test(" 边框行与空行原样输出（宽度恰好等于视口不折行）", () => {
 	const border = "─".repeat(60);
 	assert.deepEqual(wrapDialogLine(border, 60, ""), [border]);
 	assert.deepEqual(wrapDialogLine("", 60, "  "), ["  "]);
 });
 
-test("内容自带换行符时逐行各自换行并加缩进", () => {
+test(" 内容自带换行符时逐行各自换行并加缩进", () => {
 	const lines = wrapDialogLine("first line here\nsecond line", 40, "  ");
 	assert.deepEqual(lines, ["  first line here", "  second line"]);
 });
 
-test("中文内容按显示宽度（CJK 双宽）换行", () => {
+test(" 中文内容按显示宽度（CJK 双宽）换行", () => {
 	const text = "准备执行命令：删除工作区内所有未跟踪文件并强制还原已跟踪文件的修改内容";
 	const width = 30;
 	const lines = wrapDialogLine(text, width, "    ");
@@ -155,7 +155,7 @@ async function setupTuiManualDialog(): Promise<{
 	return { handlers, commands, ctx, getRendered: () => rendered };
 }
 
-test("端到端：manual 弹窗在 80 列视口完整展示超长命令", async () => {
+test(" 端到端：manual 弹窗在 80 列视口完整展示超长命令", async () => {
 	const h = await setupTuiManualDialog();
 	const longCmd =
 		"sudo docker run --rm -v /home/user/projects/long-project-name:/app -e NODE_ENV=production --name some-long-container-name node:22-slim sh -c 'npm ci && npm run build && echo finished'";
@@ -177,7 +177,7 @@ test("端到端：manual 弹窗在 80 列视口完整展示超长命令", async 
 	);
 });
 
-test("端到端：窄视口 40 列同样完整展示且不溢出", async () => {
+test(" 端到端：窄视口 40 列同样完整展示且不溢出", async () => {
 	const h = await setupTuiManualDialog();
 	const longCmd = "find /var/log -type f -name '*.log' -mtime +30 -exec rm -f {} \\; && echo cleanup-done && exit 0";
 	await h.handlers["tool_call"]({ toolName: "bash", input: { command: longCmd } }, h.ctx);

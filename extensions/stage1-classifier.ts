@@ -3,11 +3,11 @@
  *
  * Stage 1 专职分类器（System One / Decision Model，如 typesafe/jev-1.13）原生接入辅助。
  *
- * 设计边界：
+ * 设计边界（拍板见 docs/issues/）：
  * - 模型身份、认证、传输、重试、计价全部由 pi 原生 ModelRegistry 承担
  *   （findOfType / getModelsOfType / hasConfiguredAuth / classify → POST {baseUrl}/systemone）；
  * - 本模块只保留纯逻辑：ClassifierContext 构建、ClassifierResult 判读、超时竞速包裹、目录查找；
- * - 不含任何硬编码端点、密钥解析或模型 ID 判定。
+ * - 不含任何硬编码端点、密钥解析或模型 ID 判定——那属于  自研传输层，已随本 issue 移除。
  */
 
 import type { Stage1FailureReason } from "./classifier-projection.ts";
@@ -15,7 +15,7 @@ import type { Stage1FailureReason } from "./classifier-projection.ts";
 /** Stage 1 在 ClassifierContext.questions 中使用的问题键 */
 export const STAGE1_QUESTION_KEY = "shouldBlock";
 
-/** noul / bool 判定阈值：probability >= 阈值 → 应拦截 */
+/** noul / bool 判定阈值：probability >= 阈值 → 应拦截（与  口径一致） */
 export const DEFAULT_SHOULD_BLOCK_THRESHOLD = 0.5;
 
 const STAGE1_INSTRUCTIONS =
@@ -58,7 +58,7 @@ export function buildStage1ClassifierContext(stateText: string): {
 }
 
 /**
- * 评测用 state 文本构造（始终拼完整会话段，空会话回退占位文案）。
+ * 评测用 state 文本构造（与  实测口径一致：始终拼完整会话段，空会话回退占位文案）。
  * 生产侧直接复用两阶段共享的 promptContent，故此函数仅被评测仓使用。
  */
 export function buildStage1StateText(

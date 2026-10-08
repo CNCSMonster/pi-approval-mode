@@ -72,7 +72,7 @@ async function setup(opts: { hasUI: boolean }): Promise<Harness> {
 
 const cmd = (n: number) => `sudo rm -rf /tmp/issue-0026-${n}`;
 
-// 主断言：故障弹窗里用户亲手点的拒绝必须进拒绝侧（三处统计 + 指纹）。
+//  主断言：故障弹窗里用户亲手点的拒绝必须进拒绝侧（三处统计 + 指纹）。
 // 选用的可观察信号 = loopDetector.recordDenial 与 denialTracker.recordBlock 的下游效应，
 // 二者都是"拒绝侧专属"电路（不可用侧不会触发），因此 pre-fix 实现必然失败、post-fix 必然成立：
 //   ① 指纹短路：交互拒绝后原样重试 → classifier_blocked_retry 文案（无指纹则拿不到）；
@@ -127,7 +127,7 @@ test("交互 outage 弹窗中的用户拒绝计入拒绝侧（指纹 + loop 连�
 
 // 0024 非回归：故障的**自动**（无头）拦截只计不可用，绝不进拒绝侧。
 // 若拒绝侧被污染，第 4 次无头拦截会变成 loop 熔断或 consecutive_block 文案，而不是不可用熔断。
-test("回归保护: 无头 outage 自动拦截不入拒绝侧（只走不可用电路）", async () => {
+test(" 回归保护: 无头 outage 自动拦截不入拒绝侧（只走不可用电路）", async () => {
 	const h = await setup({ hasUI: false });
 
 	const reasons: string[] = [];
@@ -153,7 +153,7 @@ test("回归保护: 无头 outage 自动拦截不入拒绝侧（只走不可用�
 });
 
 // 拒绝侧与不可用侧的计数分离：弹窗被用户批准（放行）时不产生任何拒绝统计。
-test("边界: outage 弹窗中用户放行不入拒绝侧", async () => {
+test(" 边界: outage 弹窗中用户放行不入拒绝侧", async () => {
 	const h = await setup({ hasUI: true });
 	const originalSelect = h.ctx.ui.select;
 	h.ctx.ui.select = async (body: string) => {

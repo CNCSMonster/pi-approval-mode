@@ -7,7 +7,7 @@ import { isProtectedPath, isEscapingWorkspace } from "../extensions/heuristic-gu
 import { PermissionManager } from "../extensions/permission-engine.ts";
 import approvalModeExtension from "../extensions/approval-mode.ts";
 
-// 环境隔离：HOME 重定向，防本机真实用户规则/配置干扰钩子级断言（同白名单测试）
+// 环境隔离：HOME 重定向，防本机真实用户规则/配置干扰钩子级断言（同  测试）
 process.env.HOME = mkdtempSync(join(tmpdir(), "pi-issue-0021-home-"));
 
 test("symlink 逃逸不豁免（normalize 后判断）", () => {

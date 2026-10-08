@@ -110,7 +110,7 @@ async function callWrite(h: Harness, n: number) {
 // D1：不可用熔断触顶（u≥3）→ ② 跳过分类器直呈人工核准，默认拒绝态
 // ============================================================
 test("受保护路径熔断降级 D1: u≥3 时分类器零调用、熔断弹窗出现、默认拒绝出口", async () => {
-	// 前三次故障弹窗全部放行 → u=1..3（allow 不治愈 u， 语义）
+	// 前三次故障弹窗全部放行 → u=1..3（allow 不治愈 u，A 语义）
 	const h = await setup({ hasUI: true, complete: "outage", selectReply: (n) => (n <= 3 ? "1" : null) });
 
 	for (const i of [1, 2, 3]) {

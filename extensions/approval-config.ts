@@ -36,10 +36,33 @@ export interface LoopDetectionConfig {
 	stagnationThreshold?: number; // 参数颠簸停滞熔断阈值（默认 6）
 }
 
+// ==========================================
+// 分类器思考档位词汇表 (Extended Thinking Levels)
+// 取值域：off / minimal / low / medium / high / xhigh / max
+// ==========================================
+
+export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
+export const EXTENDED_THINKING_LEVELS: readonly ThinkingLevel[] = [
+	"off",
+	"minimal",
+	"low",
+	"medium",
+	"high",
+	"xhigh",
+	"max",
+] as const;
+
+export function isThinkingLevel(value: unknown): value is ThinkingLevel {
+	return typeof value === "string" && (EXTENDED_THINKING_LEVELS as readonly string[]).includes(value);
+}
+
 export interface ApprovalConfigFile {
 	classifierModel?: string; // 审批分类器模型，例如 "llm-proxy-openai-chat/gemini-3.8-flash-high-lp"
 	classifierStage1Model?: string; // 审批分类器 Stage 1 (快筛) 模型
 	classifierStage2Model?: string; // 审批分类器 Stage 2 (复核) 模型
+	classifierStage1Thinking?: ThinkingLevel; // Stage 1 思考档位 (off..max)
+	classifierStage2Thinking?: ThinkingLevel; // Stage 2 思考档位 (off..max)
 	defaultMode?: ApprovalMode; // 默认启动模式，例如 "auto" 或 "manual"（旧值 "default" 自动映射为 manual）
 	classifierTimeoutMs?: number; // Stage 1 快筛超时毫秒数 (默认 1500ms)
 	classifierStage2TimeoutMs?: number; // Stage 2 复核超时毫秒数 (缺省 = Stage 1 × 2)

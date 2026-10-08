@@ -81,7 +81,7 @@ function readAgentConfig(): any {
 // 1. stage1-classifier 纯逻辑
 // =========================================================================
 
-test("stage1-classifier: buildStage1ClassifierContext 形态对齐官方 examples/extensions/jev-router.ts", () => {
+test(" stage1-classifier: buildStage1ClassifierContext 形态对齐官方 examples/extensions/jev-router.ts", () => {
 	const ctx = buildStage1ClassifierContext("Conversation Transcript:\nhi\nTool: bash");
 	assert.strictEqual(typeof ctx.state.prompt, "string");
 	assert.ok(ctx.state.prompt.includes("Tool: bash"));
@@ -101,7 +101,7 @@ test("stage1-classifier: buildStage1ClassifierContext 形态对齐官方 example
 	assert.notStrictEqual(ctx.questions[STAGE1_QUESTION_KEY].criteria, ctx2.questions[STAGE1_QUESTION_KEY].criteria);
 });
 
-test("stage1-classifier: buildStage1StateText 评测口径（空会话占位与空入参回退）", () => {
+test(" stage1-classifier: buildStage1StateText 评测口径（空会话占位与空入参回退）", () => {
 	const full = buildStage1StateText("bash", { command: "rm -rf /" }, "user: clean the disk");
 	assert.ok(full.includes("user: clean the disk"));
 	assert.ok(full.includes("Tool: bash"));
@@ -112,7 +112,7 @@ test("stage1-classifier: buildStage1StateText 评测口径（空会话占位与�
 	assert.ok(empty.includes("{}"));
 });
 
-test("stage1-classifier: interpretStage1Result 阈值判定（0.5 边界与自定义阈值）", () => {
+test(" stage1-classifier: interpretStage1Result 阈值判定（0.5 边界与自定义阈值）", () => {
 	assert.strictEqual(DEFAULT_SHOULD_BLOCK_THRESHOLD, 0.5);
 
 	const allow = interpretStage1Result(stopResult(0.01));
@@ -133,7 +133,7 @@ function stopResult(probability: number): any {
 	return { stopReason: "stop", answers: { [STAGE1_QUESTION_KEY]: { type: "bool", probability } } };
 }
 
-test("stage1-classifier: interpretStage1Result 失败归因全分支", () => {
+test(" stage1-classifier: interpretStage1Result 失败归因全分支", () => {
 	// null（竞速超时兜底）→ timeout
 	assert.strictEqual(interpretStage1Result(null).failure, "timeout");
 	// aborted → timeout
@@ -161,7 +161,7 @@ test("stage1-classifier: interpretStage1Result 失败归因全分支", () => {
 	);
 });
 
-test("stage1-classifier: classifyStage1 成功路径与上下文透传", async () => {
+test(" stage1-classifier: classifyStage1 成功路径与上下文透传", async () => {
 	let seen: any = null;
 	const reg = {
 		classify: async (model: any, context: any, options: any) => {
@@ -186,7 +186,7 @@ test("stage1-classifier: classifyStage1 成功路径与上下文透传", async (
 	assert.strictEqual(gated.shouldBlock, false);
 });
 
-test("stage1-classifier: classifyStage1 异常归因（exception / abort 抛错 / 竞速超时）", async () => {
+test(" stage1-classifier: classifyStage1 异常归因（exception / abort 抛错 / 竞速超时）", async () => {
 	// 1. 意外抛错 → exception
 	const boom = await classifyStage1(
 		{
@@ -243,7 +243,7 @@ test("stage1-classifier: classifyStage1 异常归因（exception / abort 抛错 
 	assert.strictEqual(dead.failure, "timeout");
 });
 
-test("stage1-classifier: findClassifierModel 目录查找（首斜杠切分 / 全量 ID 扫描 / 认证门禁）", () => {
+test(" stage1-classifier: findClassifierModel 目录查找（首斜杠切分 / 全量 ID 扫描 / 认证门禁）", () => {
 	const reg = makeCatalogRegistry();
 
 	// 1. provider/id 形态 → findOfType
@@ -305,7 +305,7 @@ test("stage1-classifier: findClassifierModel 目录查找（首斜杠切分 / �
 // 2. resolveClassifierModel：classifier 目录回退与 Stage 2 防护
 // =========================================================================
 
-test("resolveClassifierModel: classifier 目录回退与 allowClassifier 防护", () => {
+test(" resolveClassifierModel: classifier 目录回退与 allowClassifier 防护", () => {
 	const ctx: any = { modelRegistry: makeCatalogRegistry(), model: { provider: "anthropic", id: "main-model" } };
 
 	// 1. provider/id 全引用（chat find 未命中 → classifier findOfType）
@@ -337,7 +337,7 @@ test("resolveClassifierModel: classifier 目录回退与 allowClassifier 防护"
 // 3. /classifier-model 校验（flag 感知）与动态补全
 // =========================================================================
 
-test("/classifier-model: --stage1 接受 classifier 模型，--stage2/--both 拒绝", async () => {
+test(" /classifier-model: --stage1 接受 classifier 模型，--stage2/--both 拒绝", async () => {
 	writeAgentConfig({});
 	const h = await setupHarness({ registry: makeCatalogRegistry() });
 
@@ -369,7 +369,7 @@ test("/classifier-model: --stage1 接受 classifier 模型，--stage2/--both 拒
 	assert.strictEqual(readAgentConfig().classifierStage2Model, "test/stage2-model");
 });
 
-test("/classifier-model 补全: 动态枚举 classifier 目录（仅 --stage1）与生效标记", async () => {
+test(" /classifier-model 补全: 动态枚举 classifier 目录（仅 --stage1）与生效标记", async () => {
 	writeAgentConfig({});
 	const h = await setupHarness({ registry: makeCatalogRegistry() });
 	const getCompletions = h.commands["classifier-model"].getArgumentCompletions;
@@ -416,7 +416,7 @@ test("/classifier-model 补全: 动态枚举 classifier 目录（仅 --stage1）
 // 4. 端到端：两阶段状态机经 registry.classify() 派发
 // =========================================================================
 
-test("e2e: Stage 1 classifier 派发（快速放行 / 上浮 Stage 2 / 失败归因与健康度）", async () => {
+test(" e2e: Stage 1 classifier 派发（快速放行 / 上浮 Stage 2 / 失败归因与健康度）", async () => {
 	writeAgentConfig({
 		classifierStage1Model: "openrouter/typesafe/jev-1.13",
 		classifierStage2Model: "test/stage2-model",
@@ -480,7 +480,7 @@ test("e2e: Stage 1 classifier 派发（快速放行 / 上浮 Stage 2 / 失败归
 	assert.ok(!h.statuses[h.statuses.length - 1].includes("S1⚠️"), "成功后状态栏必须复位");
 });
 
-test("e2e: 手工配置 classifier 为 Stage 2 时回退通用 LLM，绝不对 classifier 调 complete()", async () => {
+test(" e2e: 手工配置 classifier 为 Stage 2 时回退通用 LLM，绝不对 classifier 调 complete()", async () => {
 	writeAgentConfig({
 		classifierStage1Model: "openrouter/typesafe/jev-1.13",
 		classifierStage2Model: "openrouter/typesafe/jev-1.13",

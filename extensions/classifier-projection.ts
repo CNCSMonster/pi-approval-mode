@@ -169,7 +169,7 @@ export function buildTranscript(entries: TranscriptEntryLike[], cwd: string): st
 }
 
 // ==============================================================
-// Stage 1 独立健康状态追踪
+// Stage 1 独立健康状态追踪（ Module A / M6 对齐）
 // ==============================================================
 
 export type Stage1FailureReason = "timeout" | "exception" | "upstream_error" | "invalid_response";

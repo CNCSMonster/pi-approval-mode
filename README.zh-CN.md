@@ -64,7 +64,7 @@ pi update
 | :--- | :--- | :--- |
 | **`manual`** | `[🛡️ manual]` | **人审模式**。编辑、写入与 Shell 命令逐个需人工审批；只读工具自动放行。 |
 | **`auto-edit`** | `[📝 auto-edit]` | 区内文件免审，受保护路径与区外需确认，仅 shell 需审批 |
-| **`auto`** | `[🤖 auto]` | **分类器驱动（新会话默认）**。规则快路径与 Layer 1 工作区编辑豁免汇入两阶段 LLM 分类器（只读免审层已下线：每条未命中规则的 shell 调用，含 `ls`，均进分类器）：安全操作无感放行，风险操作研判确认；进入该模式时，宽到足以绕过分类器的 allow 规则会被**暂存剥离**（退出恢复）。 |
+| **`auto`** | `[⚖️ auto]` | **分类器驱动（新会话默认）**。规则快路径与 Layer 1 工作区编辑豁免汇入两阶段 LLM 分类器（只读免审层已下线：每条未命中规则的 shell 调用，含 `ls`，均进分类器）：安全操作无感放行，风险操作研判确认；若 Stage 1 快筛离线，徽标常驻显示 `[⚖️ auto \| S1⚠️]` 并由 Stage 2 复核接管。进入该模式时，宽到足以绕过分类器的 allow 规则会被**暂存剥离**（退出恢复）。 |
 | **`yolo`** | `[⚡ yolo]` | **全自动**。所有工具调用免弹窗直接执行（Pi 内核默认）。 |
 | **`plan`** | `[📋 plan]` | **只读规划**。禁用 `edit` 与 `write`；Shell 仅限只读命令；注入规划指令。 |
 
@@ -81,11 +81,13 @@ pi update
 
 ```json
 {
-  "classifierModel": "llm-proxy-openai-chat/gemini-3.8-flash-high-lp",
-  "classifierStage1Model": "cheap-fast-model",
-  "classifierStage2Model": "strong-reasoning-model",
+  "classifierStage1Model": "deepseek/deepseek-flash",
+  "classifierStage2Model": "openrouter/anthropic/claude-haiku-5.5",
+  "classifierStage1Thinking": "low",
+  "classifierStage2Thinking": "low",
   "defaultMode": "auto",
   "classifierTimeoutMs": 1500,
+  "classifierStage2TimeoutMs": 4500,
   "loopDetection": {
     "identicalThreshold": 3,
     "denialThreshold": 3,

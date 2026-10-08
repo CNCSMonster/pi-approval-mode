@@ -7,7 +7,7 @@ import { PermissionManager } from "../extensions/permission-engine.ts";
 import approvalModeExtension from "../extensions/approval-mode.ts";
 
 // ==============================================================
-// auto 暂存的危险 allow 规则不得被 reloadAll 原地复活
+// ：auto 暂存的危险 allow 规则不得被 reloadAll 原地复活
 //
 // 机理：persistRules 有意把暂存规则写回磁盘（磁盘 = 工作池 + 暂存），
 // 而 reloadAll 整表重载且不重新 strip ⇒ 危险 allow 回到工作池参与 evaluate()，
@@ -56,7 +56,7 @@ const bashEv = (command: string) => ({ toolName: "bash", input: { command } });
 // A. 核心：暂存激活期间 reloadAll 不得让磁盘危险 allow 参与 evaluate()
 // ==============================================================
 
-test("A - auto 暂存非空 → reloadAll 后磁盘危险 allow 不参与 evaluate()", () => {
+test(" A - auto 暂存非空 → reloadAll 后磁盘危险 allow 不参与 evaluate()", () => {
 	const { root, userDir } = sandbox(["Bash(npx *)", "Bash(git status)"]);
 	try {
 		const pm = new PermissionManager(root, userDir);
@@ -91,7 +91,7 @@ test("A - auto 暂存非空 → reloadAll 后磁盘危险 allow 不参与 evalua
 // B. 不漏 strip：重载时磁盘上新出现的危险 allow 也被摘除
 // ==============================================================
 
-test("B - reload 期间磁盘新增的危险 allow 被重新 strip（含项目层）", () => {
+test(" B - reload 期间磁盘新增的危险 allow 被重新 strip（含项目层）", () => {
 	const { root, userDir } = sandbox(["Bash(npx *)"]);
 	try {
 		const pm = new PermissionManager(root, userDir);
@@ -124,7 +124,7 @@ test("B - reload 期间磁盘新增的危险 allow 被重新 strip（含项目�
 // C. 幂等 / 无重复：多次 reload 不产生重复暂存条目
 // ==============================================================
 
-test("C - 反复 reloadAll 暂存池去重、不产生重复规则", () => {
+test(" C - 反复 reloadAll 暂存池去重、不产生重复规则", () => {
 	const { root, userDir } = sandbox(["Bash(npx *)", "Bash(node -e *)"]);
 	try {
 		const pm = new PermissionManager(root, userDir);
@@ -149,7 +149,7 @@ test("C - 反复 reloadAll 暂存池去重、不产生重复规则", () => {
 // D. 其他加载路径同样收口：setIsTrusted（/reload 信任闸）、reloadFiles
 // ==============================================================
 
-test("D - setIsTrusted / reloadFiles 路径也不复活暂存规则", () => {
+test(" D - setIsTrusted / reloadFiles 路径也不复活暂存规则", () => {
 	const { root, userDir } = sandbox(["Bash(npx *)"], ["Bash(python *)"]);
 	try {
 		const pm = new PermissionManager(root, userDir);
@@ -178,7 +178,7 @@ test("D - setIsTrusted / reloadFiles 路径也不复活暂存规则", () => {
 // E. restore 回归：reload 交错后退出 auto 仍原样归位并生效
 // ==============================================================
 
-test("E - reload 交错后退出 auto：restore 原样归位、幂等、无重复", () => {
+test(" E - reload 交错后退出 auto：restore 原样归位、幂等、无重复", () => {
 	const { root, userDir } = sandbox(["Bash(npx *)", "Bash(git status)"]);
 	try {
 		const pm = new PermissionManager(root, userDir);
@@ -212,7 +212,7 @@ test("E - reload 交错后退出 auto：restore 原样归位、幂等、无重�
 // F. 端到端：/approval-rules 命令路径（真实扩展处理器）——UI 与实际生效态一致
 // ==============================================================
 
-test("F - /approval-rules list 后：报告标注 ⏸️ 已暂存 且危险 allow 不进 allow 列表、分类器仍介入", async () => {
+test(" F - /approval-rules list 后：报告标注 ⏸️ 已暂存 且危险 allow 不进 allow 列表、分类器仍介入", async () => {
 	const { root } = sandbox();
 	const agentDir = join(ISOLATED_HOME, ".pi", "agent");
 	mkdirSync(agentDir, { recursive: true });

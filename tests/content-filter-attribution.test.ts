@@ -109,7 +109,7 @@ test("上游其他错误归因：带 finish_reason 码、非 parse_fail、优雅
 });
 
 // ③ A' 自愈闭环：熔断降级弹窗（明示状态）→ 人工批准一次 → 计数清零 → 分类器恢复
-test("熔断降级弹窗明示状态，人工批准一次即恢复分类器", async () => {
+test("A' - 熔断降级弹窗明示状态，人工批准一次即恢复分类器", async () => {
 	// selectQueue 前 3 项 null：失败弹窗全部"拒绝"（拒绝不清计数）→ consecutiveUnavailable 累积触顶
 	// 第 4 项 "1"（allow_once）：降级态批准 → recordFallbackApprove 自愈
 	const h = await setup({ hasUI: true, selectQueue: [null, null, null, "1"] });

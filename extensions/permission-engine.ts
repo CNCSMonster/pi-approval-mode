@@ -9,7 +9,7 @@
  *    - ask:  强制挂起并弹窗要求用户确认，压倒 allow；
  *    - default: 显式 default 规则命中，或未命中任何规则 → 交给审批模式漏斗（auto→classifier、非交互拒绝）；
  *    - allow: 免审放行（受 auto 模式高危暂存保护）；
- *    （读类工具未命中规则时，再经工具默认权限层：工作区内 allow / 工作区外 ask）
+ *    （读类工具未命中规则时，再经工具默认权限层：工作区内 allow / 工作区外 ask，）
  *
  * 2. DSL 语法与分流解析：
  *    ToolName 或 ToolName(specifier)
@@ -802,7 +802,7 @@ export class PermissionManager {
 }
 
 // ==============================================================
-// 工具默认权限层
+// 工具默认权限层（qwen-code getDefaultPermission 等价物， specification）
 // ==============================================================
 
 /** 读类工具集合（pi 实际内置的只读工具）。 */
@@ -813,7 +813,7 @@ export function isReadOnlyTool(toolName: string): boolean {
 	return READ_ONLY_TOOLS.has(toolName.toLowerCase());
 }
 
-/** 读类工具模式漏斗处置档位。 */
+/** 读类工具模式漏斗处置档位（ specification 矩阵）。 */
 export type ModeFunnelDisposition = "allow" | "classifier" | "prompt";
 
 /**
@@ -948,7 +948,7 @@ export function buildReadDslRule(targetPath: string): string {
 
 /**
  * 解析真实路径（跟随符号链接与内核 `..` 语义）；解析失败（路径不存在等）返回 null。
- * 白名单匹配必须同时防 `../` 穿越与符号链接逃逸——能解析的按真实位置判，
+ *  拍板：白名单匹配必须同时防 `../` 穿越与符号链接逃逸——能解析的按真实位置判，
  * 无法解析的路径读取必然失败，回退词法匹配维持既有行为。
  */
 function realpathOrNull(p: string): string | null {
@@ -996,7 +996,7 @@ export function getToolDefaultPermission(
 		abs = normalize(join(cwd, expanded)).replace(/\\/g, "/");
 	}
 
-	// 白名单先归一化、再按真实路径判（realpath 跟随符号链接，防逃逸）
+	// 拍板：白名单先归一化、再按真实路径判（realpath 跟随符号链接，防逃逸）
 	const rawAbs = isAbsolute(expanded) ? expanded : join(cwd, expanded);
 	const realAbs = realpathOrNull(rawAbs);
 	const underWhitelist = (dirLexical: string): boolean => {

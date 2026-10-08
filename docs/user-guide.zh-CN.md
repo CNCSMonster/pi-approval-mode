@@ -52,6 +52,14 @@ pi install git:github.com/CNCSMonster/pi-approval-mode
 
 当前模式常驻状态栏（如 `[⚖️ auto]`；若 Stage 1 快筛离线则常驻显示 `[⚖️ auto | S1⚠️]`，见 §4.4 与 §5.7）。
 
+| 模式 | 状态栏徽标 | 核心定位 |
+| :--- | :--- | :--- |
+| **`manual`** | `[🛡️ manual]` | **全量人审**：编辑、写入与 Shell 均需人工审批，读类工具放行 |
+| **`auto-edit`** | `[📝 auto-edit]` | **免审编辑**：区内常规文件编辑放行，越界/受保护路径与 Shell 需审批 |
+| **`auto`** | `[⚖️ auto]` | **分类器驱动（默认）**：两阶段 LLM 研判放行/拦截；S1 异常时常驻 `[⚖️ auto \| S1⚠️]` |
+| **`yolo`** | `[⚡ yolo]` | **全自动**：工具免弹窗直接执行（恢复旧会话时自动降级回安全基线） |
+| **`plan`** | `[📋 plan]` | **只读规划**：禁用 edit/write，Shell 仅限只读，注入规划提示词 |
+
 > ⚠️ **注意区分**：状态栏第 2 行上下文用量后的 `(auto)` 是 **Pi 原生的上下文自动压缩指示**（`compaction.enabled`，见 Pi 官方 `docs/settings.md`），与本插件无关；本插件的审批模式徽标位于扩展状态行（如 `[⚖️ auto]`）。两者详见 §5.7。
 
 ### 1.5 建议的下一步
@@ -98,10 +106,11 @@ pi install git:github.com/CNCSMonster/pi-approval-mode
 
 `*` **注：**
 
-- **受保护路径** = 工作区敏感位置（`.pi/`、`.git/`、`AGENTS.md`、`.bashrc` / `.zshrc` / `.profile` 等点文件、`.env*`、`id_rsa*`）。`auto` 模式下这些路径不走快路径，改走分类器。
+- **受保护路径** = 工作区敏感位置（`.pi/`、`.git/`、`AGENTS.md`、Shell 点文件如 `.bashrc` / `.zshrc` / `.profile`、环境变量与密钥 `.env*` / `id_rsa*` / `id_ed25519*`、凭据文件 `.pypirc` / `.git-credentials`、CLI 配置 `.config/gh/` / `.config/glab-cli/`、基础设施与集群目录 `helm/` / `k8s/` / `iam/` 等）。`auto` 模式下这些路径不走快路径，改走分类器。
 - **分类器 → 弹窗**：两阶段 LLM 分类器结合对话上下文研判该调用。判为有风险则弹窗展示风险理由，之后仍是 `1`–`5` 选择；判为安全则无感放行。
 - **skill 目录** `*` = 用户级 `~/.pi/agent/skills/**` 与 `~/.agents/skills/**`（恒豁免）+ 项目级 `.pi/skills/**` 与 `.agents/skills/**`（仅受信项目豁免）；显式 `deny`/`ask` 规则仍然优先于白名单。
 - **只读 `bash`** 由 Shell 状态机判定（引号、重定向、管道、`&&`/`;` 切分、`$( )` 替换、`find`/`git`/`sed` 参数守卫）。任何一处写入重定向即一票否决只读资格。**在 `auto` 下只读快路径已下线**：该分析现仅守卫 `plan`（硬拦）并为 `auto` 弹窗的“静态结构特征”展示行供料——展示≠裁决。每一条未命中规则的 shell 调用（含 `ls`）都进分类器；想把某命令钉回 0 秒，写一条 `allow` 规则。
+- **破坏性 Git 操作**：`git push --force-with-lease` 视为带租约的安全协作操作，免除高危正则兜底阻断，交给分类器智能裁决；裸 `--force` / `-f` 强推与历史重写则受到启发式兜底硬性拦截。
 
 ### 2.3 无头（非交互）运行
 
@@ -186,7 +195,8 @@ $$\text{Deny} > \text{Ask} > \text{Default} > \text{Allow}$$
 
 - **Stage 1** — 极速 JSON 判定（带超时熔断）；
 - **Stage 2** — 仅当 Stage 1 拦截时启动思维链复核，消除误报；
-- 结论与可读的风险理由进入弹窗（无头模式下转为拒绝消息）。
+- 结论与可读的风险理由进入弹窗（无头模式下转为拒绝消息）；
+- **紧凑判词契约**：分类器提示词内建严格字数约束（理由控制在 15 词或 60 字符以内），杜绝冗长套话，压降往返 token 与研判时延。
 
 ### 4.2 配置 `classifierModel`
 
@@ -194,13 +204,20 @@ $$\text{Deny} > \text{Ask} > \text{Default} > \text{Allow}$$
 
 ```json
 {
-  "classifierModel": "<provider>/<model>",
-  "classifierStage1Model": "<provider>/<cheap-model>",
-  "classifierStage2Model": "<provider>/<smart-model>",
+  "classifierStage1Model": "deepseek/deepseek-flash",
+  "classifierStage2Model": "openrouter/anthropic/claude-haiku-5.5",
+  "classifierStage1Thinking": "low",
+  "classifierStage2Thinking": "low",
   "defaultMode": "auto",
-  "classifierTimeoutMs": 1500
+  "classifierTimeoutMs": 1500,
+  "classifierStage2TimeoutMs": 4500
 }
 ```
+
+> **实战推荐配置（Benchmark 优选）**：
+> - **Stage 1（极速探针）**：`deepseek/deepseek-flash` 搭配 `thinking: "low"`（耗时 ~400ms，在 1500ms 预算内极速过滤 80% 良性操作）；
+> - **Stage 2（深度复核）**：`openrouter/anthropic/claude-haiku-5.5` 搭配 `thinking: "low"`（长思维链有效识破间接注入与带内提示词攻击，95% 综合通过率）；
+> - 若使用专职分类器（如 Jev），Stage 1 思考档位必须为 `off`。
 
 - **`<provider>/<model>`** 必须存在于 Pi 模型注册表（`~/.pi/agent/models.json`）。
   挑便宜快的小模型即可——分类器只回答一个小小的 JSON 问题：
@@ -219,11 +236,12 @@ $$\text{Deny} > \text{Ask} > \text{Default} > \text{Allow}$$
 
 - **切勿在配置文件里存 API key**。用上面的 `$ENV_VAR` 引用形式，在启动 Pi 的环境里导出变量。
 - **运行时查看或配置分类器模型**：**`/classifier-model`**
-  - **查看状态**：直接执行 `/classifier-model`，回显 Stage 1（快筛）与 Stage 2（复核）的当前配置值、生效值与回退原因。
+  - **查看状态**：直接执行 `/classifier-model`，回显 Stage 1（快筛）与 Stage 2（复核）的当前配置值、生效值与回退原因，以及各自的思考档位（`Stage 1 思考`、`Stage 2 思考`）。
   - **分阶段独立设置**：`/classifier-model --stage1 <provider/model>` 或 `/classifier-model --stage2 <provider/model>`（支持一次性指定两阶段，如 `/classifier-model --stage1 deepseek/deepseek-flash --stage2 deepseek/deepseek-v4-pro`，顺序无关）。
   - **统一设置两阶段**：`/classifier-model --both <provider/model>`（写入共享键并清空分阶段键）。
-  - **清空配置**：`/classifier-model clear`（重置全部回到内置默认及主模型）；亦可按目标清除 `/classifier-model clear --stage1`（或 `--stage2` / `--both`）。
-  - **帮助与补全**：`/classifier-model help` 显示语法与示例；支持全流程 Tab 自动补全，候选列表智能剪枝互斥选项，展示模型价格、推理与上下文窗口元数据，并对当前生效模型标注 `✓`。
+  - **设置思考档位**：`--thinking <level>`（可选 `off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`），作用范围由 `--stage1`、`--stage2` 或 `--both` 决定。例如 `/classifier-model --stage1 deepseek/deepseek-flash --thinking off`、`/classifier-model --stage2 --thinking low` 或 `/classifier-model --both --thinking minimal`。
+  - **清空配置**：`/classifier-model clear`（重置全部模型与思考键回到内置默认及主模型）；亦可按目标清除 `/classifier-model clear --stage1`（或 `--stage2` / `--both` / `--thinking`，其中 `clear --thinking` 仅清除思考档位）。
+  - **帮助与补全**：`/classifier-model help` 显示语法与示例；支持全流程 Tab 自动补全，候选列表智能剪枝互斥选项，展示模型价格、推理与上下文窗口元数据，并对当前生效模型标注 `✓`；在输入 `--thinking ` 时自动提示 7 个可用档位候选。
   - **语法迁移说明**：旧语法位置参数 `/classifier-model <model>` 与 `/classifier-model default` 已移除，请分别迁移为 `--both <model>` 与 `clear`。
 - `defaultMode` 设定启动模式；项目级 `.pi/approval-config.json` 按顶层键整体覆盖全局
   （且仅在**受信任**项目生效——见 §5.4）。
@@ -260,6 +278,19 @@ $$\text{Deny} > \text{Ask} > \text{Default} > \text{Allow}$$
 3. **全链路防呆**：
    - 文件加载侧若检测到底座配置为专职分类器，立即发出告警并阻断 Stage 2 对其继承（Stage 2 回退到内置默认）；
    - `/classifier-model` 命令行交互中，`--stage2` 与 `--both` 参数严格阻断专职分类器配置，Tab 自动补全仅在 `--stage1` 呈现专职分类器候选。
+
+#### 4.2.3 分类器思考模式配置与显式状态呈现
+
+Stage 1 与 Stage 2 分类器支持独立配置模型思考模式（Reasoning / Thinking）：
+
+- **思考档位取值域**：`off`（显式关闭思考）、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`。配置缺失时为未指定（unset，不传递 `reasoning` 参数，保持模型服务商 provider 默认行为）。
+- **校验与安全回退机制（生产侧安全优先）**：
+  - **非法枚举值**：若配置了不在取值域内的值，控制台与界面发出告警，该 stage 思考档位安全回退为未指定；
+  - **模型不支持**：若配置合法但所选模型不支持该档位（例如 `reasoning: false` 的模型或专职分类器仅支持 `off`），系统发出告警（附带该模型支持的档位列表），并安全回退为未指定；
+  - 回退机制确保审批链条高可用，绝不因思考配置错误瘫痪分类器。
+- **全链路显式可观测性**：
+  - **启动与重载日志**：插件启动与 `/reload` 完成后，输出 `[ApprovalMode] 分类器思考配置 effective: stage1=... stage2=...`（标注来源为 `配置`、`provider 默认` 或回退原因，如 `未指定(原 low 不受支持, 已回退)`）；
+  - **状态查询视图**：执行 `/classifier-model` 查询时，输出中包含 `Stage 1 思考` 与 `Stage 2 思考` 两行，完整呈现配置值、生效值与回退原因。
 
 ### 4.3 超时与优雅降级
 

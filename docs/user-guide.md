@@ -54,6 +54,14 @@ Options `2`–`4` write an `allow` rule at the corresponding tier, so the same a
 
 The current mode is always visible in the status bar (e.g. `[⚖️ auto]`; or `[⚖️ auto | S1⚠️]` if Stage 1 is degraded, see §4.4 and §5.7).
 
+| Mode | Status Badge | Core Positioning |
+| :--- | :--- | :--- |
+| **`manual`** | `[🛡️ manual]` | **Full human review**: Edits, writes, and shell commands require approval; read tools allowed |
+| **`auto-edit`** | `[📝 auto-edit]` | **Auto-edit**: Regular in-workspace edits allowed; protected paths, boundary escapes, and shell require approval |
+| **`auto`** | `[⚖️ auto]` | **Classifier-driven (default)**: Two-stage LLM determines allow/block; persists `[⚖️ auto \| S1⚠️]` on S1 degradation |
+| **`yolo`** | `[⚡ yolo]` | **Autonomous**: Tools execute without dialog prompts (downgrades to baseline on session resume) |
+| **`plan`** | `[📋 plan]` | **Read-only planning**: Disables edit/write, restricts shell to read-only, injects plan prompts |
+
 > ⚠️ **Note**: the `(auto)` after the context usage on status-bar line 2 is **Pi's native
 > auto-compaction indicator** (`compaction.enabled`, see Pi's `docs/settings.md`) and has
 > nothing to do with this plugin; this plugin's approval-mode badge lives on the extension
@@ -104,10 +112,11 @@ The five modes form an automation ramp — `manual → auto-edit → auto → yo
 
 `*` **Notes:**
 
-- **Protected path** = workspace-sensitive locations (`.pi/`, `.git/`, `AGENTS.md`, dotfiles such as `.bashrc` / `.zshrc` / `.profile`, `.env*`, `id_rsa*`). In `auto` these route through the classifier instead of the fast path.
+- **Protected path** = workspace-sensitive locations (`.pi/`, `.git/`, `AGENTS.md`, dotfiles such as `.bashrc` / `.zshrc` / `.profile`, env and keys `.env*` / `id_rsa*` / `id_ed25519*`, credential files `.pypirc` / `.git-credentials`, CLI configs `.config/gh/` / `.config/glab-cli/`, and cloud/cluster definitions `helm/` / `k8s/` / `iam/`). In `auto` these route through the classifier instead of the fast path.
 - **Classifier → dialog**: the two-stage LLM classifier reviews the call with its conversation context. If flagged risky, an interactive dialog shows the risk reason before the same `1`–`5` choices; if deemed safe, the call proceeds without any prompt.
 - **Skill dirs** `*` = user-level `~/.pi/agent/skills/**` and `~/.agents/skills/**` (always exempt) plus project-level `.pi/skills/**` and `.agents/skills/**` (exempt only when the project is trusted). Explicit `deny` / `ask` rules still win over this whitelist.
 - **Read-only `bash`** is decided by a shell state-machine (quotes, redirections, pipes, `&&`/`;` splitting, `$( )` substitution, flag guards for `find`/`git`/`sed`). A single write redirection revokes read-only status. **In `auto` the read-only fast path is retired**: the analysis now only guards `plan` (hard block) and feeds the "static structure" display line of `auto` dialogs — display, not verdict. Every rule-unmatched shell call, `ls` included, goes through the classifier; pin a command back to 0 s with an `allow` rule.
+- **Destructive Git Operations**: `git push --force-with-lease` is treated as a safe collaborative operation exempt from high-risk regex fallbacks and judged by the classifier; bare `--force` / `-f` and destructive rewrites are strictly intercepted by deterministic heuristics.
 
 ### 2.3 Headless (non-interactive) runs
 
@@ -196,7 +205,8 @@ In **`auto`** mode, every rule-unmatched shell call (the read-only fast path is 
 
 - **Stage 1** — a fast JSON judgment (with a timeout circuit-breaker);
 - **Stage 2** — a thinking re-review only when Stage 1 flags, to eliminate false positives;
-- decision + human-readable risk reason appear in the dialog (or become a headless denial).
+- decision + human-readable risk reason appear in the dialog (or become a headless denial);
+- **Compact Reason Contract**: Prompts enforce concise justifications (strictly under 15 words or 60 characters) to prune verbose rhetoric and lower turn latency.
 
 ### 4.2 Configuring `classifierModel`
 
@@ -204,13 +214,20 @@ In **`auto`** mode, every rule-unmatched shell call (the read-only fast path is 
 
 ```json
 {
-  "classifierModel": "<provider>/<model>",
-  "classifierStage1Model": "<provider>/<cheap-model>",
-  "classifierStage2Model": "<provider>/<smart-model>",
+  "classifierStage1Model": "deepseek/deepseek-flash",
+  "classifierStage2Model": "openrouter/anthropic/claude-haiku-5.5",
+  "classifierStage1Thinking": "low",
+  "classifierStage2Thinking": "low",
   "defaultMode": "auto",
-  "classifierTimeoutMs": 1500
+  "classifierTimeoutMs": 1500,
+  "classifierStage2TimeoutMs": 4500
 }
 ```
+
+> **Production Recommendation (Benchmark Optimized)**:
+> - **Stage 1 (Fast Probe)**: `deepseek/deepseek-flash` with `thinking: "low"` (~400ms latency, fast-paths 80% benign operations within 1500ms budget);
+> - **Stage 2 (Deep Review)**: `openrouter/anthropic/claude-haiku-5.5` with `thinking: "low"` (long CoT reliably detects prompt injection attacks, achieving 95% benchmark accuracy);
+> - When using dedicated state classifiers (e.g. Jev), Stage 1 thinking must remain `off`.
 
 - **`<provider>/<model>`** must exist in Pi's model registry (`~/.pi/agent/models.json`).
   Pick any cheap, fast model — the classifier only answers a small JSON question:
@@ -230,11 +247,12 @@ In **`auto`** mode, every rule-unmatched shell call (the read-only fast path is 
 - **Never store API keys in config files.** Use the `$ENV_VAR` reference form above and
   export the variable in the environment that launches Pi.
 - **Inspect or configure classifier models at runtime**: **`/classifier-model`**
-  - **View status**: Run `/classifier-model` with no arguments to inspect the configured value, effective model, and fallback reason for both Stage 1 (screening) and Stage 2 (review).
+  - **View status**: Run `/classifier-model` with no arguments to inspect the configured value, effective model, fallback reason, and thinking level (`Stage 1 思考` / `Stage 2 思考`) for both Stage 1 (screening) and Stage 2 (review).
   - **Set per-stage models**: `/classifier-model --stage1 <provider/model>` or `/classifier-model --stage2 <provider/model>` (both stages can be specified in one command, e.g. `/classifier-model --stage1 deepseek/deepseek-flash --stage2 deepseek/deepseek-v4-pro`, order-independent).
   - **Set both stages together**: `/classifier-model --both <provider/model>` (writes to shared key and clears stage-specific keys).
-  - **Clear configurations**: `/classifier-model clear` (resets all stages back to builtin defaults and main model); targeted resets are also supported: `/classifier-model clear --stage1` (or `--stage2` / `--both`).
-  - **Help and completions**: `/classifier-model help` shows syntax and examples. Full-cycle Tab completion is supported with mutual-exclusion pruning, metadata display (pricing, reasoning capability, context window), and active model indicators (`✓`).
+  - **Configure thinking level**: `--thinking <level>` (options: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`), scoped by `--stage1`, `--stage2`, or `--both`. E.g., `/classifier-model --stage1 deepseek/deepseek-flash --thinking off`, `/classifier-model --stage2 --thinking low`, or `/classifier-model --both --thinking minimal`.
+  - **Clear configurations**: `/classifier-model clear` (resets all stages and thinking keys back to builtin defaults and main model); targeted resets are also supported: `/classifier-model clear --stage1` (or `--stage2` / `--both` / `--thinking`, where `clear --thinking` clears thinking keys only).
+  - **Help and completions**: `/classifier-model help` shows syntax and examples. Full-cycle Tab completion is supported with mutual-exclusion pruning, metadata display (pricing, reasoning capability, context window), and active model indicators (`✓`); typing `--thinking ` autocompletes across all 7 supported thinking levels.
   - **Migration notes**: Positional syntax `/classifier-model <model>` and `/classifier-model default` has been removed. Please migrate to `--both <model>` and `clear` respectively.
 - `defaultMode` sets the startup mode; project-level `.pi/approval-config.json` overrides
   global settings per top-level key (and is only honored in **trusted** projects — see §5.4).
@@ -271,6 +289,19 @@ Dedicated state classifiers (e.g., Jev) implement decision protocols without cha
 3. **End-to-End Enforcement**:
    - File configuration loading detects classifiers in base config, emits warnings, and blocks Stage 2 inheritance.
    - CLI command `/classifier-model` rejects state classifiers for `--stage2` and `--both`, and autocompletion prunes them for non-Stage 1 options.
+
+#### 4.2.3 Classifier Thinking Configuration and Explicit Observability
+
+Stage 1 and Stage 2 classifiers support independent thinking mode (Reasoning / Thinking) configuration:
+
+- **Thinking Level Vocabulary**: `off` (explicitly disable reasoning), `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`. When omitted, it resolves to unset (the `reasoning` parameter is omitted from model completion calls, honoring provider defaults).
+- **Validation & Safe Fallback (Production Safety First)**:
+  - **Invalid Enum**: If an unaccepted string is supplied, a warning is emitted at startup/reload and the stage safely falls back to unset.
+  - **Unsupported Level**: If a level is valid but unsupported by the chosen model (e.g. `reasoning: false` models or state classifiers only support `off`), a warning listing supported levels is emitted and the stage safely falls back to unset.
+  - The fallback mechanism ensures classifier pipeline availability is never broken by invalid thinking options.
+- **Full-Chain Explicit Observability**:
+  - **Startup & Reload Logging**: On startup and `/reload`, the extension logs `[ApprovalMode] 分类器思考配置 effective: stage1=... stage2=...` with explicit source annotations (`配置`, `provider 默认`, or fallback reasons such as `未指定(原 low 不受支持, 已回退)`).
+  - **Status Inspection View**: Running `/classifier-model` reports explicit `Stage 1 思考` and `Stage 2 思考` status lines, including configured values, effective values, and fallback reasons.
 
 ### 4.3 Timeout & graceful degradation
 

@@ -57,7 +57,7 @@ test("投影 - 未知工具回退最小化投影 { toolName }", () => {
 	assert.deepEqual(out, { toolName: "task" });
 });
 
-test("投影 - read 只暴露 path，不暴露 offset/limit 等无关参数（）", () => {
+test("投影 - read 只暴露 path，不暴露 offset/limit 等无关参数", () => {
 	const out = projectToolInput("read", { path: "/etc/passwd", offset: 5, limit: 10 }, "/p");
 	assert.deepEqual(out, { path: "/etc/passwd" });
 });

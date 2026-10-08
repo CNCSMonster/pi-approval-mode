@@ -106,7 +106,7 @@ const cmd = (n: number) => `sudo rm -rf /tmp/issue-0027-${n}`;
 //  翻转：auto 只读 bash 免审快路径下线——ls 同样进分类器、故障同样 fail-closed；
 // 熔断可达性锚定在新口径下依然成立（三次故障来源均计入 u）。
 // ============================================================
-test("e2e: 混合流量（outage ×2 → 只读 bash 进分类器故障 → 触顶）不可用熔断可达", async () => {
+test("A e2e: 混合流量（outage ×2 → 只读 bash 进分类器故障 → 触顶）不可用熔断可达", async () => {
 	const h = await setup({ hasUI: false, complete: "outage" });
 
 	for (const n of [1, 2]) {
@@ -136,7 +136,7 @@ test("e2e: 混合流量（outage ×2 → 只读 bash 进分类器故障 → 触�
 // ============================================================
 // B：无头 loop 拦截 reason 为熔断口径 + loop 先手于 tracker consecutive_block 的 e2e 钉住
 // ============================================================
-test("e2e: 无头真实连拒 3 次 → 第 4 次拦截来自 loop 熔断而非 tracker consecutive_block", async () => {
+test("B e2e: 无头真实连拒 3 次 → 第 4 次拦截来自 loop 熔断而非 tracker consecutive_block", async () => {
 	const h = await setup({ hasUI: false, complete: "block" });
 
 	// 三次不同参数的真实拒绝（分类器判拦 → blockCall 双灌 loop + tracker）

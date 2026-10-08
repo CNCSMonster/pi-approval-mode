@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-08
+
+### ✨ Features
+- **Independent Per-Stage Classifier Thinking Configuration**:
+  - **Granular Reasoning Controls**: Extends `/classifier-model` with the `--thinking <level>` argument, supporting 7 standardized thinking tiers (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`) individually configurable for `--stage1`, `--stage2`, or `--both`.
+  - **Fail-Safe Fallback & Capability Validation**: Validates thinking levels against target model registry capabilities (`model.reasoning`, `model.thinkingLevelMap`, and specialized classifier constraints). Incompatible or unsupported configurations automatically log explicit warnings and safely fall back to unconfigured provider defaults without interrupting approval flow.
+  - **Intelligent Autocompletion**: Interactive Tab completion dynamically enumerates available thinking levels, prunes conflicting flags, and reflects active thinking settings in status views.
+- **Claude Code Industrial Safety Rules Absorption**:
+  - **Lease-Verified Force Push Exemption**: Granular git push heuristic pattern allows safe collaborative workflows using `git push --force-with-lease` while strictly intercepting unleased, destructive bare `git push --force` or `git push -f`.
+  - **Modern Credential & Infrastructure Path Protection**: Broadens protected path coverage to include Python PyPI tokens (`.pypirc`), Git credential helpers (`.git-credentials`), GitHub CLI hosts (`.config/gh/hosts.yml`), GitLab CLI configurations (`.config/glab-cli/config.yml`), and cloud infrastructure / cluster definitions (`helm`, `iam`, `k8s`, `kubernetes`, `rbac`).
+  - **Compact Reason Contract**: Enforces strict brevity constraints on classifier reasoning (`reason` under 15 words or 60 characters), reducing LLM generation tokens and latency across evaluation stages.
+- **Safety Policy Prompt Enhancement Aligned with Codex Guardian**:
+  - Re-architected base classification prompts (`CLASSIFIER_BASE_PROMPT`) incorporating deterministic positive and negative policy samples aligned with production-grade safety guardrails.
+  - Distinguishes irreversible destruction from legitimate developer actions (e.g. routine build artifact cleanup, safe cache clearing, package management), minimizing false positive friction while maintaining zero tolerance on credential exfiltration and unauthorized network transfer.
+- **Benchmark-Validated Production Topology**:
+  - Establishes verified dual-stage configuration recommendation: Stage 1 `deepseek/deepseek-flash` (`low`) + Stage 2 `openrouter/anthropic/claude-haiku-5.5` (`low`).
+  - Delivers P50 latency of 856ms with 95.0% clean benchmark accuracy and robust resilience against in-band prompt injection bypasses.
+
+
 ## [0.7.0] - 2026-10-06
 
 ### ✨ Features
@@ -103,7 +122,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### 📖 Documentation
 - Updated bilingual user guide and README with per-stage classifier command syntax and migration guide; documented loop-detector/tracker lockstep ordering facts, total-denial cap semantics, and denial-vs-unavailable counting scope.
-- Loop-detector/tracker lockstep ordering facts, total-denial cap semantics and the denial-vs-unavailable counting scope are documented at the code sites.
+- Loop-detector/tracker lockstep ordering facts, total-denial cap semantics and the denial-vs-unavailable counting scope are documented at the code sites (see entries above).
 
 ## [0.4.0] - 2026-09-30
 

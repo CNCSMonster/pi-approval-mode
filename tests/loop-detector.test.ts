@@ -83,7 +83,7 @@ test("LoopDetector - 同一操作反复重试且无进展才触发停滞（满�
 	assert.equal(res.streak, 6);
 });
 
-test("LoopDetector - 停滞分支硬上限跟随 hardLimitMultiplier", () => {
+test("LoopDetector - 停滞分支硬上限跟随 hardLimitMultiplier（ 拍板①，可达性条件：identical/denial 均 > 硬上限）", () => {
 	// 取 headroom：硬上限 = stagnationThreshold(6) × hardLimitMultiplier(3) = 18，
 	// 须 identicalThreshold(20) 与 denialThreshold(20) 都大于 18，检查 1/2 才不会抢在停滞硬熔断之前。
 	const detector = new LoopDetector({

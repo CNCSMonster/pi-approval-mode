@@ -119,12 +119,12 @@ function createMockHarness() {
 // 1. 纯解析器（parseClassifierModelArgs）断言
 // ==========================================
 
-test("Parser: 空入参 -> status", () => {
+test(" Parser: 空入参 -> status", () => {
 	assert.deepStrictEqual(parseClassifierModelArgs(""), { kind: "status" });
 	assert.deepStrictEqual(parseClassifierModelArgs("   \t  \n "), { kind: "status" });
 });
 
-test("Parser: help 子命令与其约束（C8）", () => {
+test(" Parser: help 子命令与其约束（C8）", () => {
 	assert.deepStrictEqual(parseClassifierModelArgs("help"), { kind: "help" });
 	assert.deepStrictEqual(parseClassifierModelArgs("  help  "), { kind: "help" });
 
@@ -133,7 +133,7 @@ test("Parser: help 子命令与其约束（C8）", () => {
 	assert.match((errC8 as any).message, /必须单独使用/);
 });
 
-test("Parser: clear 子命令合法与互斥（C1, C2, C3, C6）", () => {
+test(" Parser: clear 子命令合法与互斥（C1, C2, C3, C6）", () => {
 	assert.deepStrictEqual(parseClassifierModelArgs("clear"), { kind: "clear", targets: [] });
 	assert.deepStrictEqual(parseClassifierModelArgs("clear --stage1"), { kind: "clear", targets: ["--stage1"] });
 	assert.deepStrictEqual(parseClassifierModelArgs("clear --stage2"), { kind: "clear", targets: ["--stage2"] });
@@ -165,7 +165,7 @@ test("Parser: clear 子命令合法与互斥（C1, C2, C3, C6）", () => {
 	assert.match((unknown as any).message, /未知 flag/);
 });
 
-test("Parser: 设置 flags 正常与冲突规则（C1~C8）", () => {
+test(" Parser: 设置 flags 正常与冲突规则（C1~C8）", () => {
 	// 正常
 	assert.deepStrictEqual(parseClassifierModelArgs("--stage1 test/stage1"), {
 		kind: "set",
@@ -293,7 +293,7 @@ test("Parser: 设置 flags 正常与冲突规则（C1~C8）", () => {
 // 2. 格式化工具纯函数（D3）断言
 // ==========================================
 
-test("D3: formatModelCost 与 formatModelCtx 格式化", () => {
+test(" D3: formatModelCost 与 formatModelCtx 格式化", () => {
 	assert.strictEqual(formatModelCost(0.3, 1.2), "$0.3/$1.2 per M");
 	assert.strictEqual(formatModelCost(2, 10), "$2/$10 per M");
 	assert.strictEqual(formatModelCost(0, 0), "$0/$0 per M");
@@ -304,7 +304,7 @@ test("D3: formatModelCost 与 formatModelCtx 格式化", () => {
 	assert.strictEqual(formatModelCtx(0), "");
 });
 
-test("D3: buildModelDescription 优先级与省略段", () => {
+test(" D3: buildModelDescription 优先级与省略段", () => {
 	// 全部齐全且当前生效
 	const descFull = buildModelDescription(
 		{ cost: { input: 0.3, output: 1.2 }, reasoning: true, contextWindow: 1_000_000 },
@@ -330,7 +330,7 @@ test("D3: buildModelDescription 优先级与省略段", () => {
 // 3. 端到端命令执行（handler）与文件落盘断言
 // ==========================================
 
-test("E2E: status 与 help 输出规范", async () => {
+test(" E2E: status 与 help 输出规范", async () => {
 	const harness = createMockHarness();
 	await harness.handlers["session_start"]({ reason: "start" }, harness.ctx);
 
@@ -348,7 +348,7 @@ test("E2E: status 与 help 输出规范", async () => {
 	assert.strictEqual(lastHelp.message, CLASSIFIER_HELP_TEXT);
 });
 
-test("E2E: 单 flag、组合 flag 与 --both 落盘语义", async () => {
+test(" E2E: 单 flag、组合 flag 与 --both 落盘语义", async () => {
 	const harness = createMockHarness();
 	await harness.handlers["session_start"]({ reason: "start" }, harness.ctx);
 	await harness.commands["classifier-model"].handler("clear", harness.ctx);
@@ -382,7 +382,7 @@ test("E2E: 单 flag、组合 flag 与 --both 落盘语义", async () => {
 	assert.strictEqual(cfg.classifierModel, "test/stage1"); // 未提及的 shared 键保留
 });
 
-test("E2E: clear 目标清除与全局重置", async () => {
+test(" E2E: clear 目标清除与全局重置", async () => {
 	const harness = createMockHarness();
 	await harness.handlers["session_start"]({ reason: "start" }, harness.ctx);
 
@@ -424,7 +424,7 @@ test("E2E: clear 目标清除与全局重置", async () => {
 	assert.strictEqual(cfg.classifierModel, undefined);
 });
 
-test("E2E: D1 全有或全无校验与错误整条不落盘", async () => {
+test(" E2E: D1 全有或全无校验与错误整条不落盘", async () => {
 	const harness = createMockHarness();
 	await harness.handlers["session_start"]({ reason: "start" }, harness.ctx);
 	await harness.commands["classifier-model"].handler("clear", harness.ctx);
@@ -462,7 +462,7 @@ test("E2E: D1 全有或全无校验与错误整条不落盘", async () => {
 // 4. 自动补全状态机（getArgumentCompletions）断言
 // ==========================================
 
-test("Completion: START 与子命令/前缀过滤", async () => {
+test(" Completion: START 与子命令/前缀过滤", async () => {
 	const harness = createMockHarness();
 	await harness.handlers["session_start"]({ reason: "start" }, harness.ctx);
 	const getCompletions = harness.commands["classifier-model"].getArgumentCompletions;
@@ -500,7 +500,7 @@ test("Completion: START 与子命令/前缀过滤", async () => {
 	assert.strictEqual(getCompletions("help extra"), null);
 });
 
-test("Completion: clear 目标补全与互斥过滤", async () => {
+test(" Completion: clear 目标补全与互斥过滤", async () => {
 	const harness = createMockHarness();
 	await harness.handlers["session_start"]({ reason: "start" }, harness.ctx);
 	const getCompletions = harness.commands["classifier-model"].getArgumentCompletions;
@@ -525,7 +525,7 @@ test("Completion: clear 目标补全与互斥过滤", async () => {
 	assert.strictEqual(getCompletions("clear test/stage1 "), null);
 });
 
-test("Completion: 模型值补全、D3 描述与当前生效 ✓ 标注", async () => {
+test(" Completion: 模型值补全、D3 描述与当前生效 ✓ 标注", async () => {
 	const harness = createMockHarness();
 	await harness.handlers["session_start"]({ reason: "start" }, harness.ctx);
 	await harness.commands["classifier-model"].handler("clear", harness.ctx);
@@ -556,7 +556,7 @@ test("Completion: 模型值补全、D3 描述与当前生效 ✓ 标注", async 
 	assert.strictEqual(filtered[0].label, "test/stage2");
 });
 
-test("Completion: 成对后的后续 flag 补全（SET_FLAG）与互斥剪枝", async () => {
+test(" Completion: 成对后的后续 flag 补全（SET_FLAG）与互斥剪枝", async () => {
 	const harness = createMockHarness();
 	await harness.handlers["session_start"]({ reason: "start" }, harness.ctx);
 	const getCompletions = harness.commands["classifier-model"].getArgumentCompletions;
@@ -577,7 +577,7 @@ test("Completion: 成对后的后续 flag 补全（SET_FLAG）与互斥剪枝", 
 	assert.strictEqual(getCompletions("--both test/stage1 "), null);
 });
 
-test("E2E: 运行时闭包即时生效与裸 ID 匹配支持", async () => {
+test(" E2E: 运行时闭包即时生效与裸 ID 匹配支持", async () => {
 	const harness = createMockHarness();
 	await harness.handlers["session_start"]({ reason: "start" }, harness.ctx);
 	await harness.commands["classifier-model"].handler("clear", harness.ctx);
@@ -600,7 +600,7 @@ test("E2E: 运行时闭包即时生效与裸 ID 匹配支持", async () => {
 	assert.match(last.message, /Stage 2: 配置值 test\/stage1 → 生效值 test\/stage1/);
 });
 
-test("Completion: 边缘 Case（连续空格、--both 补全、非法输入、空库）", async () => {
+test(" Completion: 边缘 Case（连续空格、--both 补全、非法输入、空库）", async () => {
 	const harness = createMockHarness();
 	await harness.handlers["session_start"]({ reason: "start" }, harness.ctx);
 	const getCompletions = harness.commands["classifier-model"].getArgumentCompletions;

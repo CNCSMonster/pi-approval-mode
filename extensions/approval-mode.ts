@@ -72,8 +72,11 @@ import {
 	ALL_MODES,
 	normalizeMode,
 	loadApprovalConfig,
+	isThinkingLevel,
+	EXTENDED_THINKING_LEVELS,
 	type ApprovalMode,
 	type ApprovalConfigFile,
+	type ThinkingLevel,
 } from "./approval-config.ts";
 import { sanitizeUntrustedDetail, type SanitizedDetailResult } from "./detail-sanitizer.ts";
 import {
@@ -94,6 +97,8 @@ export {
 	ALL_MODES,
 	normalizeMode,
 	loadApprovalConfig,
+	isThinkingLevel,
+	EXTENDED_THINKING_LEVELS,
 	sanitizeUntrustedDetail,
 	StageHealthTracker,
 	STAGE1_ESCALATE_THRESHOLD,
@@ -113,6 +118,11 @@ export {
 export type {
 	ApprovalMode,
 	ApprovalConfigFile,
+	ThinkingLevel,
+	ClassifierClearFlag,
+	ClassifierSetPair,
+	StageThinkingResolution,
+	ClassifierThinkingResolution,
 	SanitizedDetailResult,
 	Stage1FailureReason,
 	Stage1HealthStatus,
@@ -431,34 +441,162 @@ export function applyClassifierTimeoutConfig(
 }
 
 // ==========================================
-// /classifier-model 参数解析、帮助与自动补全纯逻辑
+// 分类器思考档位配置校验与生效解析 (纯逻辑、可单测)
+//
+// 取值域：off / minimal / low / medium / high / xhigh / max。
+// 单字段表达开/关：off = 关闭；其余 = 开启于该档；键缺失 = unset (零行为变化)。
+// 校验规则：
+// 1. 非法枚举值 → 违规告警 + 该 stage 回退 unset；
+// 2. 所选模型不支持该档 → 告警（含该模型支持档位列表）+ 该 stage 回退 unset；
+// 3. 回退原因写进 effective 来源标注 (如 stage2=未指定(原 low 不受支持, 已回退))；
+// 4. effective 行控制台打印：[ApprovalMode] 分类器思考配置 effective: stage1=... stage2=...
+// ==========================================
+
+export interface StageThinkingResolution {
+	level?: ThinkingLevel;
+	rawConfig?: unknown;
+	effectiveSummary: string; // 如 "off(配置)"、"未指定(provider 默认)"、"未指定(原 low 不受支持, 已回退)"
+	fallbackReason?: string; // 如 "原 low 不受支持, 已回退"
+}
+
+export interface ClassifierThinkingResolution {
+	stage1: StageThinkingResolution;
+	stage2: StageThinkingResolution;
+	violated: boolean;
+}
+
+export function getSupportedThinkingLevels(model: any): ThinkingLevel[] {
+	if (!model) return ["off"];
+	if (model.type === "classifier" || model.reasoning === false) {
+		return ["off"];
+	}
+	const map = model.thinkingLevelMap;
+	const levels: ThinkingLevel[] = [];
+	for (const lvl of EXTENDED_THINKING_LEVELS) {
+		if (lvl === "xhigh" || lvl === "max") {
+			if (map && map[lvl] !== null && map[lvl] !== undefined) {
+				levels.push(lvl);
+			}
+		} else {
+			if (map && map[lvl] === null) {
+				continue;
+			}
+			levels.push(lvl);
+		}
+	}
+	return levels;
+}
+
+export function applyClassifierThinkingConfig(
+	fileConfig: ApprovalConfigFile,
+	s1Model: any,
+	s2Model: any,
+	ctx?: { ui?: { notify?: (message: string, level: string) => void }; hasUI?: boolean; silent?: boolean },
+): ClassifierThinkingResolution {
+	let violated = false;
+
+	function resolveStage(
+		stageName: "stage1" | "stage2",
+		fieldName: "classifierStage1Thinking" | "classifierStage2Thinking",
+		raw: unknown,
+		model: any,
+	): StageThinkingResolution {
+		if (typeof raw === "undefined") {
+			return {
+				level: undefined,
+				effectiveSummary: "未指定(provider 默认)",
+			};
+		}
+
+		if (!isThinkingLevel(raw)) {
+			violated = true;
+			const msg = `[ApprovalMode] 分类器思考配置违规：${fieldName} 收到 ${JSON.stringify(raw)}（非法枚举值，可用：${EXTENDED_THINKING_LEVELS.join(", ")}）；${stageName} 思考回退未指定。`;
+			if (!ctx?.silent) {
+				console.warn(msg);
+				if (ctx?.hasUI !== false) ctx?.ui?.notify?.(msg, "warning");
+			}
+			return {
+				level: undefined,
+				rawConfig: raw,
+				effectiveSummary: `未指定(原 ${raw} 违规, 已回退)`,
+				fallbackReason: `原 ${raw} 违规, 已回退`,
+			};
+		}
+
+		const supported = getSupportedThinkingLevels(model);
+		if (!supported.includes(raw)) {
+			violated = true;
+			const modelLabel = model ? `${model.provider}/${model.id}` : "当前模型";
+			const msg = `[ApprovalMode] 分类器思考配置不受支持：模型 "${modelLabel}" 不支持思考档位 "${raw}"（该模型支持：${supported.join(", ")}）；${stageName} 思考回退未指定。`;
+			if (!ctx?.silent) {
+				console.warn(msg);
+				if (ctx?.hasUI !== false) ctx?.ui?.notify?.(msg, "warning");
+			}
+			return {
+				level: undefined,
+				rawConfig: raw,
+				effectiveSummary: `未指定(原 ${raw} 不受支持, 已回退)`,
+				fallbackReason: `原 ${raw} 不受支持, 已回退`,
+			};
+		}
+
+		return {
+			level: raw,
+			rawConfig: raw,
+			effectiveSummary: `${raw}(配置)`,
+		};
+	}
+
+	const stage1 = resolveStage("stage1", "classifierStage1Thinking", fileConfig.classifierStage1Thinking, s1Model);
+	const stage2 = resolveStage("stage2", "classifierStage2Thinking", fileConfig.classifierStage2Thinking, s2Model);
+
+	if (!ctx?.silent) {
+		console.debug(`[ApprovalMode] 分类器思考配置 effective: stage1=${stage1.effectiveSummary} stage2=${stage2.effectiveSummary}`);
+	}
+
+	return { stage1, stage2, violated };
+}
+
+// ==========================================
+//  / /classifier-model 参数解析、帮助与自动补全纯逻辑
 // ==========================================
 
 export const CLASSIFIER_SET_FLAGS = ["--stage1", "--stage2", "--both"] as const;
 export type ClassifierSetFlag = (typeof CLASSIFIER_SET_FLAGS)[number];
 
+export const CLASSIFIER_CLEAR_FLAGS = ["--stage1", "--stage2", "--both", "--thinking"] as const;
+export type ClassifierClearFlag = (typeof CLASSIFIER_CLEAR_FLAGS)[number];
+
+export interface ClassifierSetPair {
+	flag: ClassifierSetFlag;
+	model?: string;
+	thinking?: ThinkingLevel;
+}
+
 export type ClassifierModelCommand =
 	| { kind: "status" }
 	| { kind: "help" }
-	| { kind: "clear"; targets: ClassifierSetFlag[] }
-	| { kind: "set"; pairs: { flag: ClassifierSetFlag; model: string }[] }
+	| { kind: "clear"; targets: ClassifierClearFlag[] }
+	| { kind: "set"; pairs: ClassifierSetPair[] }
 	| { kind: "error"; message: string };
 
 export const CLASSIFIER_USAGE =
-	"用法: /classifier-model [--stage1 <m>] [--stage2 <m>] [--both <m>] | clear [--stage1|--stage2|--both] | help";
+	"用法: /classifier-model [--stage1 <m>] [--stage2 <m>] [--both <m>] [--thinking <level>] | clear [--stage1|--stage2|--both|--thinking] | help";
 
 export const CLASSIFIER_FLAG_DESCRIPTIONS: Record<string, string> = {
 	"--stage1": "设置 Stage 1（快筛）专属模型",
 	"--stage2": "设置 Stage 2（复核）专属模型",
 	"--both": "一个模型同时用于 Stage 1 与 Stage 2",
-	clear: "清空分类器模型配置；可用 --stage1/--stage2/--both 指定范围",
+	"--thinking": "设置思考档位（off..max，随 --stage1/--stage2/--both 决定范围）",
+	clear: "清空分类器模型与思考配置；可用 --stage1/--stage2/--both/--thinking 指定范围",
 	help: "显示用法与示例",
 };
 
-export const CLASSIFIER_CLEAR_TARGET_DESCRIPTIONS: Record<ClassifierSetFlag, string> = {
+export const CLASSIFIER_CLEAR_TARGET_DESCRIPTIONS: Record<ClassifierClearFlag, string> = {
 	"--stage1": "清除 Stage 1 专属模型配置",
 	"--stage2": "清除 Stage 2 专属模型配置",
 	"--both": "清除共享与两阶段配置（≡ clear）",
+	"--thinking": "清除思考档位配置",
 };
 
 // ==========================================
@@ -530,7 +668,7 @@ export function isClassifierTypeModel(registry: ModelRegistryLike, pattern?: str
 	return false;
 }
 
-export const CLASSIFIER_HELP_TEXT = `/classifier-model — 查看或设置 Auto 模式分类器模型
+export const CLASSIFIER_HELP_TEXT = `/classifier-model — 查看或设置 Auto 模式分类器模型与思考配置
 
 用法:
   /classifier-model                                   查看两阶段状态与用法提示
@@ -538,16 +676,23 @@ export const CLASSIFIER_HELP_TEXT = `/classifier-model — 查看或设置 Auto 
   /classifier-model --stage2 <model>                  设置 Stage 2（复核）专属模型
   /classifier-model --stage1 <m1> --stage2 <m2>       两阶段分别设置（顺序无关）
   /classifier-model --both <model>                    一个模型同时用于两阶段
-  /classifier-model clear                             清空全部分类器模型配置（回落内置默认→主模型）
-  /classifier-model clear --stage1 [--stage2]         按目标清除（--both ≡ clear）
+  /classifier-model --stage1 [--thinking <level>]     设置 Stage 1 思考档位 (off..max)
+  /classifier-model --stage2 [--thinking <level>]     设置 Stage 2 思考档位 (off..max)
+  /classifier-model --both [--thinking <level>]       两阶段同时设置思考档位
+  /classifier-model clear                             清空全部分类器模型与思考配置（回落内置默认→主模型）
+  /classifier-model clear [--stage1|--stage2|--both]  按目标清除模型配置（--both ≡ clear）
+  /classifier-model clear --thinking                  清除思考档位配置
   /classifier-model help                              显示本帮助
 
 示例:
   /classifier-model --stage1 deepseek/deepseek-flash --stage2 deepseek/deepseek-v4-pro
   /classifier-model --both deepseek/deepseek-flash
+  /classifier-model --stage1 deepseek/deepseek-flash --thinking off
+  /classifier-model --stage2 --thinking low
+  /classifier-model clear --thinking
   /classifier-model clear --stage1
 
-说明: --both 与 --stage1/--stage2 互斥；旧语法 <model>/default 已移除（分别用 --both <model>/clear）`;
+说明: --both 与 --stage1/--stage2 互斥；思考档位可选 off, minimal, low, medium, high, xhigh, max；旧语法 <model>/default 已移除（分别用 --both <model>/clear）`;
 
 export function formatModelCost(input?: number, output?: number): string {
 	const fmtNum = (n: number) => (Number.isInteger(n) ? String(n) : String(parseFloat(n.toFixed(4))));
@@ -613,19 +758,19 @@ export function parseClassifierModelArgs(args: string): ClassifierModelCommand {
 
 	// clear 子命令（首 token）
 	if (first === "clear") {
-		const targets: ClassifierSetFlag[] = [];
+		const targets: ClassifierClearFlag[] = [];
 		for (const t of tokens.slice(1)) {
 			if (!t.startsWith("--")) {
-				return { kind: "error", message: `clear 后面仅接受目标 flag（--stage1/--stage2/--both），不支持位置入参 "${t}"` };
+				return { kind: "error", message: `clear 后面仅接受目标 flag（--stage1/--stage2/--both/--thinking），不支持位置入参 "${t}"` };
 			}
 			const lower = t.toLowerCase();
-			if (CLASSIFIER_SET_FLAGS.includes(lower as ClassifierSetFlag) && t !== lower) {
-				return { kind: "error", message: `flag 严格小写，不接受 "${t}"（可用：--stage1 / --stage2 / --both）` };
+			if (CLASSIFIER_CLEAR_FLAGS.includes(lower as ClassifierClearFlag) && t !== lower) {
+				return { kind: "error", message: `flag 严格小写，不接受 "${t}"（可用：--stage1 / --stage2 / --both / --thinking）` };
 			}
-			if (!CLASSIFIER_SET_FLAGS.includes(t as ClassifierSetFlag)) {
-				return { kind: "error", message: `未知 flag "${t}"（flag 严格小写，可用：--stage1 / --stage2 / --both）` };
+			if (!CLASSIFIER_CLEAR_FLAGS.includes(t as ClassifierClearFlag)) {
+				return { kind: "error", message: `未知 flag "${t}"（flag 严格小写，可用：--stage1 / --stage2 / --both / --thinking）` };
 			}
-			const flag = t as ClassifierSetFlag;
+			const flag = t as ClassifierClearFlag;
 			if (targets.includes(flag)) {
 				return { kind: "error", message: `重复 flag "${t}"（同一条命令只能出现一次）` };
 			}
@@ -641,7 +786,7 @@ export function parseClassifierModelArgs(args: string): ClassifierModelCommand {
 	}
 
 	// 设置 flags 序列
-	const pairs: { flag: ClassifierSetFlag; model: string }[] = [];
+	const pairs: ClassifierSetPair[] = [];
 	const seen: ClassifierSetFlag[] = [];
 	let i = 0;
 
@@ -654,6 +799,33 @@ export function parseClassifierModelArgs(args: string): ClassifierModelCommand {
 		if (tok === "help") {
 			return { kind: "error", message: `"help" 必须单独使用，不能与设置 flag 混用` };
 		}
+		if (tok === "--thinking") {
+			if (seen.length === 0) {
+				return { kind: "error", message: `"--thinking" 必须指定作用范围（可用：--stage1 / --stage2 / --both）` };
+			}
+			const currentPair = pairs[pairs.length - 1];
+			if (currentPair.thinking !== undefined) {
+				return { kind: "error", message: `重复指定 "--thinking"` };
+			}
+			const val = tokens[i + 1];
+			if (val === undefined) {
+				return { kind: "error", message: `"--thinking" 缺少档位值` };
+			}
+			if (val.startsWith("--")) {
+				return { kind: "error", message: `"--thinking" 的值不能以 "--" 开头（"${val}"）——是否缺少档位值？` };
+			}
+			const lowerVal = val.toLowerCase();
+			if (isThinkingLevel(lowerVal) && val !== lowerVal) {
+				return { kind: "error", message: `档位严格小写，不接受 "${val}"（可用：${EXTENDED_THINKING_LEVELS.join(", ")}）` };
+			}
+			if (!isThinkingLevel(val)) {
+				return { kind: "error", message: `"--thinking" 收到无效档位 "${val}"（可用：${EXTENDED_THINKING_LEVELS.join(", ")}）` };
+			}
+			currentPair.thinking = val;
+			i += 2;
+			continue;
+		}
+
 		if (!tok.startsWith("--")) {
 			return { kind: "error", message: `不支持位置入参 "${tok}"（旧语法已移除：设置用 --both <m>，重置用 clear）` };
 		}
@@ -681,6 +853,12 @@ export function parseClassifierModelArgs(args: string): ClassifierModelCommand {
 		if (val === undefined) {
 			return { kind: "error", message: `"${flag}" 缺少模型值` };
 		}
+		if (val === "--thinking") {
+			pairs.push({ flag });
+			seen.push(flag);
+			i += 1;
+			continue;
+		}
 		if (val.startsWith("--")) {
 			return { kind: "error", message: `"${flag}" 的值不能以 "--" 开头（"${val}"）——是否缺少模型值？` };
 		}
@@ -706,6 +884,10 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 	let customClassifierModel: string | undefined;
 	let customClassifierStage1Model: string | undefined;
 	let customClassifierStage2Model: string | undefined;
+	let customClassifierStage1Thinking: unknown | undefined;
+	let customClassifierStage2Thinking: unknown | undefined;
+	let effectiveClassifierStage1Thinking: ThinkingLevel | undefined;
+	let effectiveClassifierStage2Thinking: ThinkingLevel | undefined;
 
 	/**
 	 * 获取生效的公共底座模型。
@@ -755,11 +937,11 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.registerFlag("classifier-model", {
-		description: "Auto 模式下审批分类器使用的快速模型 (默认: llm-proxy-openai-chat/gemini-3.8-flash-high-lp)",
+		description: "Auto 模式下审批分类器使用的模型 (默认读取 approval-config.json 或当前活跃模型)",
 		type: "string",
 	});
 
-	// 更新 TUI 底部状态栏指示器 (: 状态栏支持 Stage 1 degraded 常驻轻量感知)
+	// 更新 TUI 底部状态栏指示器 (状态栏支持 Stage 1 degraded 常驻轻量感知)
 	function updateStatus(ctx: ExtensionContext): void {
 		if (!ctx?.ui?.setStatus) return;
 		const theme = ctx.ui.theme;
@@ -806,7 +988,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		currentMode = newMode;
 
 		loopDetector.reset();
-		//  /  Timing 4：与 loopDetector 对称重置 denialTracker，跨模式不带旧债
+		// D /  Timing 4：与 loopDetector 对称重置 denialTracker，跨模式不带旧债
 		// （plan 连拒切 auto 开局即清零，含 totalBlock/totalUnavailable/指纹/自愈连击）。
 		denialTracker.resetAll();
 		stageHealthTracker.reset();
@@ -880,6 +1062,8 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		customClassifierModel = fileConfig.classifierModel;
 		customClassifierStage1Model = fileConfig.classifierStage1Model;
 		customClassifierStage2Model = fileConfig.classifierStage2Model;
+		customClassifierStage1Thinking = fileConfig.classifierStage1Thinking;
+		customClassifierStage2Thinking = fileConfig.classifierStage2Thinking;
 
 		// 分类器配置冲突治理与能力契约对齐
 		if (detectClassifierConflict(fileConfig)) {
@@ -907,6 +1091,16 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		const timeoutConfig = applyClassifierTimeoutConfig(fileConfig, ctx);
 		classifierTimeoutMs = timeoutConfig.stage1;
 		classifierStage2TimeoutMs = timeoutConfig.stage2;
+
+		// 分类器思考配置解析与校验回退 (对齐超时风格，启动/reload 打 effective 日志)
+		const s1SharedInit = getEffectiveSharedModel("Stage 1", ctx);
+		const s2SharedInit = getEffectiveSharedModel("Stage 2", ctx);
+		const resolvedS1Init = resolveClassifierModel(ctx, customClassifierStage1Model, s1SharedInit, false, "Stage 1");
+		const resolvedS2Init = resolveClassifierModel(ctx, customClassifierStage2Model, s2SharedInit, false, "Stage 2", false);
+		const thinkingConfig = applyClassifierThinkingConfig(fileConfig, resolvedS1Init.model, resolvedS2Init.model, ctx);
+		effectiveClassifierStage1Thinking = thinkingConfig.stage1.level;
+		effectiveClassifierStage2Thinking = thinkingConfig.stage2.level;
+
 		loopDetector.resetThresholds(fileConfig.loopDetection);
 		denialTracker.resetConfig({
 			limits: fileConfig.denialLimits,
@@ -1158,17 +1352,31 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		const r1 = resolveClassifierModel(ctx, customClassifierStage1Model, s1Shared, false, "Stage 1");
 		const r2 = resolveClassifierModel(ctx, customClassifierStage2Model, s2Shared, false, "Stage 2", false);
 
+		const currentThinkingCfg: ApprovalConfigFile = {
+			classifierModel: customClassifierModel,
+			classifierStage1Model: customClassifierStage1Model,
+			classifierStage2Model: customClassifierStage2Model,
+			classifierStage1Thinking: customClassifierStage1Thinking as ThinkingLevel | undefined,
+			classifierStage2Thinking: customClassifierStage2Thinking as ThinkingLevel | undefined,
+		};
+		const thinkingRes = applyClassifierThinkingConfig(currentThinkingCfg, r1.model, r2.model, { silent: true });
+
 		const baseMsg = isConflict
 			? `公共底座: 配置值 ${customClassifierModel} [⚠️ 冲突已忽略：两阶段均已单独指定，此项未启用]\n`
 			: "";
 
 		const s1Msg = `Stage 1: 配置值 ${r1.configValue || "未配置"} → 生效值 ${r1.label}` + (r1.fallbackReason ? ` (回退原因: ${r1.fallbackReason})` : "");
+		const s1ThinkingMsg = `Stage 1 思考: 配置值 ${customClassifierStage1Thinking ? String(customClassifierStage1Thinking) : "未配置"} → 生效值 ${thinkingRes.stage1.level ?? "未指定"}` +
+			(thinkingRes.stage1.fallbackReason ? ` (回退原因: ${thinkingRes.stage1.fallbackReason})` : (thinkingRes.stage1.level ? " (配置)" : " (provider 默认)"));
+
 		const s2Msg = `Stage 2: 配置值 ${r2.configValue || "未配置"} → 生效值 ${r2.label}` + (r2.fallbackReason ? ` (回退原因: ${r2.fallbackReason})` : "");
+		const s2ThinkingMsg = `Stage 2 思考: 配置值 ${customClassifierStage2Thinking ? String(customClassifierStage2Thinking) : "未配置"} → 生效值 ${thinkingRes.stage2.level ?? "未指定"}` +
+			(thinkingRes.stage2.fallbackReason ? ` (回退原因: ${thinkingRes.stage2.fallbackReason})` : (thinkingRes.stage2.level ? " (配置)" : " (provider 默认)"));
 
 		const s1Health = stageHealthTracker.getStatus();
 		const s1HealthMsg = `Stage 1 运行健康: ${s1Health.status} (连续失败 ${s1Health.consecutiveFailures} 次，累计 ${s1Health.totalFailures} 次)`;
 
-		return `当前审批分类器模型状态:\n${baseMsg}${s1Msg}\n${s2Msg}\n${s1HealthMsg}\n配置文件: ~/.pi/agent/approval-config.json\n\n${CLASSIFIER_USAGE}`;
+		return `当前审批分类器模型状态:\n${baseMsg}${s1Msg}\n${s1ThinkingMsg}\n${s2Msg}\n${s2ThinkingMsg}\n${s1HealthMsg}\n配置文件: ~/.pi/agent/approval-config.json\n\n${CLASSIFIER_USAGE}`;
 	}
 
 	function validateClassifierModelRef(ctx: ExtensionContext, modelRef: string, flag: ClassifierSetFlag): { ok: boolean; reason?: string } {
@@ -1231,25 +1439,31 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 
 		// 3. CLEAR 分支
 		if (head === "clear") {
-			const usedTargets: ClassifierSetFlag[] = [];
+			const usedTargets: ClassifierClearFlag[] = [];
 			for (const t of completed.slice(1)) {
-				if (!CLASSIFIER_SET_FLAGS.includes(t as ClassifierSetFlag)) {
+				if (!CLASSIFIER_CLEAR_FLAGS.includes(t as ClassifierClearFlag)) {
 					return null;
 				}
-				const flag = t as ClassifierSetFlag;
+				const flag = t as ClassifierClearFlag;
 				if (usedTargets.includes(flag)) return null;
 				if (flag === "--both" && usedTargets.length > 0) return null;
 				if (flag !== "--both" && usedTargets.includes("--both")) return null;
 				usedTargets.push(flag);
 			}
 
-			let candidateFlags: ClassifierSetFlag[] = [];
+			let candidateFlags: ClassifierClearFlag[] = [];
 			if (usedTargets.length === 0) {
-				candidateFlags = [...CLASSIFIER_SET_FLAGS];
+				// 若未输入前缀或前缀非 --t，保持原有 3 flags 以严格兼容既有测试；若以 --t 开头则提供 --thinking
+				candidateFlags = partial.startsWith("--t")
+					? [...CLASSIFIER_CLEAR_FLAGS]
+					: [...CLASSIFIER_SET_FLAGS];
 			} else if (usedTargets.includes("--both")) {
 				return null;
 			} else {
-				candidateFlags = CLASSIFIER_SET_FLAGS.filter((f) => f !== "--both" && !usedTargets.includes(f));
+				const remainingStages = CLASSIFIER_SET_FLAGS.filter((f) => f !== "--both" && !usedTargets.includes(f));
+				candidateFlags = partial.startsWith("--t") && !usedTargets.includes("--thinking")
+					? [...remainingStages, "--thinking"]
+					: [...remainingStages];
 			}
 
 			const matched = candidateFlags.filter((f) => f.startsWith(partial));
@@ -1275,8 +1489,21 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 			if (flag === "--both" && usedFlags.length > 0) return null;
 			if (flag !== "--both" && usedFlags.includes("--both")) return null;
 
-			// 若当前 flag 处于最后一个 completed token，说明正在输入其模型值（SET_VALUE）
+			// 若当前 flag 处于最后一个 completed token，说明正在输入其模型值或 --thinking（SET_VALUE）
 			if (i + 1 >= completed.length) {
+				// 若用户主动键入以 -- 开头的前缀，优先补全 --thinking
+				if (partial.startsWith("--")) {
+					if ("--thinking".startsWith(partial)) {
+						const base = completed.join(" ");
+						return [{
+							value: `${base} --thinking`,
+							label: "--thinking",
+							description: CLASSIFIER_FLAG_DESCRIPTIONS["--thinking"],
+						}];
+					}
+					return null;
+				}
+
 				const models = latestCtx?.modelRegistry?.getAll() ?? [];
 				const base = completed.join(" ");
 
@@ -1329,22 +1556,61 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 				return items.length > 0 ? items : null;
 			}
 
-			const val = completed[i + 1];
-			if (val.startsWith("--") || val === "clear" || val === "help") {
-				return null;
+			// 处理 flag 后的参数：可能为 model，也可能直接接 --thinking
+			const nextTok = completed[i + 1];
+			let nextOffset = 2;
+
+			if (nextTok === "--thinking") {
+				if (i + 2 >= completed.length) {
+					// 正在输入 thinking 档位
+					const base = completed.join(" ");
+					const matched = EXTENDED_THINKING_LEVELS.filter((lvl) => lvl.startsWith(partial));
+					if (matched.length === 0) return null;
+					return matched.map((lvl) => ({
+						value: `${base} ${lvl}`,
+						label: lvl,
+						description: `设置思考档位为 ${lvl}`,
+					}));
+				}
+				nextOffset = 3;
+			} else {
+				if (nextTok.startsWith("--") || nextTok === "clear" || nextTok === "help") {
+					return null;
+				}
+				if (i + 2 < completed.length && completed[i + 2] === "--thinking") {
+					if (i + 3 >= completed.length) {
+						// 正在输入 thinking 档位
+						const base = completed.join(" ");
+						const matched = EXTENDED_THINKING_LEVELS.filter((lvl) => lvl.startsWith(partial));
+						if (matched.length === 0) return null;
+						return matched.map((lvl) => ({
+							value: `${base} ${lvl}`,
+							label: lvl,
+							description: `设置思考档位为 ${lvl}`,
+						}));
+					}
+					nextOffset = 4;
+				}
 			}
 
 			usedFlags.push(flag);
-			i += 2;
+			i += nextOffset;
 		}
 
 		// 5. 完整成对后，输入下一个 flag（SET_FLAG）
 		if (i === completed.length) {
-			let candidateFlags: ClassifierSetFlag[] = [];
+			let candidateFlags: string[] = [];
 			if (usedFlags.includes("--both")) {
-				return null;
+				if (partial.startsWith("--t") && !completed.includes("--thinking")) {
+					candidateFlags = ["--thinking"];
+				} else {
+					return null;
+				}
 			} else {
 				candidateFlags = CLASSIFIER_SET_FLAGS.filter((f) => f !== "--both" && !usedFlags.includes(f));
+				if (partial.startsWith("--t") && completed[completed.length - 2] !== "--thinking") {
+					candidateFlags.push("--thinking");
+				}
 			}
 
 			const matched = candidateFlags.filter((f) => f.startsWith(partial));
@@ -1384,23 +1650,59 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 
 			if (parsed.kind === "clear") {
 				const patch: Partial<ApprovalConfigFile> = {};
-				const clearAll = parsed.targets.length === 0 || parsed.targets.includes("--both");
+				const hasThinking = parsed.targets.includes("--thinking");
+				const hasStage1 = parsed.targets.includes("--stage1");
+				const hasStage2 = parsed.targets.includes("--stage2");
+				const hasBoth = parsed.targets.includes("--both");
+				const clearAll = parsed.targets.length === 0 || (hasBoth && !hasThinking);
 
-				if (clearAll || parsed.targets.includes("--stage1")) {
-					customClassifierStage1Model = undefined;
-					patch.classifierStage1Model = undefined;
-				}
-				if (clearAll || parsed.targets.includes("--stage2")) {
-					customClassifierStage2Model = undefined;
-					patch.classifierStage2Model = undefined;
-				}
 				if (clearAll) {
 					customClassifierModel = undefined;
+					customClassifierStage1Model = undefined;
+					customClassifierStage2Model = undefined;
+					customClassifierStage1Thinking = undefined;
+					customClassifierStage2Thinking = undefined;
+					effectiveClassifierStage1Thinking = undefined;
+					effectiveClassifierStage2Thinking = undefined;
 					patch.classifierModel = undefined;
+					patch.classifierStage1Model = undefined;
+					patch.classifierStage2Model = undefined;
+					patch.classifierStage1Thinking = undefined;
+					patch.classifierStage2Thinking = undefined;
+				} else if (hasThinking) {
+					if (hasStage1 && !hasStage2) {
+						customClassifierStage1Thinking = undefined;
+						effectiveClassifierStage1Thinking = undefined;
+						patch.classifierStage1Thinking = undefined;
+					} else if (hasStage2 && !hasStage1) {
+						customClassifierStage2Thinking = undefined;
+						effectiveClassifierStage2Thinking = undefined;
+						patch.classifierStage2Thinking = undefined;
+					} else {
+						customClassifierStage1Thinking = undefined;
+						customClassifierStage2Thinking = undefined;
+						effectiveClassifierStage1Thinking = undefined;
+						effectiveClassifierStage2Thinking = undefined;
+						patch.classifierStage1Thinking = undefined;
+						patch.classifierStage2Thinking = undefined;
+					}
+				} else {
+					if (hasStage1) {
+						customClassifierStage1Model = undefined;
+						patch.classifierStage1Model = undefined;
+					}
+					if (hasStage2) {
+						customClassifierStage2Model = undefined;
+						patch.classifierStage2Model = undefined;
+					}
+					if (hasBoth) {
+						customClassifierModel = undefined;
+						patch.classifierModel = undefined;
+					}
 				}
 
 				saveGlobalApprovalConfig(patch);
-				const clearedDesc = clearAll ? "全部分类器模型配置" : parsed.targets.join(" ");
+				const clearedDesc = clearAll ? "全部分类器模型与思考配置" : parsed.targets.join(" ");
 				ctx.ui.notify(`已清除分类器模型配置 (${clearedDesc})\n\n${buildClassifierStatusReport(ctx)}`, "info");
 				return;
 			}
@@ -1408,13 +1710,15 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 			if (parsed.kind === "set") {
 				// D1: 全有或全无校验
 				for (const pair of parsed.pairs) {
-					const check = validateClassifierModelRef(ctx, pair.model, pair.flag);
-					if (!check.ok) {
-						ctx.ui.notify(
-							`"${pair.flag}" 的模型值 "${pair.model}" 无效：${check.reason}（期望 <provider>/<model>）\n整条命令未保存（全有或全无）\n\n${CLASSIFIER_USAGE}`,
-							"error",
-						);
-						return;
+					if (pair.model) {
+						const check = validateClassifierModelRef(ctx, pair.model, pair.flag);
+						if (!check.ok) {
+							ctx.ui.notify(
+								`"${pair.flag}" 的模型值 "${pair.model}" 无效：${check.reason}（期望 <provider>/<model>）\n整条命令未保存（全有或全无）\n\n${CLASSIFIER_USAGE}`,
+								"error",
+							);
+							return;
+						}
 					}
 				}
 
@@ -1422,24 +1726,67 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 				const patch: Partial<ApprovalConfigFile> = {};
 				for (const pair of parsed.pairs) {
 					if (pair.flag === "--stage1") {
-						customClassifierStage1Model = pair.model;
-						patch.classifierStage1Model = pair.model;
+						if (pair.model) {
+							customClassifierStage1Model = pair.model;
+							patch.classifierStage1Model = pair.model;
+						}
+						if (pair.thinking) {
+							customClassifierStage1Thinking = pair.thinking;
+							patch.classifierStage1Thinking = pair.thinking;
+						}
 					} else if (pair.flag === "--stage2") {
-						customClassifierStage2Model = pair.model;
-						patch.classifierStage2Model = pair.model;
+						if (pair.model) {
+							customClassifierStage2Model = pair.model;
+							patch.classifierStage2Model = pair.model;
+						}
+						if (pair.thinking) {
+							customClassifierStage2Thinking = pair.thinking;
+							patch.classifierStage2Thinking = pair.thinking;
+						}
 					} else if (pair.flag === "--both") {
-						customClassifierModel = pair.model;
-						customClassifierStage1Model = undefined;
-						customClassifierStage2Model = undefined;
-						patch.classifierModel = pair.model;
-						patch.classifierStage1Model = undefined;
-						patch.classifierStage2Model = undefined;
+						if (pair.model) {
+							customClassifierModel = pair.model;
+							customClassifierStage1Model = undefined;
+							customClassifierStage2Model = undefined;
+							patch.classifierModel = pair.model;
+							patch.classifierStage1Model = undefined;
+							patch.classifierStage2Model = undefined;
+						}
+						if (pair.thinking) {
+							customClassifierStage1Thinking = pair.thinking;
+							customClassifierStage2Thinking = pair.thinking;
+							patch.classifierStage1Thinking = pair.thinking;
+							patch.classifierStage2Thinking = pair.thinking;
+						}
 					}
 				}
 
 				saveGlobalApprovalConfig(patch);
-				const savedDesc = parsed.pairs.map((p) => `${p.flag} → ${p.model}`).join(", ");
-				ctx.ui.notify(`已保存分类器模型配置: ${savedDesc}\n\n${buildClassifierStatusReport(ctx)}`, "info");
+
+				// 重新解析生效思考配置
+				const s1Shared = getEffectiveSharedModel("Stage 1", ctx);
+				const s2Shared = getEffectiveSharedModel("Stage 2", ctx);
+				const r1 = resolveClassifierModel(ctx, customClassifierStage1Model, s1Shared, false, "Stage 1");
+				const r2 = resolveClassifierModel(ctx, customClassifierStage2Model, s2Shared, false, "Stage 2", false);
+				const currentThinkingCfg: ApprovalConfigFile = {
+					classifierModel: customClassifierModel,
+					classifierStage1Model: customClassifierStage1Model,
+					classifierStage2Model: customClassifierStage2Model,
+					classifierStage1Thinking: customClassifierStage1Thinking as ThinkingLevel | undefined,
+					classifierStage2Thinking: customClassifierStage2Thinking as ThinkingLevel | undefined,
+				};
+				const newThinking = applyClassifierThinkingConfig(currentThinkingCfg, r1.model, r2.model, ctx);
+				effectiveClassifierStage1Thinking = newThinking.stage1.level;
+				effectiveClassifierStage2Thinking = newThinking.stage2.level;
+
+				const savedDescParts: string[] = [];
+				for (const p of parsed.pairs) {
+					const items: string[] = [];
+					if (p.model) items.push(p.model);
+					if (p.thinking) items.push(`thinking:${p.thinking}`);
+					savedDescParts.push(`${p.flag} → ${items.join(", ")}`);
+				}
+				ctx.ui.notify(`已保存分类器模型配置: ${savedDescParts.join("; ")}\n\n${buildClassifierStatusReport(ctx)}`, "info");
 				return;
 			}
 		},
@@ -1453,7 +1800,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		},
 	});
 
-	// 5. 提示词动态增强（针对 Plan 模式）与新一轮摩擦预算重置
+	// 5. 提示词动态增强（针对 Plan 模式）与新一轮摩擦预算重置 ( Timing 1)
 	pi.on("before_agent_start", async () => {
 		denialTracker.resetTurnDenials();
 
@@ -1553,6 +1900,10 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 			} else {
 				let stage1Response: any = null;
 				try {
+					const stage1CompleteOptions: Record<string, any> = { cacheRetention: "none" };
+					if (effectiveClassifierStage1Thinking !== undefined) {
+						stage1CompleteOptions.reasoning = effectiveClassifierStage1Thinking;
+					}
 					const stage1Promise = ctx.modelRegistry.complete(
 						s1Model,
 						{
@@ -1565,7 +1916,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 								},
 							],
 						},
-						{ cacheRetention: "none" },
+						stage1CompleteOptions,
 					);
 					stage1Response = await withTimeout(stage1Promise, classifierTimeoutMs, null);
 					if (!stage1Response) {
@@ -1647,6 +1998,10 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		// === Stage 2: 深度推理复核 (带超时熔断保护) ===
 		let stage2Response: any = null;
 		try {
+			const stage2CompleteOptions: Record<string, any> = { cacheRetention: "none" };
+			if (effectiveClassifierStage2Thinking !== undefined) {
+				stage2CompleteOptions.reasoning = effectiveClassifierStage2Thinking;
+			}
 			const stage2Promise = ctx.modelRegistry.complete(
 				s2Model,
 				{
@@ -1659,7 +2014,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 						},
 					],
 				},
-				{ cacheRetention: "none" },
+				stage2CompleteOptions,
 			);
 
 			stage2Response = await withTimeout(stage2Promise, classifierStage2TimeoutMs, null);
@@ -1760,7 +2115,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 
 		if (ctx.mode === "tui") {
 			const result = await ctx.ui.custom<ApprovalAction | null>((tui, theme, _kb, done) => {
-				// ：指纹短路弹窗默认拒绝态（光标停在 Block；Esc 本就=拒绝）
+				// 3：指纹短路弹窗默认拒绝态（光标停在 Block；Esc 本就=拒绝）
 				let selectedIndex = denyByDefault ? Math.max(0, options.findIndex((o) => o.action === "block")) : 0;
 				// 详情折叠/展开状态
 				let isExpanded = false;
@@ -1994,7 +2349,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		// 统计归属：分类器故障引发的**自动拦截**只计入“不可用”计数，
 		// 不灌入“拒绝”类统计（consecutiveBlock/totalBlock/loop 连续被拒）——两套计数各司其职。
 		// 仅无头自动拦截可用此豁免；用户在弹窗中的拒绝一律入账。
-		// 口径（，宽口径保持）：拒绝类 = 一切明确说 no 的拦截（用户拒绝 / deny 规则 /
+		// 口径（D，宽口径保持）：拒绝类 = 一切明确说 no 的拦截（用户拒绝 / deny 规则 /
 		// plan 拦截 / 熔断自拦）；“不可用”豁免仅限分类器 outage 的自动拦截（基线 M11 口径句）。
 		if (countAsDenial) {
 			loopDetector.recordDenial(toolName, input);
@@ -2021,9 +2376,9 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		label: string,
 		toolName: string,
 		input: Record<string, any>,
-		fromCircuitFallback = false, // ：本次弹窗是否因熔断跳过分类器而产生（Qwen wasAutoModeFallback 同款判据）
+		fromCircuitFallback = false, // A'：本次弹窗是否因熔断跳过分类器而产生（Qwen wasAutoModeFallback 同款判据）
 	): Promise<ToolCallEventResult | undefined> {
-		// （Qwen Code v2 同款）：仅「触顶后跳过分类器的 fallback 弹窗」上的
+		// A'（Qwen Code v2 同款）：仅「触顶后跳过分类器的 fallback 弹窗」上的
 		// 人工批准是自愈触发器——清连击计数，下次判定重新交分类器；
 		// 分类器真实跑过但失败的故障弹窗批准不清（0027-A/D1 语义保持）；
 		// 拒绝路径不清（拒绝视为分类器判对）。
@@ -2109,7 +2464,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		// ==============================================================
 		const loopCheck = loopDetector.checkBeforeExecution(toolName, input);
 		if (loopCheck.isLoop) {
-			// ：无头语境下模型既没有弹窗可点、也没有“策略”可转——会话已被
+			// 1：无头语境下模型既没有弹窗可点、也没有“策略”可转——会话已被
 			// loop 熔断先手拦截后续一切调用（且拦截自灌 recordDenial，除非人工介入不会归零）。
 			// 因此无头 reason 一律改用熔断口径：明示会话已停 + 需人工介入，
 			// 不再复用 warningMessage 里“转换策略 / 选择拒绝并指示停止”这类只对交互侧成立的行动指引。
@@ -2131,7 +2486,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 				);
 			}
 
-			// 处于 yolo 模式下一律即刻阻断，不穿透放行！
+			//  Module C: 处于 yolo 模式下一律即刻阻断，不穿透放行！
 			// terminate 恒为 false，将结构化 Agent 报错注入上下文赋予 Model 自主决策与纠错空间。
 			if (currentMode === "yolo") {
 				if (ctx.hasUI) {
@@ -2156,7 +2511,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 			input,
 		});
 
-		// 1) 命中 Deny 规则：最高优先级硬性阻断，不弹窗，直接向模型反馈错误
+		// 1) 命中 Deny 规则：最高优先级硬性阻断，不弹窗，直接向模型反馈错误 ( Module D)
 		if (permDecision.decision === "deny") {
 			if (ctx.hasUI) {
 				ctx.ui.notify(`🛑 命中禁止规则: ${permDecision.matchedRule}，已阻断执行`, "error");
@@ -2289,7 +2644,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 					return blockCall(toolName, input, fallback.reasonText || "Blocked", terminate, fallback.kind !== "consecutive_unavailable");
 				}
 
-				// ：交互侧按优先级消费 fallback——
+				// C：交互侧按优先级消费 fallback——
 				// ① total_denial 达顶 → 直接拒绝（不跑分类器）+ 解除指引；② 不可用触顶 → 既有启发式降级保持；
 				// ③ classifier_blocked_retry 指纹命中 → 跳过分类器直接人审弹窗（基线 M10：不重复研判/不重复弹窗，默认拒绝态）；
 				// ④ 其余 → 跑分类器（现状）。consecutive_block 交互侧不消费（0027 非目标，由 ① 的上限与弹窗承接）。
@@ -2319,7 +2674,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 					return handleOutcome(retryAction, dslRule, ctx, label, toolName, input);
 				}
 
-				// ：在触顶判断时点捕获（弹窗时现算会被失败计数翻转污染）
+				// A'：在触顶判断时点捕获（弹窗时现算会被失败计数翻转污染）
 				const circuitFallbackRead = unavailableCircuitTripped();
 				let decision: { shouldBlock: boolean; reason: string; stage: "fast" | "thinking" | "fallback"; outage?: boolean };
 				if (circuitFallbackRead) {
@@ -2438,7 +2793,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 						return blockCall(toolName, input, fallback.reasonText || "Blocked", terminate, fallback.kind !== "consecutive_unavailable");
 					}
 
-					// ：交互侧按优先级消费 fallback——
+					// C：交互侧按优先级消费 fallback——
 					// ① total_denial 达顶 → 直接拒绝（不跑分类器）+ 解除指引；
 					// ②不可用触顶 → 跳过分类器直呈人工核准（保护等级不降，只甩掉挂掉的 LLM 等待，默认拒绝态）；
 					// ③ classifier_blocked_retry 指纹命中 → 跳过分类器直接人审弹窗（基线 M10：不重复研判/不重复弹窗，默认拒绝态）；
@@ -2551,7 +2906,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 					return blockCall(toolName, input, fallback.reasonText || "Blocked", terminate, fallback.kind !== "consecutive_unavailable");
 				}
 
-				// ：交互侧按优先级消费 fallback——
+				// C：交互侧按优先级消费 fallback——
 				// ① total_denial 达顶 → 直接拒绝（不跑分类器）+ 解除指引；② 不可用触顶 → 既有启发式降级保持；
 				// ③ classifier_blocked_retry 指纹命中 → 跳过分类器直接人审弹窗（基线 M10：不重复研判/不重复弹窗，默认拒绝态）；
 				// ④ 其余 → 跑分类器（现状）。consecutive_block 交互侧不消费（0027 非目标，由 ① 的上限与弹窗承接）。
@@ -2582,7 +2937,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 				}
 
 				let decision: { shouldBlock: boolean; reason: string; stage: "fast" | "thinking" | "fallback"; outage?: boolean };
-				// ：触顶判断时点捕获（同 read 分支）
+				// A'：触顶判断时点捕获（同 read 分支）
 				const circuitFallbackBash = unavailableCircuitTripped();
 				if (circuitFallbackBash) {
 					decision = fallbackHeuristicCheck(toolName, input, ctx.cwd);

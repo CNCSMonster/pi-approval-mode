@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import approvalModeExtension, { resolveClassifierModel } from "../extensions/approval-mode.ts";
 
-// 环境隔离：HOME 重定向，防本机真实用户规则/配置干扰钩子级断言（同白名单测试）
+// 环境隔离：HOME 重定向，防本机真实用户规则/配置干扰钩子级断言（同  测试）
 process.env.HOME = mkdtempSync(join(tmpdir(), "pi-issue-0017-home-"));
 
 test("resolveClassifierModel logic (① double default, ② single stage inheritance, ③ invalid fallback)", () => {
@@ -46,7 +46,7 @@ test("resolveClassifierModel logic (① double default, ② single stage inherit
 });
 
 // ④ 失败语义 + ⑤ 记数语义 + 会话内告警，经 tool_call 钩子端到端验证。
-// 设计要点：DenialTracker 阈值 consecutiveUnavailable=3（设计基线 M11；由 2 调齐），用例顺序刻意安排使每条断言
+// 设计要点：DenialTracker 阈值 consecutiveUnavailable=3（设计基线 M11； 由 2 调齐），用例顺序刻意安排使每条断言
 // 都能区分错误实现（详见各 case 注释）。
 test("failure and metrics semantics via extension hooks (④, ⑤, 会话内告警)", async () => {
 	const handlers: Record<string, any> = {};

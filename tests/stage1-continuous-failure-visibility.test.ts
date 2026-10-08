@@ -150,7 +150,7 @@ test("StageHealthTracker 连续 5 次阶梯升级判断与成功复位", () => {
 // 端到端测试: 状态栏常驻 [⚖️ auto | S1⚠️]、连续 5 次升级告警与绝不阻塞 Agent
 // =========================================================================
 
-test("Stage 1 异常时状态栏联动 [⚖️ auto | S1⚠️]，连续 5 次阶梯升级，且全程不阻塞 Agent", async () => {
+test(" e2e: Stage 1 异常时状态栏联动 [⚖️ auto | S1⚠️]，连续 5 次阶梯升级，且全程不阻塞 Agent", async () => {
 	let stage1Calls = 0;
 	let stage2Calls = 0;
 	let stage1SimulateFail = true;

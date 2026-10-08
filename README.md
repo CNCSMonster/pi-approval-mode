@@ -67,7 +67,7 @@ pi update
 | :--- | :--- | :--- |
 | **`manual`** | `[🛡️ manual]` | **Human review**. Edits, writes, and shell commands each require explicit approval. Read-only tools are auto-approved. |
 | **`auto-edit`** | `[📝 auto-edit]` | Auto-approves in-workspace file edits; protected paths, out-of-workspace edits, and shell commands require confirmation. |
-| **`auto`** | `[🤖 auto]` | **Classifier-driven** (the startup default). Rule fast paths + the Layer-1 workspace-edit exemption funnel into a 2-stage LLM classifier (the read-only auto-allow layer is retired — every rule-unmatched shell call, `ls` included, is classified). Safe operations proceed seamlessly; risky operations are reviewed. Broad allow rules that would defeat the classifier are temporarily stashed while in this mode. |
+| **`auto`** | `[⚖️ auto]` | **Classifier-driven** (the startup default). Rule fast paths + the Layer-1 workspace-edit exemption funnel into a 2-stage LLM classifier (the read-only auto-allow layer is retired — every rule-unmatched shell call, `ls` included, is classified). Safe operations proceed seamlessly; risky operations are reviewed; if Stage 1 is degraded, the badge stays at `[⚖️ auto \| S1⚠️]` while Stage 2 handles reviews. Broad allow rules that would defeat the classifier are temporarily stashed while in this mode. |
 | **`yolo`** | `[⚡ yolo]` | **Autonomous**. All tool calls execute without prompts (Pi core default). |
 | **`plan`** | `[📋 plan]` | **Read-only planning**. Disables `edit` and `write`; limits shell to read-only commands; injects planning instructions. |
 
@@ -84,11 +84,13 @@ Configure the approval mode, classifier model, timeout, and loop detection thres
 
 ```json
 {
-  "classifierModel": "llm-proxy-openai-chat/gemini-3.8-flash-high-lp",
-  "classifierStage1Model": "cheap-fast-model",
-  "classifierStage2Model": "strong-reasoning-model",
+  "classifierStage1Model": "deepseek/deepseek-flash",
+  "classifierStage2Model": "openrouter/anthropic/claude-haiku-5.5",
+  "classifierStage1Thinking": "low",
+  "classifierStage2Thinking": "low",
   "defaultMode": "auto",
   "classifierTimeoutMs": 1500,
+  "classifierStage2TimeoutMs": 4500,
   "loopDetection": {
     "identicalThreshold": 3,
     "denialThreshold": 3,
