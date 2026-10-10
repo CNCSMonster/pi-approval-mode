@@ -144,7 +144,7 @@ export class DenialTracker {
 			return {
 				shouldFallback: true,
 				kind: "total_denial",
-				// B：不向模型承诺 "unrelated safe work may continue"——无头语境下该承诺
+				// ：不向模型承诺 "unrelated safe work may continue"——无头语境下该承诺
 				// 被 loop 先手的会话级熔断否决；交互语境达顶同样直接拒绝（0027-C-1）。
 				// 文案只说实话并告知人如何解除（allow 规则 / 重启会话）。
 				reasonText: `Auto mode reached its session denial cap (${this.limits.maxTotalDenials}). Further flagged actions will be denied without classification. This cannot be cleared from the model side: a human must add an explicit allow rule (or restart the session) to resume flagged work.`,
@@ -159,7 +159,7 @@ export class DenialTracker {
 		// recordDenial + recordBlock 锁步灌入）、同阈值（默认 3），故第 4 次连拒
 		// 必然先命中 loop 的 consecutive_denials 熔断，本 kind 只在交互侧（loop
 		// 不拦截、弹窗继续）或阈值被配置分叉时才可达。
-		// 交互侧暂不消费本 kind（ 非目标，其计数由 total_denial 上限与弹窗承接）。
+		// 交互侧暂不消费本 kind。
 		if (this.consecutiveBlock >= this.limits.maxConsecutiveBlock) {
 			return {
 				shouldFallback: true,
@@ -211,7 +211,7 @@ export class DenialTracker {
 	}
 
 	/**
-	 * A' /  Timing 2:
+	 *  /  Timing 2:
 	 * 降级/熔断期间用户在人工弹窗上批准任意一次 → 清两类连击计数与动作指纹短路缓存 →
 	 * 下次判定重新交分类器；若分类器仍故障则再次失败重新计数（同一恢复曲线，
 	 * 无永久锁死）。拒绝路径不调用本方法（拒绝视为分类器判对，计数保持）。
@@ -251,7 +251,7 @@ export class DenialTracker {
 	/**
 	 * 记录分类器成功作出一次裁决 (不论 allow 还是 block，只要分类器成功响应即消除不可用计数)
 	 *
-	 * A：这是 recordAllow 之外唯一可重置 consecutiveUnavailable 的入口。
+	 * ：这是 recordAllow 之外唯一可重置 consecutiveUnavailable 的入口。
 	 */
 	public recordClassifierActive(): void {
 		this.consecutiveUnavailable = 0;
@@ -278,7 +278,7 @@ export class DenialTracker {
 }
 
 // ==============================================================
-// 2. 统一英文引导文案表 (Specification 规范)
+// 2. 统一英文引导文案表 
 // ==============================================================
 
 export const DENIAL_MESSAGES = {
@@ -293,6 +293,12 @@ export const DENIAL_MESSAGES = {
 
 	presetAskHeadless: (rule: string): string =>
 		`[Permission: ask] Rule ${rule} requires interactive confirmation, which is unavailable in non-interactive mode. Continue with unrelated safe work or report the blocker to the user.`,
+
+	readonlyModeToolDisabled: (tool: string): string =>
+		`Error: EROFS: read-only file system. The "${tool}" tool is disabled in Read-Only mode. Please provide your proposed changes or analysis in your response text instead.`,
+
+	readonlyModeCommandBlocked: (cmd: string, reason: string): string =>
+		`[Read-Only Mode] Command execution blocked by read-only policy: "${cmd}" (${reason}). Only safe exploration and inspection commands are permitted.`,
 
 	planModeToolDisabled: (tool: string): string =>
 		`Plan mode is read-only: the "${tool}" tool is disabled. Analyze and plan only; ask the user to switch modes to make changes.`,
@@ -359,7 +365,7 @@ export const DENIAL_MESSAGES = {
 };
 
 // ==============================================================
-// 3. 双通道 Agent 结构化报错文案生成器 (Specification / Module D)
+// 3. 双通道 Agent 结构化报错文案生成器 
 // ==============================================================
 
 export function formatDenyReasonForAgent(rule: string): string {

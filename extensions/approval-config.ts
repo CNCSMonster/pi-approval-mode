@@ -12,12 +12,12 @@ import type { DenialLimits } from "./denial-tracker.ts";
 // 审批模式词汇表与旧名别名（v0.3.0: default → manual）
 // ==========================================
 
-export type ApprovalMode = "manual" | "auto-edit" | "auto" | "yolo" | "plan";
+export type ApprovalMode = "manual" | "auto-edit" | "auto" | "yolo" | "readonly" | "plan";
 
-export const ALL_MODES: ApprovalMode[] = ["manual", "auto-edit", "auto", "yolo", "plan"];
+export const ALL_MODES: ApprovalMode[] = ["manual", "auto-edit", "auto", "yolo", "readonly"];
 
-/** 旧模式名别名：兼容既有配置、CLI 参数与历史会话状态。 */
-const MODE_ALIAS: Record<string, ApprovalMode> = { default: "manual" };
+/** 旧模式名别名：兼容既有配置、CLI 参数与历史会话状态（plan 归一化为 readonly，default 归一化为 manual）。 */
+const MODE_ALIAS: Record<string, ApprovalMode> = { default: "manual", plan: "readonly" };
 
 /** 规范化模式字符串：接受旧别名，返回合法模式或 undefined（非法值交由内置默认回退）。 */
 export function normalizeMode(value: unknown): ApprovalMode | undefined {
@@ -125,4 +125,74 @@ export function loadApprovalConfig(
 	}
 
 	return { config, projectConfigFound, projectConfigBlocked };
+}
+
+// ==========================================
+// 项目级自然语言审批策略加载 (.pi/approval-policy.md)
+// ==========================================
+
+export const PROJECT_POLICY_MAX_LENGTH = 3000;
+
+export interface LoadProjectApprovalPolicyResult {
+	policy: string | undefined;
+	policyFound: boolean;
+	policyBlocked: boolean;
+	policyTruncated: boolean;
+}
+
+/**
+ * 加载项目级自然语言审批策略（.pi/approval-policy.md）。
+ *
+ * 信任闸核验：未受信任的工作区禁止加载，防止恶意项目 Prompt Injection 提权。
+ * 预算控制：超出 PROJECT_POLICY_MAX_LENGTH (3000) 字符时安全截断并记录 debug 提示。
+ *
+ * @param cwd        工作区根目录
+ * @param isTrusted  项目是否受信任（ctx.isProjectTrusted()）
+ * @param agentDir   pi agent 配置目录（运行时 getAgentDir()，单测注入临时目录）
+ */
+export function loadProjectApprovalPolicy(
+	cwd: string,
+	isTrusted: boolean,
+	agentDir: string,
+): LoadProjectApprovalPolicyResult {
+	let policy: string | undefined;
+	let policyFound = false;
+	let policyBlocked = false;
+	let policyTruncated = false;
+
+	// 1. 全局级策略（可选）
+	const globalPolicyPath = join(agentDir, "approval-policy.md");
+	if (existsSync(globalPolicyPath)) {
+		try {
+			policy = readFileSync(globalPolicyPath, "utf-8");
+		} catch {
+			// ignore
+		}
+	}
+
+	// 2. 项目级策略覆盖（经信任闸核验）
+	const projectPolicyPath = join(cwd, ".pi", "approval-policy.md");
+	if (existsSync(projectPolicyPath)) {
+		policyFound = true;
+		if (isTrusted) {
+			try {
+				policy = readFileSync(projectPolicyPath, "utf-8");
+			} catch {
+				// ignore
+			}
+		} else {
+			policyBlocked = true;
+		}
+	}
+
+	// 3. 预算控制截断
+	if (policy !== undefined && policy.length > PROJECT_POLICY_MAX_LENGTH) {
+		policy = policy.slice(0, PROJECT_POLICY_MAX_LENGTH);
+		policyTruncated = true;
+		console.debug(
+			`[ApprovalMode] 项目审批策略超出预算上限 (${PROJECT_POLICY_MAX_LENGTH} 字符)，已安全截断（原始长度: ${policy.length}）。`,
+		);
+	}
+
+	return { policy, policyFound, policyBlocked, policyTruncated };
 }

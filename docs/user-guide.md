@@ -49,8 +49,10 @@ Options `2`–`4` write an `allow` rule at the corresponding tier, so the same a
 
 ### 1.4 Switching modes
 
-- **`Ctrl+Alt+A`** — cycle `manual ➔ auto-edit ➔ auto ➔ yolo ➔ plan`;
-- **`/approval-mode [mode]`** — jump directly to a mode (Tab-completed, e.g. `/approval-mode auto`).
+- **`Ctrl+Alt+A`** — cycle `manual ➔ auto-edit ➔ auto ➔ yolo ➔ readonly`;
+- **`Ctrl+Alt+P`** — instantly toggle between the current mode and **`readonly`** (read-only exploration mode);
+- **`/approval-mode [mode]`** — jump directly to a mode (Tab-completed, e.g. `/approval-mode auto`);
+- **`/readonly`** (or alias **`/plan`**) — quickly switch to read-only mode.
 
 The current mode is always visible in the status bar (e.g. `[⚖️ auto]`; or `[⚖️ auto | S1⚠️]` if Stage 1 is degraded, see §4.4 and §5.7).
 
@@ -60,7 +62,7 @@ The current mode is always visible in the status bar (e.g. `[⚖️ auto]`; or `
 | **`auto-edit`** | `[📝 auto-edit]` | **Auto-edit**: Regular in-workspace edits allowed; protected paths, boundary escapes, and shell require approval |
 | **`auto`** | `[⚖️ auto]` | **Classifier-driven (default)**: Two-stage LLM determines allow/block; persists `[⚖️ auto \| S1⚠️]` on S1 degradation |
 | **`yolo`** | `[⚡ yolo]` | **Autonomous**: Tools execute without dialog prompts (downgrades to baseline on session resume) |
-| **`plan`** | `[📋 plan]` | **Read-only planning**: Disables edit/write, restricts shell to read-only, injects plan prompts |
+| **`readonly`**<br>*(alias `plan`)* | `[👁️ readonly]` | **Read-Only Exploration**: Complete filesystem read-only, kernel-level sandboxing, constant Tools Schema, zero dialog interruptions |
 
 > ⚠️ **Note**: the `(auto)` after the context usage on status-bar line 2 is **Pi's native
 > auto-compaction indicator** (`compaction.enabled`, see Pi's `docs/settings.md`) and has
@@ -94,15 +96,15 @@ loop breaker ─▶ deny rules ─▶ ask rules ─▶ default rules / allow rul
 
 ### 2.2 The matrix
 
-The five modes form an automation ramp — `manual → auto-edit → auto → yolo` (`plan` is orthogonal). Modes are columns; the state of the call is the row. `*`-marked cells are explained below the table.
+The five modes form an automation ramp — `manual → auto-edit → auto → yolo` (`readonly` is orthogonal exploration). Modes are columns; the state of the call is the row. `*`-marked cells are explained below the table.
 
-| Call | `manual` | `auto-edit` | `auto` | `yolo` | `plan` |
+| Call | `manual` | `auto-edit` | `auto` | `yolo` | `readonly` (plan) |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| `edit` / `write` — regular workspace file | 🛡️ prompt | ✅ auto | ✅ auto | ✅ auto | ⛔ blocked |
-| `edit` / `write` — **outside workspace** | 🛡️ prompt | 🛡️ prompt | ⚖️ classifier → dialog `*` | ✅ auto | ⛔ blocked |
-| `edit` / `write` — **protected path** `*` | 🛡️ prompt | 🛡️ prompt | ⚖️ classifier → dialog `*` | ✅ auto | ⛔ blocked |
-| `bash` — read-only (by shell analysis) | 🛡️ prompt | 🛡️ prompt | ⚖️ classifier → dialog | ✅ auto | ✅ auto |
-| `bash` — anything else | 🛡️ prompt | 🛡️ prompt | ⚖️ classifier → dialog `*` | ✅ auto | ⛔ blocked |
+| `edit` / `write` — regular workspace file | 🛡️ prompt | ✅ auto | ✅ auto | ✅ auto | ⛔ EROFS block (zero prompt) |
+| `edit` / `write` — **outside workspace** | 🛡️ prompt | 🛡️ prompt | ⚖️ classifier → dialog `*` | ✅ auto | ⛔ EROFS block (zero prompt) |
+| `edit` / `write` — **protected path** `*` | 🛡️ prompt | 🛡️ prompt | ⚖️ classifier → dialog `*` | ✅ auto | ⛔ EROFS block (zero prompt) |
+| `bash` — read-only (allowlist / sandbox) | 🛡️ prompt | 🛡️ prompt | ⚖️ classifier → dialog | ✅ auto | 🔒 Kernel sandbox / graceful fallback |
+| `bash` — anything else | 🛡️ prompt | 🛡️ prompt | ⚖️ classifier → dialog `*` | ✅ auto | ⛔ Policy blocked |
 | read-family, no rule, **inside** workspace | ✅ auto | ✅ auto | ✅ auto | ✅ auto | ✅ auto |
 | read-family, no rule, **outside** workspace (except skill dirs `*`) | 🛡️ ask dialog | 🛡️ ask dialog | 🛡️ ask dialog | 🛡️ ask dialog | 🛡️ ask dialog |
 | read-family, matched **`default`** rule | 🛡️ prompt | 📝 prompt | ⚖️ classifier → dialog `*` | ✅ auto | ✅ auto |
@@ -115,7 +117,7 @@ The five modes form an automation ramp — `manual → auto-edit → auto → yo
 - **Protected path** = workspace-sensitive locations (`.pi/`, `.git/`, `AGENTS.md`, dotfiles such as `.bashrc` / `.zshrc` / `.profile`, env and keys `.env*` / `id_rsa*` / `id_ed25519*`, credential files `.pypirc` / `.git-credentials`, CLI configs `.config/gh/` / `.config/glab-cli/`, and cloud/cluster definitions `helm/` / `k8s/` / `iam/`). In `auto` these route through the classifier instead of the fast path.
 - **Classifier → dialog**: the two-stage LLM classifier reviews the call with its conversation context. If flagged risky, an interactive dialog shows the risk reason before the same `1`–`5` choices; if deemed safe, the call proceeds without any prompt.
 - **Skill dirs** `*` = user-level `~/.pi/agent/skills/**` and `~/.agents/skills/**` (always exempt) plus project-level `.pi/skills/**` and `.agents/skills/**` (exempt only when the project is trusted). Explicit `deny` / `ask` rules still win over this whitelist.
-- **Read-only `bash`** is decided by a shell state-machine (quotes, redirections, pipes, `&&`/`;` splitting, `$( )` substitution, flag guards for `find`/`git`/`sed`). A single write redirection revokes read-only status. **In `auto` the read-only fast path is retired**: the analysis now only guards `plan` (hard block) and feeds the "static structure" display line of `auto` dialogs — display, not verdict. Every rule-unmatched shell call, `ls` included, goes through the classifier; pin a command back to 0 s with an `allow` rule.
+- **Read-only `bash` & Tiered Sandboxing**: in `readonly` mode, shell commands are wrapped in OS kernel-level sandboxes (macOS `sandbox-exec`, Linux `bwrap`) to prevent writes physically; in Windows or sandbox-less environments, it falls back gracefully to a strict read-only allowlist (`git status`, `ls`, `grep`, `cargo check`, etc.). **In `auto` the read-only fast path is retired**: the analysis now only feeds the "static structure" display line of `auto` dialogs — display, not verdict. Every rule-unmatched shell call, `ls` included, goes through the classifier; pin a command back to 0 s with an `allow` rule.
 - **Destructive Git Operations**: `git push --force-with-lease` is treated as a safe collaborative operation exempt from high-risk regex fallbacks and judged by the classifier; bare `--force` / `-f` and destructive rewrites are strictly intercepted by deterministic heuristics.
 
 ### 2.3 Headless (non-interactive) runs
@@ -409,6 +411,18 @@ Pi deliberately ships no approval mechanism of its own (the official docs state 
 "intentionally does not include ... permission popups"), so all approval capability comes
 from this plugin. The two "auto"s belong to entirely different subsystems and merely share
 a word.
+
+### 5.8 Dealing with Classifier 403 (Region Blocked), 401 (Auth Failed), or Timeouts
+
+The plugin embeds an upstream error diagnostics extractor (`upstream-error-extractor`). When model requests fail, it avoids swallowing errors into a generic exception. Instead, it emits structured diagnostic logs to the console and passes exact short codes and troubleshooting suggestions directly to the UI dialog:
+
+| Short Code | Typical Cause | Plugin Behavior & Solution |
+| :--- | :--- | :--- |
+| **`upstream_403(Region Blocked)`** | Provider region restriction or Cloudflare block | Emits error UI notification and appends "🔧 排障建议" in approval dialogs. **Fix**: Adjust proxy rules to route classifier API endpoints through supported regions |
+| **`upstream_401(Auth Failed)`** | Missing/invalid API key or expired permissions | Emits error notification. **Fix**: Verify environment variables and `models.json` keys |
+| **`upstream_429(Rate Limited)`** | Rate limit or quota exhaustion | Falls back to human review. **Fix**: Retry later or switch models via `/classifier-model` |
+| **`network_error`** | Network disconnected or proxy port down | Logs connection failure. **Fix**: Ensure proxy client (e.g. port 7890) is running |
+| **`stage2_timeout(...)`** | Network hung or slow proxy response | Warns of possible proxy hang. **Fix**: Increase `classifierTimeoutMs` or check proxy stability |
 
 ---
 

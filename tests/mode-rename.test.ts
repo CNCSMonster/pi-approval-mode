@@ -10,10 +10,12 @@ import { normalizeMode, loadApprovalConfig } from "../extensions/approval-config
 //    统一入口覆盖三处摄取点：配置 defaultMode、CLI --approval-mode、历史会话状态
 // ==============================================================
 
-test("模式改名 - 别名兼容：旧值 default 映射为 manual，非法值回 undefined", () => {
+test("模式改名 - 别名兼容：旧值 default 映射为 manual，plan 映射为 readonly，非法值回 undefined", () => {
 	assert.equal(normalizeMode("default"), "manual");
 	assert.equal(normalizeMode("manual"), "manual");
-	for (const m of ["auto-edit", "auto", "yolo", "plan"]) {
+	assert.equal(normalizeMode("plan"), "readonly");
+	assert.equal(normalizeMode("readonly"), "readonly");
+	for (const m of ["auto-edit", "auto", "yolo", "readonly"]) {
 		assert.equal(normalizeMode(m), m);
 	}
 	assert.equal(normalizeMode("bogus"), undefined);
@@ -23,7 +25,7 @@ test("模式改名 - 别名兼容：旧值 default 映射为 manual，非法值�
 });
 
 // ==============================================================
-// B. 信任闸 defaultMode 提权剧本（ 护栏回归）
+// B. 信任闸 defaultMode 提权剧本
 //    攻击：仓库自带 .pi/approval-config.json 写 defaultMode: "yolo"
 //    预期：未信任 → 整份阻断（文件粒度），攻击值不进入配置
 // ==============================================================

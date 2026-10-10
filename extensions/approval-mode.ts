@@ -41,6 +41,7 @@ import {
 	isProtectedPath,
 	isEscapingWorkspace,
 	CLASSIFIER_BASE_PROMPT,
+	buildClassifierBasePrompt,
 	type FallbackAction,
 } from "./heuristic-guard.ts";
 import {
@@ -72,6 +73,7 @@ import {
 	ALL_MODES,
 	normalizeMode,
 	loadApprovalConfig,
+	loadProjectApprovalPolicy,
 	isThinkingLevel,
 	EXTENDED_THINKING_LEVELS,
 	type ApprovalMode,
@@ -79,6 +81,17 @@ import {
 	type ThinkingLevel,
 } from "./approval-config.ts";
 import { sanitizeUntrustedDetail, type SanitizedDetailResult } from "./detail-sanitizer.ts";
+import {
+	detectSandboxCapability,
+	evaluateStrictReadOnlyCommand,
+	formatReadOnlyCommandBlocked,
+	formatReadOnlyFileError,
+	wrapReadOnlyBashCommand,
+	READONLY_MODE_SYSTEM_REMINDER,
+} from "./readonly-sandbox.ts";
+import {
+	extractUpstreamErrorInfo,
+} from "./upstream-error-extractor.ts";
 import {
 	wrapDialogLine,
 	consolidateBlankLines,
@@ -97,9 +110,11 @@ export {
 	ALL_MODES,
 	normalizeMode,
 	loadApprovalConfig,
+	loadProjectApprovalPolicy,
 	isThinkingLevel,
 	EXTENDED_THINKING_LEVELS,
 	sanitizeUntrustedDetail,
+	extractUpstreamErrorInfo,
 	StageHealthTracker,
 	STAGE1_ESCALATE_THRESHOLD,
 	evaluateFallbackAction,
@@ -138,7 +153,8 @@ const MODE_DESCRIPTIONS: Record<ApprovalMode, string> = {
 	"auto-edit": "📝 auto-edit - 自动批准文件编辑（仅 Shell 命令需审批）",
 	auto: "⚖️ auto - 智能分类器模式（双阶段 LLM 自动判定意图与风险）",
 	yolo: "⚡ yolo - 全自动模式（除显式 deny 规则与死循环熔断外直接执行）",
-	plan: "📋 plan - 只读分析模式（禁用编辑/写入工具，仅放行只读命令）",
+	readonly: "👁 readonly - 只读探查模式（严格只读沙盒，零人工弹窗，用于分析与 Review）",
+	plan: "👁 readonly - 只读探查模式（严格只读沙盒，零人工弹窗，用于分析与 Review）",
 };
 
 // 审批动作类型
@@ -880,7 +896,6 @@ export function parseClassifierModelArgs(args: string): ClassifierModelCommand {
 export default function approvalModeExtension(pi: ExtensionAPI): void {
 	let currentMode: ApprovalMode = "auto";
 	let currentToolCallId: string | undefined;
-	let toolsBeforePlanMode: string[] | undefined;
 	let customClassifierModel: string | undefined;
 	let customClassifierStage1Model: string | undefined;
 	let customClassifierStage2Model: string | undefined;
@@ -913,6 +928,10 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 	let classifierStage2TimeoutMs = 3000;
 	let latestCtx: ExtensionContext | undefined;
 
+	// 项目级自然语言审批策略缓存（session_start/reload 时加载，分类器调用时注入）
+	let cachedProjectPolicy: string | undefined;
+	let cachedClassifierBasePrompt: string = CLASSIFIER_BASE_PROMPT;
+
 	// Qwen Code 四态权限规则管理器
 	let permissionManager: PermissionManager;
 
@@ -941,7 +960,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		type: "string",
 	});
 
-	// 更新 TUI 底部状态栏指示器 (状态栏支持 Stage 1 degraded 常驻轻量感知)
+	// 更新 TUI 底部状态栏指示器 
 	function updateStatus(ctx: ExtensionContext): void {
 		if (!ctx?.ui?.setStatus) return;
 		const theme = ctx.ui.theme;
@@ -958,26 +977,16 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 			"auto-edit": theme.fg("accent", "📝 auto-edit"),
 			auto: autoBadge,
 			yolo: theme.fg("error", "⚡ yolo"),
-			plan: theme.fg("warning", "📋 plan"),
+			readonly: theme.fg("warning", "👁 readonly"),
+			plan: theme.fg("warning", "👁 readonly"),
 		};
 
 		ctx.ui.setStatus("approval-mode", `[${badges[currentMode]}]`);
 	}
 
-	// 动态调整工具可用性（plan 模式禁用写入工具）
-	function applyModeTools(targetMode: ApprovalMode): void {
-		if (targetMode === "plan") {
-			if (toolsBeforePlanMode === undefined) {
-				toolsBeforePlanMode = pi.getActiveTools();
-			}
-			const readOnlyTools = toolsBeforePlanMode.filter((t) => t !== "edit" && t !== "write");
-			pi.setActiveTools(readOnlyTools);
-		} else {
-			if (toolsBeforePlanMode !== undefined) {
-				pi.setActiveTools(toolsBeforePlanMode);
-				toolsBeforePlanMode = undefined;
-			}
-		}
+	// 动态调整工具可用性
+	function applyModeTools(_targetMode: ApprovalMode): void {
+		// 工具声明保持 100% 恒定暴露，保全大模型前缀缓存 (Prefill Cache)，根除 Gemini 400 undeclared_tool_name 崩溃。
 	}
 
 	// 切换审批模式
@@ -988,7 +997,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		currentMode = newMode;
 
 		loopDetector.reset();
-		// D /  Timing 4：与 loopDetector 对称重置 denialTracker，跨模式不带旧债
+		//  /  Timing 4：与 loopDetector 对称重置 denialTracker，跨模式不带旧债
 		// （plan 连拒切 auto 开局即清零，含 totalBlock/totalUnavailable/指纹/自愈连击）。
 		denialTracker.resetAll();
 		stageHealthTracker.reset();
@@ -1052,8 +1061,20 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		const { config: fileConfig, projectConfigBlocked } = loadApprovalConfig(ctx.cwd, isTrusted, getAgentDir());
 		const projectRulesBlocked = permissionManager.isProjectRulesBlocked();
 
+		// 加载项目级自然语言审批策略（过信任闸 + 预算截断）
+		const { policy: loadedPolicy, policyBlocked: projectPolicyBlocked, policyTruncated } =
+			loadProjectApprovalPolicy(ctx.cwd, isTrusted, getAgentDir());
+		cachedProjectPolicy = loadedPolicy;
+		cachedClassifierBasePrompt = buildClassifierBasePrompt(cachedProjectPolicy);
+		if (policyTruncated) {
+			ctx.ui.notify(
+				`⚠️ [ApprovalMode] 项目审批策略 (.pi/approval-policy.md) 超出 3000 字符预算上限，已安全截断。`,
+				"warning",
+			);
+		}
+
 		// 若当前项目未受信任且携带项目级配置或规则，发出明确安全告警
-		if (!isTrusted && (projectConfigBlocked || projectRulesBlocked)) {
+		if (!isTrusted && (projectConfigBlocked || projectRulesBlocked || projectPolicyBlocked)) {
 			ctx.ui.notify(
 				`⚠️ 检测到当前工作区未受信任（Untrusted）。为防御恶意安全策略劫持，项目级审批配置与规则已被安全闸阻断禁用，仅加载用户全局配置。如需启用请使用 --approve 信任项目。`,
 				"warning",
@@ -1239,7 +1260,8 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		"auto-edit": "自动批准文件编辑（仅 Shell 命令需审批）",
 		auto: "智能分类器模式（双阶段 LLM 自动判定风险）",
 		yolo: "全自动模式（除显式 deny 规则与死循环熔断外直接执行）",
-		plan: "只读规划模式（禁用编辑/写入，仅放行只读命令）",
+		readonly: "只读探查模式（严格只读沙盒，零人工弹窗，用于分析与 Review）",
+		plan: "只读探查模式（readonly 兼容别名）",
 	};
 
 	function getModeCompletions(prefix: string): AutocompleteItem[] | null {
@@ -1255,7 +1277,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 	}
 
 	pi.registerCommand("approval-mode", {
-		description: "查看或切换审批模式 (manual, auto-edit, auto, yolo, plan)",
+		description: "查看或切换审批模式 (manual, auto-edit, auto, yolo, readonly)",
 		getArgumentCompletions: getModeCompletions,
 		handler: modeCommandHandler,
 	});
@@ -1792,7 +1814,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		},
 	});
 
-	// 4. 注册快捷键：Ctrl+Alt+A 快速循环切换模式
+	// 4. 注册快捷键：Ctrl+Alt+A 快速循环切换模式；Ctrl+Alt+P 快速切换只读探查模式
 	pi.registerShortcut(Key.ctrlAlt("a"), {
 		description: "循环切换审批模式 (Approval Mode)",
 		handler: async (ctx) => {
@@ -1800,23 +1822,64 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		},
 	});
 
-	// 5. 提示词动态增强（针对 Plan 模式）与新一轮摩擦预算重置 ( Timing 1)
-	pi.on("before_agent_start", async () => {
-		denialTracker.resetTurnDenials();
+	pi.registerShortcut(Key.ctrlAlt("p"), {
+		description: "切换只读探查模式 (Read-Only Mode)",
+		handler: async (ctx) => {
+			if (currentMode === "readonly" || currentMode === "plan") {
+				switchMode("manual", ctx);
+			} else {
+				switchMode("readonly", ctx);
+			}
+		},
+	});
 
-		if (currentMode === "plan") {
-			return {
-				message: {
-					customType: "approval-plan-instructions",
-					content: `[PLAN MODE ACTIVE]
-当前处于【只读探索模式 (Plan Mode)】：
-- 写入和编辑工具 (edit, write) 已被禁用。
-- Shell 命令仅允许执行常规只读检索与检查。
-- 请专注于深入分析代码、理解需求与架构，并在回复中以 "Plan:" 为标题输出清晰的分步实施计划。
-- 严禁尝试做实质性文件修改。计划确认后用户将切换模式进行实施。`,
-					display: false,
-				},
-			};
+	// 快速切换只读探查模式命令 (/readonly 与 /plan 兼容别名)
+	pi.registerCommand("readonly", {
+		description: "切换为只读探查模式 (Read-Only Mode)",
+		handler: async (_args, ctx) => {
+			if (currentMode === "readonly" || currentMode === "plan") {
+				switchMode("manual", ctx);
+			} else {
+				switchMode("readonly", ctx);
+			}
+		},
+	});
+
+	pi.registerCommand("plan", {
+		description: "切换为只读探查模式 (readonly 别名兼容)",
+		handler: async (_args, ctx) => {
+			if (currentMode === "readonly" || currentMode === "plan") {
+				switchMode("manual", ctx);
+			} else {
+				switchMode("readonly", ctx);
+			}
+		},
+	});
+
+	// 5. 新一轮摩擦预算重置 
+	pi.on("before_agent_start", async (event: any) => {
+		denialTracker.resetTurnDenials();
+		if ((currentMode === "readonly" || currentMode === "plan") && event?.systemPromptOptions?.guidelines) {
+			event.systemPromptOptions.guidelines.push(
+				"Environment Mode: Read-Only. Your file-writing capabilities are restricted for safe codebase exploration. Focus on reading files, investigating architecture, and outlining step-by-step solutions directly in your response text.",
+			);
+		}
+	});
+
+	// 6. 在只读模式下向当前轮次请求上下文注入正向附注，不向历史物理追加孤立的假 user 消息
+	pi.on("context", async (event: any) => {
+		if (currentMode === "readonly" || currentMode === "plan") {
+			const messages = event.messages;
+			if (Array.isArray(messages) && messages.length > 0) {
+				const lastUserMsg = [...messages].reverse().find((m: any) => m.role === "user");
+				if (lastUserMsg) {
+					if (typeof lastUserMsg.content === "string") {
+						lastUserMsg.content = `${lastUserMsg.content}\n\n${READONLY_MODE_SYSTEM_REMINDER}`;
+					} else if (Array.isArray(lastUserMsg.content)) {
+						lastUserMsg.content.push({ type: "text", text: `\n\n${READONLY_MODE_SYSTEM_REMINDER}` });
+					}
+				}
+			}
 		}
 	});
 
@@ -1907,7 +1970,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 					const stage1Promise = ctx.modelRegistry.complete(
 						s1Model,
 						{
-							systemPrompt: CLASSIFIER_BASE_PROMPT + STAGE1_SUFFIX,
+							systemPrompt: cachedClassifierBasePrompt + STAGE1_SUFFIX,
 							messages: [
 								{
 									role: "user",
@@ -1921,9 +1984,21 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 					stage1Response = await withTimeout(stage1Promise, classifierTimeoutMs, null);
 					if (!stage1Response) {
 						s1Failure = "timeout";
+						console.warn(
+							`[ApprovalMode] 分类器 Stage 1 超时 (${classifierTimeoutMs}ms, 模型: ${s1Model?.provider}/${s1Model?.id})。`,
+						);
 					}
-				} catch {
+				} catch (err: unknown) {
 					s1Failure = "exception";
+					const errInfo = extractUpstreamErrorInfo(err);
+					console.error(`[ApprovalMode] 分类器 Stage 1 请求异常 (${s1Model?.provider}/${s1Model?.id}):`, err);
+					console.warn(`[ApprovalMode] Stage 1 排障诊断提示: ${errInfo.diagnosticHint}`);
+					if (errInfo.category === "region_blocked" || errInfo.category === "auth_failed") {
+						ctx.ui?.notify?.(
+							`⚠️ [ApprovalMode] 分类器快筛请求异常: ${errInfo.shortCode}。${errInfo.diagnosticHint}`,
+							"error",
+						);
+					}
 				}
 
 				if (stage1Response) {
@@ -1933,7 +2008,16 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 							: null;
 					if (s1Err !== null) {
 						s1Failure = "upstream_error";
-					} else {
+						const errInfo = extractUpstreamErrorInfo(s1Err);
+						console.error(`[ApprovalMode] 分类器 Stage 1 收到错误响应 (${s1Model?.provider}/${s1Model?.id}):`, s1Err);
+						console.warn(`[ApprovalMode] Stage 1 排障诊断提示: ${errInfo.diagnosticHint}`);
+						if (errInfo.category === "region_blocked" || errInfo.category === "auth_failed") {
+							ctx.ui?.notify?.(
+								`⚠️ [ApprovalMode] 分类器快筛收到上游拒绝: ${errInfo.shortCode}。${errInfo.diagnosticHint}`,
+								"error",
+							);
+						}
+					} else if (Array.isArray(stage1Response.content)) {
 						const stage1Text = stage1Response.content
 							.filter((c: any): c is { type: "text"; text: string } => c.type === "text")
 							.map((c: any) => c.text)
@@ -1953,6 +2037,8 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 						} else {
 							s1Failure = "invalid_response";
 						}
+					} else {
+						s1Failure = "invalid_response";
 					}
 				}
 			}
@@ -2005,7 +2091,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 			const stage2Promise = ctx.modelRegistry.complete(
 				s2Model,
 				{
-					systemPrompt: CLASSIFIER_BASE_PROMPT + STAGE2_SUFFIX,
+					systemPrompt: cachedClassifierBasePrompt + STAGE2_SUFFIX,
 					messages: [
 						{
 							role: "user",
@@ -2018,23 +2104,37 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 			);
 
 			stage2Response = await withTimeout(stage2Promise, classifierStage2TimeoutMs, null);
-		} catch {
+		} catch (err: unknown) {
 			denialTracker.recordUnavailable();
+			const errInfo = extractUpstreamErrorInfo(err);
+			console.error(`[ApprovalMode] 分类器 Stage 2 请求异常 (${s2Model?.provider}/${s2Model?.id}):`, err);
+			console.warn(`[ApprovalMode] Stage 2 排障诊断提示: ${errInfo.diagnosticHint}`);
+			if (errInfo.category === "region_blocked" || errInfo.category === "auth_failed") {
+				ctx.ui?.notify?.(
+					`⚠️ [ApprovalMode] 分类器请求上游失败: ${errInfo.shortCode}。${errInfo.diagnosticHint}`,
+					"error",
+				);
+			}
 			return {
 				shouldBlock: true,
-				reason: DENIAL_MESSAGES.singleUnavailable("stage2_exception"),
+				reason: DENIAL_MESSAGES.classifierUpstreamError(errInfo.shortCode, toolName),
 				stage: "fallback",
-				outage: true
+				outage: true,
+				diagnosticHint: errInfo.diagnosticHint,
 			};
 		}
 
 		if (!stage2Response) {
 			denialTracker.recordUnavailable();
+			console.warn(
+				`[ApprovalMode] 分类器 Stage 2 超时 (${classifierStage2TimeoutMs}ms, 模型: ${s2Model?.provider}/${s2Model?.id})，可能由代理网络挂起或阻塞引起。`,
+			);
 			return {
 				shouldBlock: true,
 				reason: DENIAL_MESSAGES.singleUnavailable(`stage2_timeout(${classifierStage2TimeoutMs}ms)`),
 				stage: "fallback",
-				outage: true
+				outage: true,
+				diagnosticHint: `分类器请求在 ${classifierStage2TimeoutMs}ms 内未响应。若使用网络代理，请检查代理服务是否正常转发。`,
 			};
 		}
 
@@ -2046,14 +2146,26 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 				: null;
 		if (s2Err !== null) {
 			denialTracker.recordUnavailable();
-			const upstreamCode = (s2Err.match(/finish_reason:\s*([\w]+)/i)?.[1] || s2Err).slice(0, 60);
+			const errInfo = extractUpstreamErrorInfo(s2Err);
+			console.error(`[ApprovalMode] 分类器 Stage 2 收到上游错误响应 (${s2Model?.provider}/${s2Model?.id}):`, s2Err);
+			console.warn(`[ApprovalMode] Stage 2 排障诊断提示: ${errInfo.diagnosticHint}`);
+			if (errInfo.category === "region_blocked" || errInfo.category === "auth_failed") {
+				ctx.ui?.notify?.(
+					`⚠️ [ApprovalMode] 分类器收到上游拒绝: ${errInfo.shortCode}。${errInfo.diagnosticHint}`,
+					"error",
+				);
+			}
+			const upstreamCode = s2Err.includes("content_filter")
+				? "content_filter"
+				: (s2Err.match(/finish_reason:\s*([\w]+)/i)?.[1] || errInfo.shortCode).slice(0, 60);
 			return {
 				shouldBlock: true,
 				reason: s2Err.includes("content_filter")
 					? DENIAL_MESSAGES.classifierContentFilter(toolName)
 					: DENIAL_MESSAGES.classifierUpstreamError(upstreamCode, toolName),
 				stage: "fallback",
-				outage: true
+				outage: true,
+				diagnosticHint: errInfo.diagnosticHint,
 			};
 		}
 
@@ -2349,7 +2461,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		// 统计归属：分类器故障引发的**自动拦截**只计入“不可用”计数，
 		// 不灌入“拒绝”类统计（consecutiveBlock/totalBlock/loop 连续被拒）——两套计数各司其职。
 		// 仅无头自动拦截可用此豁免；用户在弹窗中的拒绝一律入账。
-		// 口径（D，宽口径保持）：拒绝类 = 一切明确说 no 的拦截（用户拒绝 / deny 规则 /
+		// 口径：拒绝类 = 一切明确说 no 的拦截（用户拒绝 / deny 规则 /
 		// plan 拦截 / 熔断自拦）；“不可用”豁免仅限分类器 outage 的自动拦截（基线 M11 口径句）。
 		if (countAsDenial) {
 			loopDetector.recordDenial(toolName, input);
@@ -2376,9 +2488,9 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		label: string,
 		toolName: string,
 		input: Record<string, any>,
-		fromCircuitFallback = false, // A'：本次弹窗是否因熔断跳过分类器而产生（Qwen wasAutoModeFallback 同款判据）
+		fromCircuitFallback = false, // ：本次弹窗是否因熔断跳过分类器而产生（Qwen wasAutoModeFallback 同款判据）
 	): Promise<ToolCallEventResult | undefined> {
-		// A'（Qwen Code v2 同款）：仅「触顶后跳过分类器的 fallback 弹窗」上的
+		// （Qwen Code v2 同款）：仅「触顶后跳过分类器的 fallback 弹窗」上的
 		// 人工批准是自愈触发器——清连击计数，下次判定重新交分类器；
 		// 分类器真实跑过但失败的故障弹窗批准不清（0027-A/D1 语义保持）；
 		// 拒绝路径不清（拒绝视为分类器判对）。
@@ -2511,7 +2623,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 			input,
 		});
 
-		// 1) 命中 Deny 规则：最高优先级硬性阻断，不弹窗，直接向模型反馈错误 ( Module D)
+		// 1) 命中 Deny 规则：最高优先级硬性阻断，不弹窗，直接向模型反馈错误 
 		if (permDecision.decision === "deny") {
 			if (ctx.hasUI) {
 				ctx.ui.notify(`🛑 命中禁止规则: ${permDecision.matchedRule}，已阻断执行`, "error");
@@ -2644,7 +2756,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 					return blockCall(toolName, input, fallback.reasonText || "Blocked", terminate, fallback.kind !== "consecutive_unavailable");
 				}
 
-				// C：交互侧按优先级消费 fallback——
+				// ：交互侧按优先级消费 fallback——
 				// ① total_denial 达顶 → 直接拒绝（不跑分类器）+ 解除指引；② 不可用触顶 → 既有启发式降级保持；
 				// ③ classifier_blocked_retry 指纹命中 → 跳过分类器直接人审弹窗（基线 M10：不重复研判/不重复弹窗，默认拒绝态）；
 				// ④ 其余 → 跑分类器（现状）。consecutive_block 交互侧不消费（0027 非目标，由 ① 的上限与弹窗承接）。
@@ -2674,7 +2786,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 					return handleOutcome(retryAction, dslRule, ctx, label, toolName, input);
 				}
 
-				// A'：在触顶判断时点捕获（弹窗时现算会被失败计数翻转污染）
+				// ：在触顶判断时点捕获（弹窗时现算会被失败计数翻转污染）
 				const circuitFallbackRead = unavailableCircuitTripped();
 				let decision: { shouldBlock: boolean; reason: string; stage: "fast" | "thinking" | "fallback"; outage?: boolean };
 				if (circuitFallbackRead) {
@@ -2707,6 +2819,9 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 				}
 				classifierDialog.push({ label: "读取目标", content: label });
 				classifierDialog.push({ label: "分类器研判风险", content: decision.reason });
+				if ((decision as any).diagnosticHint) {
+					classifierDialog.push({ label: "🔧 排障建议", content: (decision as any).diagnosticHint });
+				}
 
 				const classifierAction = await promptApprovalDialog(
 					ctx,
@@ -2752,27 +2867,49 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 			return allowCall(toolName, input);
 		}
 
-		// 2) plan 模式：严格只读，工业级 Shell 分析
-		if (currentMode === "plan") {
+		// 2) readonly / plan 模式：严格只读探查，OS 级执行沙盒与白名单平滑降级 
+		if (currentMode === "readonly" || currentMode === "plan") {
+			// 文件编辑与写入工具：0 毫秒客观 EROFS 报错物理阻断，0 人工弹窗打扰，驱动 Agent 自我纠偏
 			if (toolName === "edit" || toolName === "write") {
+				const filePath = String(input.path || input.target_file || "");
 				return blockCall(
 					toolName,
 					input,
-					DENIAL_MESSAGES.planModeToolDisabled(toolName),
+					formatReadOnlyFileError(filePath),
 				);
 			}
 
+			// Shell 命令：根据平台分层使用 OS 内核级只读沙盒与严格命令白名单
 			if (toolName === "bash") {
-				const cmd = (input.command || "").trim();
-				const analysis = analyzeShellCommand(cmd);
-				if (!analysis.isReadOnly) {
+				const cmd = String(input.command || "").trim();
+				const capability = detectSandboxCapability();
+
+				// 第一道防线：静态命令只读规则分析（0ms 快速阻断非只读与破坏性命令）
+				const verdict = evaluateStrictReadOnlyCommand(cmd);
+				if (!verdict.isSafe) {
 					return blockCall(
 						toolName,
 						input,
-						DENIAL_MESSAGES.planModeCommandBlocked(cmd, analysis.reason || "non-read-only"),
+						formatReadOnlyCommandBlocked(cmd, verdict.reason || "non-read-only"),
 					);
 				}
+
+				// 第二道防线：Tier 1 环境下进行内核级只读沙盒包装加固
+				if (capability.tier === "tier1_seatbelt" || capability.tier === "tier1_bwrap") {
+					const wrapped = wrapReadOnlyBashCommand(cmd, capability);
+					input.command = wrapped.command;
+					return allowCall(toolName, input);
+				}
+
+				// Tier 2 环境：缺失沙盒时通过白名单已放行，首次提示免责建议
+				if (capability.advisoryNotice && !notifiedFallbacks.has("readonly-sandbox")) {
+					notifiedFallbacks.add("readonly-sandbox");
+					ctx.ui.notify(capability.advisoryNotice, "info");
+				}
+				return allowCall(toolName, input);
 			}
+
+			// 其他内置/扩展读类工具直接放行
 			return allowCall(toolName, input);
 		}
 
@@ -2793,7 +2930,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 						return blockCall(toolName, input, fallback.reasonText || "Blocked", terminate, fallback.kind !== "consecutive_unavailable");
 					}
 
-					// C：交互侧按优先级消费 fallback——
+					// ：交互侧按优先级消费 fallback——
 					// ① total_denial 达顶 → 直接拒绝（不跑分类器）+ 解除指引；
 					// ②不可用触顶 → 跳过分类器直呈人工核准（保护等级不降，只甩掉挂掉的 LLM 等待，默认拒绝态）；
 					// ③ classifier_blocked_retry 指纹命中 → 跳过分类器直接人审弹窗（基线 M10：不重复研判/不重复弹窗，默认拒绝态）；
@@ -2807,7 +2944,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 					}
 
 					// ② 不可用熔断触顶（直读计数，不看 kind——b/u 同涨时 kind 不可靠）→
-					//    跳过分类器直呈人工核准（ 方案A：保护等级不降，只甩掉挂掉的 LLM 等待）
+					//    跳过分类器直呈人工核准
 					if (ctx.hasUI && unavailableCircuitTripped()) {
 						denialTracker.consumePendingFingerprint();
 						const degradedDialog: Array<{ label: string; content: string }> = [];
@@ -2874,6 +3011,9 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 						});
 					}
 					dialogDetails.push({ label: "拦截原因", content: decision.reason });
+					if ((decision as any).diagnosticHint) {
+						dialogDetails.push({ label: "🔧 排障建议", content: (decision as any).diagnosticHint });
+					}
 
 					const action = await promptApprovalDialog(
 						ctx,
@@ -2906,7 +3046,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 					return blockCall(toolName, input, fallback.reasonText || "Blocked", terminate, fallback.kind !== "consecutive_unavailable");
 				}
 
-				// C：交互侧按优先级消费 fallback——
+				// ：交互侧按优先级消费 fallback——
 				// ① total_denial 达顶 → 直接拒绝（不跑分类器）+ 解除指引；② 不可用触顶 → 既有启发式降级保持；
 				// ③ classifier_blocked_retry 指纹命中 → 跳过分类器直接人审弹窗（基线 M10：不重复研判/不重复弹窗，默认拒绝态）；
 				// ④ 其余 → 跑分类器（现状）。consecutive_block 交互侧不消费（0027 非目标，由 ① 的上限与弹窗承接）。
@@ -2937,7 +3077,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 				}
 
 				let decision: { shouldBlock: boolean; reason: string; stage: "fast" | "thinking" | "fallback"; outage?: boolean };
-				// A'：触顶判断时点捕获（同 read 分支）
+				// ：触顶判断时点捕获（同 read 分支）
 				const circuitFallbackBash = unavailableCircuitTripped();
 				if (circuitFallbackBash) {
 					decision = fallbackHeuristicCheck(toolName, input, ctx.cwd);
@@ -2974,6 +3114,9 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 					});
 				}
 				dialogDetails.push({ label: "分类器研判风险", content: decision.reason });
+				if ((decision as any).diagnosticHint) {
+					dialogDetails.push({ label: "🔧 排障建议", content: (decision as any).diagnosticHint });
+				}
 				dialogDetails.push({ label: "静态结构特征", content: shellAnalysis.reason || "非安全只读命令" });
 
 				const action = await promptApprovalDialog(

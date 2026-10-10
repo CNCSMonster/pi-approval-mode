@@ -802,7 +802,7 @@ export class PermissionManager {
 }
 
 // ==============================================================
-// 工具默认权限层（qwen-code getDefaultPermission 等价物， specification）
+// 工具默认权限层（qwen-code getDefaultPermission 等价物，
 // ==============================================================
 
 /** 读类工具集合（pi 实际内置的只读工具）。 */
@@ -813,7 +813,7 @@ export function isReadOnlyTool(toolName: string): boolean {
 	return READ_ONLY_TOOLS.has(toolName.toLowerCase());
 }
 
-/** 读类工具模式漏斗处置档位（ specification 矩阵）。 */
+/** 读类工具模式漏斗处置档位。 */
 export type ModeFunnelDisposition = "allow" | "classifier" | "prompt";
 
 /**
@@ -831,6 +831,7 @@ export type ModeFunnelDisposition = "allow" | "classifier" | "prompt";
 export function resolveReadDisposition(mode: string): ModeFunnelDisposition {
 	switch (mode) {
 		case "yolo":
+		case "readonly":
 		case "plan":
 			return "allow";
 		case "auto":

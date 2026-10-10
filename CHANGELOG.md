@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-10
+
+### ✨ Features
+- **Lightweight Read-Only Exploration Mode & OS Kernel Sandboxing**:
+  - **Tool Schema Invariant**: Keeps tool declarations (including `edit`, `write`, `bash`) 100% intact throughout session lifecycles, eliminating Gemini 400 runtime crashes (`undeclared_tool_name`) and preventing prompt cache (KV cache) invalidation.
+  - **Two-Tier Layered Execution Sandbox**:
+    - **Tier 1 (Kernel Sandbox)**: Enforces write restrictions at the OS kernel level using `sandbox-exec` (Seatbelt) on macOS and Bubblewrap (`bwrap`) on Linux, shielding against arbitrary script execution and escaping.
+    - **Tier 2 (Strict Allowlist Fallback)**: Automatically falls back on Windows or environments lacking bubblewrap to a strict read-only command allowlist, intercepting redirection (`>`, `>>`) and unsafe mutations in 0ms.
+  - **Objective Physical Error Feedback & Zero Disruption**: Intercepts `edit` and `write` tool calls with standard `EROFS: read-only file system` errors without human approval dialogs, guiding models to self-correct and formulate plans directly in text response.
+  - **Context-Preserving Prompt Injection**: Injects read-only `<system-reminder>` directives non-intrusively via `context` hooks to the trailing user message and adds system guidelines without polluting conversation history.
+  - **Mode Aliasing & Shortcuts**: Introduces `/readonly` command with `/plan` alias compatibility, accessible via standard shortcut `Ctrl+Alt+P`.
+- **Classifier Upstream Error Diagnostics & UI Observability**:
+  - **Structured Diagnostic Extraction**: Extracts precise HTTP error codes and categorization from upstream classifier failures, preventing silent swallowed generic exceptions.
+  - **Proactive Anomaly Categorization**: Accurately classifies provider region lockouts (`upstream_403(Region Blocked)`), authentication failures (`upstream_401(Auth Failed)`), rate limits (`upstream_429(Rate Limited)`), and network proxy dropouts.
+  - **Approval Dialog & UI Alert Propagation**: Surfaces diagnostic hints directly in interactive approval dialogs (`🔧 排障建议`) and raises UI error notifications on critical 403/401 events to guide users on network proxy or API credential fixes.
+- **Workspace Project-Specific Natural Language Approval Policy**:
+  - **Custom Policy Loading**: Supports loading workspace-specific approval guidelines from `.pi/approval-policy.md` (or global `~/.pi/agent/approval-policy.md`), seamlessly appending them to classifier evaluation prompts.
+  - **Trust Gate Protection & Invariant Defense**: Strictly gates policy loading behind workspace trust (`isProjectTrusted()`), neutralizing malicious policy prompt injection in untrusted repositories.
+  - **Prompt Budget & Safety Invariant**: Enforces a 3,000 character maximum budget limit with graceful truncation and preserves the core invariant that project policies can only expand review requirements and never weaken or bypass default hard blocks.
+- **Documentation & User Guide Synchronization**:
+  - Synchronized comprehensive bilingual user guides (`user-guide.zh-CN.md` and `user-guide.md`) detailing Read-Only mode mechanics, sandbox architecture, and upstream troubleshooting guides.
+
 ## [0.8.0] - 2026-10-08
 
 ### ✨ Features

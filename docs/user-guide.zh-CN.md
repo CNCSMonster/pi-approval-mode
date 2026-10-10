@@ -47,8 +47,10 @@ pi install git:github.com/CNCSMonster/pi-approval-mode
 
 ### 1.4 切换模式
 
-- **`Ctrl+Alt+A`** — 循环切换 `manual ➔ auto-edit ➔ auto ➔ yolo ➔ plan`；
-- **`/approval-mode [mode]`** — 直达指定模式（支持 Tab 补全，如 `/approval-mode auto`）。
+- **`Ctrl+Alt+A`** — 循环切换 `manual ➔ auto-edit ➔ auto ➔ yolo ➔ readonly`；
+- **`Ctrl+Alt+P`** — 一键在当前模式与 **`readonly`**（只读探查模式）之间快速切换；
+- **`/approval-mode [mode]`** — 直达指定模式（支持 Tab 补全，如 `/approval-mode auto`）；
+- **`/readonly`**（或别名 **`/plan`**）— 快速切换只读探查模式。
 
 当前模式常驻状态栏（如 `[⚖️ auto]`；若 Stage 1 快筛离线则常驻显示 `[⚖️ auto | S1⚠️]`，见 §4.4 与 §5.7）。
 
@@ -58,7 +60,7 @@ pi install git:github.com/CNCSMonster/pi-approval-mode
 | **`auto-edit`** | `[📝 auto-edit]` | **免审编辑**：区内常规文件编辑放行，越界/受保护路径与 Shell 需审批 |
 | **`auto`** | `[⚖️ auto]` | **分类器驱动（默认）**：两阶段 LLM 研判放行/拦截；S1 异常时常驻 `[⚖️ auto \| S1⚠️]` |
 | **`yolo`** | `[⚡ yolo]` | **全自动**：工具免弹窗直接执行（恢复旧会话时自动降级回安全基线） |
-| **`plan`** | `[📋 plan]` | **只读规划**：禁用 edit/write，Shell 仅限只读，注入规划提示词 |
+| **`readonly`**<br>*(别名 `plan`)* | `[👁️ readonly]` | **只读探查**：全盘物理只读，内核级沙盒隔离，Tools Schema 恒定暴露，零人工弹窗 |
 
 > ⚠️ **注意区分**：状态栏第 2 行上下文用量后的 `(auto)` 是 **Pi 原生的上下文自动压缩指示**（`compaction.enabled`，见 Pi 官方 `docs/settings.md`），与本插件无关；本插件的审批模式徽标位于扩展状态行（如 `[⚖️ auto]`）。两者详见 §5.7。
 
@@ -88,15 +90,15 @@ pi install git:github.com/CNCSMonster/pi-approval-mode
 
 ### 2.2 行为矩阵
 
-五个模式构成自动化梯度——`manual → auto-edit → auto → yolo`（`plan` 正交）。模式是列、调用状态是行。带 `*` 的单元格见表下注释。
+五个模式构成自动化梯度——`manual → auto-edit → auto → yolo`（`readonly` 正交安全探查）。模式是列、调用状态是行。带 `*` 的单元格见表下注释。
 
-| 调用 | `manual` | `auto-edit` | `auto` | `yolo` | `plan` |
+| 调用 | `manual` | `auto-edit` | `auto` | `yolo` | `readonly` (plan) |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| `edit` / `write` — 工作区常规文件 | 🛡️ 弹窗 | ✅ 自动 | ✅ 自动 | ✅ 自动 | ⛔ 阻断 |
-| `edit` / `write` — **工作区外** | 🛡️ 弹窗 | 🛡️ 弹窗 | ⚖️ 分类器 → 弹窗 `*` | ✅ 自动 | ⛔ 阻断 |
-| `edit` / `write` — **受保护路径** `*` | 🛡️ 弹窗 | 🛡️ 弹窗 | ⚖️ 分类器 → 弹窗 `*` | ✅ 自动 | ⛔ 阻断 |
-| `bash` — 只读（词法分析判定） | 🛡️ 弹窗 | 🛡️ 弹窗 | ⚖️ 分类器 → 弹窗 | ✅ 自动 | ✅ 自动 |
-| `bash` — 其余命令 | 🛡️ 弹窗 | 🛡️ 弹窗 | ⚖️ 分类器 → 弹窗 `*` | ✅ 自动 | ⛔ 阻断 |
+| `edit` / `write` — 工作区常规文件 | 🛡️ 弹窗 | ✅ 自动 | ✅ 自动 | ✅ 自动 | ⛔ EROFS 阻断 (零弹窗) |
+| `edit` / `write` — **工作区外** | 🛡️ 弹窗 | 🛡️ 弹窗 | ⚖️ 分类器 → 弹窗 `*` | ✅ 自动 | ⛔ EROFS 阻断 (零弹窗) |
+| `edit` / `write` — **受保护路径** `*` | 🛡️ 弹窗 | 🛡️ 弹窗 | ⚖️ 分类器 → 弹窗 `*` | ✅ 自动 | ⛔ EROFS 阻断 (零弹窗) |
+| `bash` — 只读（白名单/沙盒） | 🛡️ 弹窗 | 🛡️ 弹窗 | ⚖️ 分类器 → 弹窗 | ✅ 自动 | 🔒 内核沙盒放行 / 自动降级 |
+| `bash` — 其余命令 | 🛡️ 弹窗 | 🛡️ 弹窗 | ⚖️ 分类器 → 弹窗 `*` | ✅ 自动 | ⛔ 策略阻断 |
 | 读类、无规则、**工作区内** | ✅ 自动 | ✅ 自动 | ✅ 自动 | ✅ 自动 | ✅ 自动 |
 | 读类、无规则、**工作区外**（除 skill 目录 `*` 外） | 🛡️ ask 弹窗 | 🛡️ ask 弹窗 | 🛡️ ask 弹窗 | 🛡️ ask 弹窗 | 🛡️ ask 弹窗 |
 | 读类、命中 **`default`** 规则 | 🛡️ 弹窗 | 📝 弹窗 | ⚖️ 分类器 → 弹窗 `*` | ✅ 自动 | ✅ 自动 |
@@ -109,7 +111,7 @@ pi install git:github.com/CNCSMonster/pi-approval-mode
 - **受保护路径** = 工作区敏感位置（`.pi/`、`.git/`、`AGENTS.md`、Shell 点文件如 `.bashrc` / `.zshrc` / `.profile`、环境变量与密钥 `.env*` / `id_rsa*` / `id_ed25519*`、凭据文件 `.pypirc` / `.git-credentials`、CLI 配置 `.config/gh/` / `.config/glab-cli/`、基础设施与集群目录 `helm/` / `k8s/` / `iam/` 等）。`auto` 模式下这些路径不走快路径，改走分类器。
 - **分类器 → 弹窗**：两阶段 LLM 分类器结合对话上下文研判该调用。判为有风险则弹窗展示风险理由，之后仍是 `1`–`5` 选择；判为安全则无感放行。
 - **skill 目录** `*` = 用户级 `~/.pi/agent/skills/**` 与 `~/.agents/skills/**`（恒豁免）+ 项目级 `.pi/skills/**` 与 `.agents/skills/**`（仅受信项目豁免）；显式 `deny`/`ask` 规则仍然优先于白名单。
-- **只读 `bash`** 由 Shell 状态机判定（引号、重定向、管道、`&&`/`;` 切分、`$( )` 替换、`find`/`git`/`sed` 参数守卫）。任何一处写入重定向即一票否决只读资格。**在 `auto` 下只读快路径已下线**：该分析现仅守卫 `plan`（硬拦）并为 `auto` 弹窗的“静态结构特征”展示行供料——展示≠裁决。每一条未命中规则的 shell 调用（含 `ls`）都进分类器；想把某命令钉回 0 秒，写一条 `allow` 规则。
+- **只读 `bash` 与分层沙盒**：在 `readonly` 模式下，Shell 命令优先由操作系统内核级只读沙盒（macOS `sandbox-exec`、Linux `bwrap`）强力包裹执行，物理杜绝写入副作用；在 Windows 或无沙盒环境中，自动平滑降级为严格只读命令白名单（`git status`, `ls`, `grep`, `cargo check` 等）。**在 `auto` 下只读快路径已下线**：该分析现仅为 `auto` 弹窗的“静态结构特征”展示行供料——展示≠裁决。每一条未命中规则的 shell 调用（含 `ls`）都进分类器；想把某命令钉回 0 秒，写一条 `allow` 规则。
 - **破坏性 Git 操作**：`git push --force-with-lease` 视为带租约的安全协作操作，免除高危正则兜底阻断，交给分类器智能裁决；裸 `--force` / `-f` 强推与历史重写则受到启发式兜底硬性拦截。
 
 ### 2.3 无头（非交互）运行
@@ -381,6 +383,18 @@ v0.3.0 起更名为 **`manual`**。新会话默认 `auto` 后，`default` 这个
 | 扩展状态行 `[⚖️ auto \| S1⚠️]` | **本插件**的审批模式徽标（Stage 1 降级态）：Stage 1 快筛离线或异常，已由 Stage 2 深度复核接管。Agent 不受阻塞，但单次工具审批延迟增加 | 本插件运行状态机（Stage 1 degraded 自动常驻，恢复后复原） |
 
 Pi 本身不内置审批机制（官方文档明示 intentionally does not include permission popups），审批能力全部由本插件提供；两个 "auto" 分属完全不同的子系统，仅是文字撞名。
+
+### 5.8 遇到分类器 403 锁区、401 凭据失效或超时怎么办？
+
+本插件内置了上游错误提取诊断器（`upstream-error-extractor`）：当上游模型调用异常时，不会笼统吞没为 generic exception，而是在控制台打印结构化排障日志，并在弹窗与状态通知中透传具体短码与排障建议：
+
+| 错误短码 | 典型原因 | 插件行为与排障建议 |
+| :--- | :--- | :--- |
+| **`upstream_403(Region Blocked)`** | 上游模型厂商锁区或 Cloudflare 拦截 | 状态栏/弹窗发出 UI 告警，弹窗追加“🔧 排障建议”。**解决方式**：检查本地代理软件（如 Clash / Surge / Mihomo）分流规则，确保分类器 API 域名走海外支持区域节点 |
+| **`upstream_401(Auth Failed)`** | API Key 错误、欠费或缺少模型权限 | 发出明确认证失败警告并提示检查 Key 配置。**解决方式**：检查环境变量与 `models.json` 对应 key 是否正确有效 |
+| **`upstream_429(Rate Limited)`** | 模型请求频控超限或 TPM 耗尽 | 降级为人审。**解决方式**：稍后重试或在 `/classifier-model` 换用更高配额的模型 |
+| **`network_error`** | 本地网络中断或本地代理端口未启动 | 控制台清晰记录网络异常。**解决方式**：检查本地代理进程（如 7890 端口）是否存活 |
+| **`stage2_timeout(...)`** | 网络挂起或请求超时 | 降级为人审并提示代理可能挂起。**解决方式**：可适当调大 `classifierTimeoutMs` 或检查代理连通性 |
 
 ---
 

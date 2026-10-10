@@ -7,10 +7,10 @@
 
 ## 一、核心选型结论与推荐配置 (TL;DR)
 
-经过对全网主流专职决策模型与通用代码/决策模型在 121 题全量基准测试与系统全链路保真测试，得出当前生产环境下的**黄金配置组合**：
+经过对全网主流专职决策模型（阿里百炼、Cloudflare Clef、TypeSafe Jev）与通用代码/决策模型（OpenAI GPT-6 Luna、Anthropic Claude Haiku 4.5、DeepSeek-Flash 等）在 **47 题高难对抗集** 与 **74 题真实编码场景集** 的全量基准压测，得出当前生产环境下的**黄金配置组合**：
 
-* **Stage 1（高频快速守门）**：**`deepseek/deepseek-flash`**（DeepSeek 官方直连，thinking: `low`，时延 ~400ms）
-* **Stage 2（深度权威复核）**：**`openrouter/anthropic/claude-haiku-5.5`**（Anthropic 官方，thinking: `low`，具备防间接/带内注入深度推理能力）
+* **Stage 1（高频快速守门）**：**`deepseek/deepseek-flash`**（DeepSeek 官方直连，时延 ~749ms）
+* **Stage 2（深度权威复核）**：**`openrouter/openai/gpt-6-luna`**（OpenAI Decisions 底座，零思考前向输出）
 
 ### 1. 本地一键配置文件
 配置文件路径：`~/.pi/agent/approval-config.json`
