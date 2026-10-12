@@ -11,6 +11,7 @@
 export type UpstreamErrorCategory =
 	| "region_blocked"
 	| "auth_failed"
+	| "insufficient_balance"
 	| "rate_limited"
 	| "network_error"
 	| "generic_upstream";
@@ -66,7 +67,7 @@ export function extractUpstreamErrorInfo(err: unknown): UpstreamErrorInfo {
 			statusCode = Number.parseInt(codeMatch[1], 10);
 		} else {
 			// 补充特定经典状态码匹配
-			const standaloneMatch = rawMessage.match(/\b(401|403|429|500|502|503|504)\b/);
+			const standaloneMatch = rawMessage.match(/\b(401|402|403|429|500|502|503|504)\b/);
 			if (standaloneMatch) {
 				statusCode = Number.parseInt(standaloneMatch[1], 10);
 			}
@@ -118,12 +119,36 @@ export function extractUpstreamErrorInfo(err: unknown): UpstreamErrorInfo {
 		};
 	}
 
-	// 6. 429 / 频控限流 (rate_limited)
+	// 6. 402 / 账户余额不足或额度耗尽 (insufficient_balance)
+	if (
+		statusCode === 402 ||
+		lowerMsg.includes("insufficient balance") ||
+		lowerMsg.includes("insufficient_balance") ||
+		lowerMsg.includes("insufficient quota") ||
+		lowerMsg.includes("insufficient_quota") ||
+		lowerMsg.includes("out of quota") ||
+		lowerMsg.includes("credit balance") ||
+		(lowerMsg.includes("balance") && lowerMsg.includes("insufficient")) ||
+		(lowerMsg.includes("billing") && lowerMsg.includes("quota"))
+	) {
+		const codeStr = statusCode ?? 402;
+		return {
+			statusCode: codeStr,
+			rawMessage,
+			category: "insufficient_balance",
+			shortCode: `upstream_${codeStr}(Insufficient Balance)`,
+			diagnosticHint:
+				"上游账户余额耗尽或额度不足（402 Insufficient Balance）。建议为模型账户充值或使用 /classifier-model 切换其他可用模型。",
+		};
+	}
+
+	// 7. 429 / 频控限流 (rate_limited)
 	if (
 		statusCode === 429 ||
 		lowerMsg.includes("rate limit") ||
-		lowerMsg.includes("quota") ||
-		lowerMsg.includes("too many requests")
+		lowerMsg.includes("rate_limit") ||
+		lowerMsg.includes("too many requests") ||
+		lowerMsg.includes("quota")
 	) {
 		const codeStr = statusCode ?? 429;
 		return {
@@ -132,11 +157,11 @@ export function extractUpstreamErrorInfo(err: unknown): UpstreamErrorInfo {
 			category: "rate_limited",
 			shortCode: `upstream_${codeStr}(Rate Limited)`,
 			diagnosticHint:
-				"上游请求频率过高或账户额度耗尽（429 Too Many Requests）。建议稍后重试或检查账户可用额度。",
+				"上游请求频率过高或触发限流（429 Too Many Requests）。建议稍后重试或调整并发频率。",
 		};
 	}
 
-	// 7. 网络底层连接或代理异常 (network_error)
+	// 8. 网络底层连接或代理异常 (network_error)
 	if (
 		lowerMsg.includes("econnrefused") ||
 		lowerMsg.includes("enotfound") ||
@@ -156,7 +181,7 @@ export function extractUpstreamErrorInfo(err: unknown): UpstreamErrorInfo {
 		};
 	}
 
-	// 8. 其他上游异常 (generic_upstream)
+	// 9. 其他上游异常 (generic_upstream)
 	return {
 		statusCode,
 		rawMessage,

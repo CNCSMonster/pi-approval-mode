@@ -51,6 +51,33 @@ test("extractUpstreamErrorInfo - 401 认证失败分支", () => {
 	assert.strictEqual(res2.shortCode, "upstream_401(Auth Failed)");
 });
 
+test("extractUpstreamErrorInfo - 402 与 Insufficient Balance 余额分支", () => {
+	// 场景 1: status 402 数字状态码与 DeepSeek 报文
+	const err1 = {
+		statusCode: 402,
+		message: '{"message":"Insufficient Balance (request_id: 971f6dc5-3066-4b3a-a434-)}',
+	};
+	const res1 = extractUpstreamErrorInfo(err1);
+	assert.strictEqual(res1.category, "insufficient_balance");
+	assert.strictEqual(res1.statusCode, 402);
+	assert.strictEqual(res1.shortCode, "upstream_402(Insufficient Balance)");
+	assert.match(res1.diagnosticHint, /账户余额耗尽|充值/);
+
+	// 场景 2: 文本报错包含 402 且带 Insufficient Balance
+	const err2 = '402: {"message":"Insufficient Balance"}';
+	const res2 = extractUpstreamErrorInfo(err2);
+	assert.strictEqual(res2.category, "insufficient_balance");
+	assert.strictEqual(res2.statusCode, 402);
+	assert.strictEqual(res2.shortCode, "upstream_402(Insufficient Balance)");
+
+	// 场景 3: 仅含 out of quota / credit balance / insufficient quota
+	const err3 = new Error("Provider credit balance exhausted, out of quota");
+	const res3 = extractUpstreamErrorInfo(err3);
+	assert.strictEqual(res3.category, "insufficient_balance");
+	assert.strictEqual(res3.shortCode, "upstream_402(Insufficient Balance)");
+	assert.match(res3.diagnosticHint, /充值/);
+});
+
 test("extractUpstreamErrorInfo - 429 频控与配额限流分支", () => {
 	const err1 = { response: { status: 429, data: { error: { message: "Rate limit exceeded" } } } };
 	const res1 = extractUpstreamErrorInfo(err1);

@@ -9,7 +9,7 @@
  *    - ask:  强制挂起并弹窗要求用户确认，压倒 allow；
  *    - default: 显式 default 规则命中，或未命中任何规则 → 交给审批模式漏斗（auto→classifier、非交互拒绝）；
  *    - allow: 免审放行（受 auto 模式高危暂存保护）；
- *    （读类工具未命中规则时，再经工具默认权限层：工作区内 allow / 工作区外 ask，）
+ *    
  *
  * 2. DSL 语法与分流解析：
  *    ToolName 或 ToolName(specifier)
@@ -61,12 +61,26 @@ export interface RuleMatchContext {
 }
 
 // 宏元分类映射表
-const TOOL_MACROS: Record<string, string[]> = {
+export const TOOL_MACROS: Record<string, string[]> = {
 	read: ["read", "read_file", "grep", "grep_search", "find", "ls", "glob", "list_directory", "zoom_image"],
 	edit: ["edit", "write", "write_file", "notebook_edit"],
-	bash: ["bash", "run_shell_command", "monitor"],
-	shell: ["bash", "run_shell_command", "monitor"],
+	bash: ["bash", "powershell", "pwsh", "cmd", "run_shell_command", "monitor"],
+	shell: ["bash", "powershell", "pwsh", "cmd", "run_shell_command", "monitor"],
+	powershell: ["powershell", "pwsh"],
+	pwsh: ["powershell", "pwsh"],
 };
+
+/** 判断是否为通用 Shell 工具（bash / powershell / pwsh / cmd / run_shell_command）。 */
+export function isShellTool(toolName: string): boolean {
+	const lower = (toolName || "").toLowerCase();
+	return (
+		lower === "bash" ||
+		lower === "powershell" ||
+		lower === "pwsh" ||
+		lower === "cmd" ||
+		lower === "run_shell_command"
+	);
+}
 
 /**
  * 将工具名称标准化并展开宏
@@ -101,7 +115,13 @@ export function parseDslRule(ruleStr: string): ParsedRule {
 	const toolLower = toolName.toLowerCase();
 	let specifierKind: "command" | "path" | "generic" = "generic";
 
-	if (toolLower === "bash" || toolLower === "shell" || toolLower === "run_shell_command") {
+	if (
+		toolLower === "bash" ||
+		toolLower === "shell" ||
+		toolLower === "powershell" ||
+		toolLower === "pwsh" ||
+		toolLower === "run_shell_command"
+	) {
 		specifierKind = "command";
 	} else if (
 		toolLower === "read" ||
@@ -178,21 +198,81 @@ export function globToRegex(globPattern: string): RegExp {
 }
 
 /**
- * 匹配 Shell 命令通配符 (单词边界 + 环境变量剥离)
+ * 复合命令段聚合策略 :
+ * - "all"  : 所有子命令段均需命中模式——allow 池专用,
+ *            防止 `git status && rm -rf /` 借前缀 allow 规则逃逸;
+ * - "any"  : 任一子命令段命中即算匹配——deny / ask / default 池专用,
+ *            防止复合命令夹带危险段绕过阻断 (否则 deny `Bash(rm *)`
+ *            会因 `ls && rm -rf /` 的首段不命中而漏拦)。
  */
-export function matchesCommandPattern(commandStr: string, pattern: string): boolean {
+export type SegmentMatchMode = "all" | "any";
+
+/**
+ * 匹配 Shell 命令通配符 (单词边界 + 环境变量剥离 + 复合命令段安全隔离)
+ */
+export function matchesCommandPattern(
+	commandStr: string,
+	pattern: string,
+	mode: SegmentMatchMode = "all",
+): boolean {
 	const rawCmd = commandStr.trim();
 	const rawPat = pattern.trim();
 	if (!rawCmd) return false;
 	if (rawPat === "*") return true;
 
-	// 1. 剥离目标命令的前导环境变量 (FOO=bar git status -> git status)
-	const { tokens } = tokenizeShellCommand(rawCmd);
+	const { tokens, hasCommandSubstitution } = tokenizeShellCommand(rawCmd);
+	// 存在动态命令替换 $(...) / `...` 时禁止模糊命中:
+	// - "all" (allow 池): 直接不命中, 防止命令注入与提权逃逸;
+	// - "any" (deny/ask/default 池): 继续按段评估, 防止借命令替换绕过阻断。
+	if (hasCommandSubstitution && rawPat !== "*" && mode === "all") {
+		return false;
+	}
+
+	// 按照控制/逻辑操作符（&&, ||, ;, |, &）切分为多个子命令段
+	const segments: string[] = [];
+	let currentWords: string[] = [];
+	for (const token of tokens) {
+		if (
+			token.type === "op" &&
+			(token.value === "&&" ||
+				token.value === "||" ||
+				token.value === ";" ||
+				token.value === "&" ||
+				token.value === "|" ||
+				token.value === "|&")
+		) {
+			if (currentWords.length > 0) {
+				segments.push(currentWords.join(" "));
+				currentWords = [];
+			}
+		} else if (token.type === "word") {
+			currentWords.push(token.value);
+		}
+	}
+	if (currentWords.length > 0) {
+		segments.push(currentWords.join(" "));
+	}
+
+	// 复合命令聚合:
+	// - "all" : 每段均需命中 (npm test && npm run lint 需两段均命中 allow);
+	// - "any" : 任一段命中即生效 (deny `Bash(rm *)` 需拦截 `ls && rm -rf /`)。
+	if (segments.length > 1) {
+		return mode === "all"
+			? segments.every((seg) => matchesSingleCommandPattern(seg, rawPat))
+			: segments.some((seg) => matchesSingleCommandPattern(seg, rawPat));
+	}
+
+	return matchesSingleCommandPattern(rawCmd, rawPat);
+}
+
+function matchesSingleCommandPattern(subCmd: string, rawPat: string): boolean {
+	const { tokens } = tokenizeShellCommand(subCmd);
 	const words = tokens.filter((t) => t.type === "word").map((t) => t.value);
 	const { commandWords } = stripLeadingEnvVars(words);
 	const normalizedCmd = commandWords.join(" ");
+	if (!normalizedCmd) return false;
 
-	// 2. 模式无通配符: 需严格单词边界匹配
+	// 模式无通配符: 需严格单词边界匹配
 	// 例如模式 "git" 匹配 "git"、"git status"，但不匹配 "gitk"
 	if (!rawPat.includes("*")) {
 		if (normalizedCmd === rawPat) return true;
@@ -200,7 +280,7 @@ export function matchesCommandPattern(commandStr: string, pattern: string): bool
 		return false;
 	}
 
-	// 3. 模式含通配符: 编译为精确正则
+	// 模式含通配符: 编译为精确正则
 	// "git *" -> /^git( .*)?$/
 	// "npm test*" -> /^npm test.*$/
 	let regexStr = "^";
@@ -223,7 +303,7 @@ export function matchesCommandPattern(commandStr: string, pattern: string): bool
 	regexStr += "$";
 
 	const reg = new RegExp(regexStr);
-	return reg.test(normalizedCmd) || reg.test(rawCmd);
+	return reg.test(normalizedCmd) || reg.test(subCmd.trim());
 }
 
 /**
@@ -287,8 +367,13 @@ export function matchesPathPattern(targetPath: string, pattern: string, cwd: str
 
 /**
  * 校验单条 ParsedRule 是否匹配当前调用上下文
+ * @param mode 复合命令段聚合策略 (deny/ask/default 传 "any", allow 传 "all")
  */
-export function matchesParsedRule(rule: ParsedRule, ctx: RuleMatchContext): boolean {
+export function matchesParsedRule(
+	rule: ParsedRule,
+	ctx: RuleMatchContext,
+	mode: SegmentMatchMode = "all",
+): boolean {
 	const candidateTools = expandToolNames(rule.toolName);
 	const targetToolLower = ctx.toolName.toLowerCase();
 
@@ -303,10 +388,10 @@ export function matchesParsedRule(rule: ParsedRule, ctx: RuleMatchContext): bool
 
 	const spec = rule.specifier;
 
-	// 1. 命令模式 (Bash)
+	// 1. 命令模式 (Bash / Shell / PowerShell)
 	if (rule.specifierKind === "command") {
-		const commandStr = (ctx.input.command || "").trim();
-		return matchesCommandPattern(commandStr, spec);
+		const commandStr = (ctx.input.command || ctx.input.cmd || "").trim();
+		return matchesCommandPattern(commandStr, spec, mode);
 	}
 
 	// 2. 路径模式 (Read / Edit)
@@ -711,34 +796,34 @@ export class PermissionManager {
 			...this.userRules.default,
 		];
 
-		// 1. 扫描 Deny 规则池 (最高优先级，短路阻断)
+		// 1. 扫描 Deny 规则池 (最高优先级，短路阻断；复合命令 any 聚合：任一段命中即拦)
 		for (const r of allDeny) {
 			const parsed = parseDslRule(r);
-			if (matchesParsedRule(parsed, ctx)) {
+			if (matchesParsedRule(parsed, ctx, "any")) {
 				return { decision: "deny", matchedRule: r };
 			}
 		}
 
-		// 2. 扫描 Ask 规则池 (次高优先级，强制人工确认)
+		// 2. 扫描 Ask 规则池 (次高优先级，强制人工确认；复合命令 any 聚合：任一段命中即问)
 		for (const r of allAsk) {
 			const parsed = parseDslRule(r);
-			if (matchesParsedRule(parsed, ctx)) {
+			if (matchesParsedRule(parsed, ctx, "any")) {
 				return { decision: "ask", matchedRule: r };
 			}
 		}
 
-		// 2.5 扫描 default 规则池 (交给审批模式：auto→classifier，非 auto→人工)
+		// 2.5 扫描 default 规则池 (交给审批模式：auto→classifier，非 auto→人工；any 聚合从严)
 		for (const r of allDefault) {
 			const parsed = parseDslRule(r);
-			if (matchesParsedRule(parsed, ctx)) {
+			if (matchesParsedRule(parsed, ctx, "any")) {
 				return { decision: "default", matchedRule: r };
 			}
 		}
 
-		// 3. 扫描 Allow 规则池 (免审通过)
+		// 3. 扫描 Allow 规则池 (免审通过；复合命令 all 聚合：每段均命中才放行)
 		for (const r of allAllow) {
 			const parsed = parseDslRule(r);
-			if (matchesParsedRule(parsed, ctx)) {
+			if (matchesParsedRule(parsed, ctx, "all")) {
 				return { decision: "allow", matchedRule: r };
 			}
 		}
@@ -802,7 +887,7 @@ export class PermissionManager {
 }
 
 // ==============================================================
-// 工具默认权限层（qwen-code getDefaultPermission 等价物，
+// 工具默认权限层
 // ==============================================================
 
 /** 读类工具集合（pi 实际内置的只读工具）。 */
@@ -904,7 +989,14 @@ function isInterpreterToken(rawToken: string): boolean {
 export function isDangerousAllowRule(ruleStr: string): boolean {
 	const parsed = parseDslRule(ruleStr);
 	const tools = expandToolNames(parsed.toolName);
-	const isShellLike = tools.some((t) => t === "bash" || t === "run_shell_command" || t === "monitor");
+	const isShellLike = tools.some(
+		(t) =>
+			t === "bash" ||
+			t === "powershell" ||
+			t === "pwsh" ||
+			t === "run_shell_command" ||
+			t === "monitor",
+	);
 	if (!isShellLike) return false;
 
 	if (!parsed.specifier) return true;
@@ -949,7 +1041,7 @@ export function buildReadDslRule(targetPath: string): string {
 
 /**
  * 解析真实路径（跟随符号链接与内核 `..` 语义）；解析失败（路径不存在等）返回 null。
- *  拍板：白名单匹配必须同时防 `../` 穿越与符号链接逃逸——能解析的按真实位置判，
+ * 拍板：白名单匹配必须同时防 `../` 穿越与符号链接逃逸——能解析的按真实位置判，
  * 无法解析的路径读取必然失败，回退词法匹配维持既有行为。
  */
 function realpathOrNull(p: string): string | null {

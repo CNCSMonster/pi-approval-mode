@@ -1,7 +1,7 @@
 # 生产级审批分类器最佳实践与阶段性配置建议指南 (Classifier Best Practices Guide)
 
-> **版本**：v1.1 (2026-10-08)  
-> **适用范围**：`pi-approval-mode` 双阶段审批模式（Two-Stage Classifier Pipeline）
+> **版本**：v1.0 (2026-10-07)  
+> **适用范围**：`pi-approval-mode` 双阶段审批模式（Two-Stage Classifier Pipeline）  
 
 ---
 

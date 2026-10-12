@@ -7,7 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.9.0] - 2026-10-10
+## [0.10.0] - 2026-10-11
+
+### 🛡️ Security & Robustness Hardening
+- **Multi-Vector Approval Security Hardening**:
+  - **Cross-Platform Shell Governance**: Expands tool interceptor to unify PowerShell (`powershell`, `pwsh`) with bash under the primary approval matrix and strict read-only analyzer.
+  - **Compound Command Injection Defense**: Enhanced AST and tokenizer patterns neutralize operator chaining (`&&`, `||`, `;`) and command substitution (`$(...)`, `` `...` ``) allowlist bypasses.
+  - **Tier 1 Sandbox Priority in Read-Only Mode**: Prioritizes OS-level sandboxing (Bubblewrap / Seatbelt) before static fallback rules, safely wrapping exploratory commands (e.g. `python test.py`) without premature allowlist rejections.
+  - **External Unrecognized Tool Physical Blocking**: Automatically blocks unconfigured external MCP tools with `EBUSY`/`EPERM` in non-interactive/headless environments and read-only mode to prevent side effects.
+  - **State Machine Concurrency Lock**: Serializes concurrent rule mutations in `PermissionManager` to eliminate race conditions and avoid reviving temporary allow rules.
+
+### 🐛 Bug Fixes & Diagnostics
+- **Classifier Upstream 402 Balance & TUI Console Render Integrity**:
+  - **Non-Intrusive Safe File Logging**: Replaces bare `console.error` and `console.warn` writes on hot classification paths with structured file logging (`~/.pi/agent/logs/approval-mode.log`), preventing ANSI hardware line-breaks from desynchronizing `pi-tui` cursor coordinates and covering the user input box.
+  - **Dedicated 402 Insufficient Balance Recognition**: Adds `insufficient_balance` (`upstream_402(Insufficient Balance)`) error classification in `upstream-error-extractor.ts`, providing targeted guidance for account top-up and model switching.
+  - **UI Notification & Modal Hints**: Surfaces proactive UI notifications and approval modal diagnostics (`🔧 排障建议`) for upstream quota exhaustion and balance depletion.
+
 
 ### ✨ Features
 - **Lightweight Read-Only Exploration Mode & OS Kernel Sandboxing**:

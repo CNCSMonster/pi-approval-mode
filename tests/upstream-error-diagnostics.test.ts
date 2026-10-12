@@ -10,6 +10,10 @@ import { mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import approvalModeExtension from "../extensions/approval-mode.ts";
+import {
+	getRecentLogs,
+	clearRecentLogs,
+} from "../extensions/logger.ts";
 
 const sandboxHome = mkdtempSync(join(tmpdir(), "pi-issue-0053-home-"));
 process.env.HOME = sandboxHome;
@@ -86,6 +90,7 @@ async function setup(opts: { hasUI: boolean }): Promise<Harness> {
 const dangerousCmd = "sudo rm -rf /var/log/app.log";
 
 test("Stage 2 捕获 403 锁区异常，透传 shortCode 与 UI notify 及控制台日志", async () => {
+	clearRecentLogs();
 	const h = await setup({ hasUI: false });
 	const err403 = new Error("Request failed with status code 403: Region not supported in your country");
 	(err403 as any).status = 403;
@@ -93,26 +98,16 @@ test("Stage 2 捕获 403 锁区异常，透传 shortCode 与 UI notify 及控制
 	// Stage 1 fast check 抛错流转 Stage 2，Stage 2 也抛出 403
 	h.setQueue([err403, err403]);
 
-	const originalError = console.error;
-	const originalWarn = console.warn;
-	const logs: string[] = [];
-	console.error = (...args: any[]) => logs.push(args.join(" "));
-	console.warn = (...args: any[]) => logs.push(args.join(" "));
+	const res = await h.handlers["tool_call"]({ toolName: "bash", input: { command: dangerousCmd } }, h.ctx);
+	assert.strictEqual(res?.block, true, "fail-closed 阻断");
+	const reason = String(res?.reason);
+	assert.match(reason, /upstream_403\(Region Blocked\)/, "reason 必须透传结构化错误短码");
+	assert.match(reason, /bash/, "包含受影响工具名");
 
-	try {
-		const res = await h.handlers["tool_call"]({ toolName: "bash", input: { command: dangerousCmd } }, h.ctx);
-		assert.strictEqual(res?.block, true, "fail-closed 阻断");
-		const reason = String(res?.reason);
-		assert.match(reason, /upstream_403\(Region Blocked\)/, "reason 必须透传结构化错误短码");
-		assert.match(reason, /bash/, "包含受影响工具名");
-
-		// 检查控制台排障日志
-		assert.ok(logs.some((l) => l.includes("[ApprovalMode] 分类器 Stage 2 请求异常") && l.includes("403")));
-		assert.ok(logs.some((l) => l.includes("网络代理分流规则")));
-	} finally {
-		console.error = originalError;
-		console.warn = originalWarn;
-	}
+	// 检查排障日志（写入安全文件日志记录器，杜绝直写控制台破坏 TUI）
+	const logs = getRecentLogs();
+	assert.ok(logs.some((l) => l.includes("[ApprovalMode] 分类器 Stage 2 请求异常") && l.includes("403")));
+	assert.ok(logs.some((l) => l.includes("网络代理分流规则")));
 });
 
 test("交互模式下 403 锁区异常触发 UI Notify 并在审批弹窗展示 🔧 排障建议", async () => {
@@ -154,6 +149,7 @@ test("401 凭据失效透传 upstream_401(Auth Failed) 并给出 API Key 检查�
 });
 
 test("Stage 2 超时分支打印排障日志并在弹窗中呈现代理检查建议", async () => {
+	clearRecentLogs();
 	const h = await setup({ hasUI: true });
 
 	// stage1 抛错触发流转 Stage 2，Stage 2 挂起模拟超时 (由 withTimeout 返回 null)
@@ -162,19 +158,12 @@ test("Stage 2 超时分支打印排障日志并在弹窗中呈现代理检查建
 		() => new Promise((resolve) => setTimeout(resolve, 5000)), // 模拟挂起
 	]);
 
-	const originalWarn = console.warn;
-	const warns: string[] = [];
-	console.warn = (...args: any[]) => warns.push(args.join(" "));
+	await h.handlers["tool_call"]({ toolName: "bash", input: { command: dangerousCmd } }, h.ctx);
 
-	try {
-		await h.handlers["tool_call"]({ toolName: "bash", input: { command: dangerousCmd } }, h.ctx);
+	const logs = getRecentLogs();
+	assert.ok(logs.some((w) => w.includes("分类器 Stage 2 超时") && w.includes("可能由代理网络挂起或阻塞引起")));
 
-		assert.ok(warns.some((w) => w.includes("分类器 Stage 2 超时") && w.includes("可能由代理网络挂起或阻塞引起")));
-
-		const promptBody = h.dialogs[0];
-		assert.match(promptBody, /🔧 排障建议/);
-		assert.match(promptBody, /检查代理服务是否正常转发/);
-	} finally {
-		console.warn = originalWarn;
-	}
+	const promptBody = h.dialogs[0];
+	assert.match(promptBody, /🔧 排障建议/);
+	assert.match(promptBody, /检查代理服务是否正常转发/);
 });

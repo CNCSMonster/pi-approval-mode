@@ -449,10 +449,17 @@ export function fallbackHeuristicCheck(
 
 
 export function isEscapingWorkspace(cwd: string, filePath: string): boolean {
+	const realCwd = (() => {
+		try {
+			return realpathSync(cwd);
+		} catch {
+			return cwd;
+		}
+	})();
 	const absPath = resolve(cwd, filePath);
 	try {
 		const real = realpathSync(absPath);
-		const rel = relative(cwd, real).replace(/\\/g, "/");
+		const rel = relative(realCwd, real).replace(/\\/g, "/");
 		return rel.startsWith("..") || isAbsolute(rel);
 	} catch {
 		const rel = relative(cwd, absPath).replace(/\\/g, "/");

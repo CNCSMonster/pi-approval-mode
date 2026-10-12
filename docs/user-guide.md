@@ -45,7 +45,8 @@ Options `2`–`4` write an `allow` rule at the corresponding tier, so the same a
 **Dialog interaction & display protections**:
 - **Details folding & toggle hotkeys**: Long commands or bulky tool inputs are bounded by a dynamic vertical height budget. Calls spanning $\ge 7$ visual lines fold by default (showing head 3 and tail 2 visual lines), with single extra-long lines protected via head-and-tail character truncation. Press **`v`** or Pi-native **`Ctrl+O`** at any time to toggle between folded and expanded views;
 - **Batch progress awareness**: When an assistant turn dispatches multiple tool calls in a batch, the dialog title automatically highlights `(Batch X/Y)` to indicate the current call's position in the sequence;
-- **Short terminal degradation**: In small viewports ($\le 28$ rows), the dialog automatically switches to a compact layout, hiding decorative lines and option descriptions to guarantee that choices 1–5 and keybinding hints are fully visible and never clipped.
+- **Short terminal degradation**: In small viewports ($\le 28$ rows), the dialog automatically switches to a compact layout, hiding decorative lines and option descriptions to guarantee that choices 1–5 and keybinding hints are fully visible and never clipped;
+- **Serialized dialog mutex**: when the model dispatches multiple pending tool calls concurrently in one turn, approval dialogs are presented **serially in arrival order** (built-in mutex), so dialogs never overlap and keybindings never race.
 
 ### 1.4 Switching modes
 
@@ -58,11 +59,11 @@ The current mode is always visible in the status bar (e.g. `[⚖️ auto]`; or `
 
 | Mode | Status Badge | Core Positioning |
 | :--- | :--- | :--- |
-| **`manual`** | `[🛡️ manual]` | **Full human review**: Edits, writes, and shell commands require approval; read tools allowed |
-| **`auto-edit`** | `[📝 auto-edit]` | **Auto-edit**: Regular in-workspace edits allowed; protected paths, boundary escapes, and shell require approval |
+| **`manual`** | `[🛡️ manual]` | **Full human review**: Edits, writes, shell commands, and external/third-party tools require approval; read tools allowed |
+| **`auto-edit`** | `[📝 auto-edit]` | **Auto-edit**: Regular in-workspace edits allowed; protected paths, boundary escapes, shell, and external tools require approval |
 | **`auto`** | `[⚖️ auto]` | **Classifier-driven (default)**: Two-stage LLM determines allow/block; persists `[⚖️ auto \| S1⚠️]` on S1 degradation |
 | **`yolo`** | `[⚡ yolo]` | **Autonomous**: Tools execute without dialog prompts (downgrades to baseline on session resume) |
-| **`readonly`**<br>*(alias `plan`)* | `[👁️ readonly]` | **Read-Only Exploration**: Complete filesystem read-only, kernel-level sandboxing, constant Tools Schema, zero dialog interruptions |
+| **`readonly`**<br>*(alias `plan`)* | `[👁️ readonly]` | **Read-Only Exploration**: Complete filesystem read-only, kernel-level sandboxing, non-read external tools physically blocked, constant Tools Schema, zero dialog interruptions |
 
 > ⚠️ **Note**: the `(auto)` after the context usage on status-bar line 2 is **Pi's native
 > auto-compaction indicator** (`compaction.enabled`, see Pi's `docs/settings.md`) and has
@@ -103,8 +104,9 @@ The five modes form an automation ramp — `manual → auto-edit → auto → yo
 | `edit` / `write` — regular workspace file | 🛡️ prompt | ✅ auto | ✅ auto | ✅ auto | ⛔ EROFS block (zero prompt) |
 | `edit` / `write` — **outside workspace** | 🛡️ prompt | 🛡️ prompt | ⚖️ classifier → dialog `*` | ✅ auto | ⛔ EROFS block (zero prompt) |
 | `edit` / `write` — **protected path** `*` | 🛡️ prompt | 🛡️ prompt | ⚖️ classifier → dialog `*` | ✅ auto | ⛔ EROFS block (zero prompt) |
-| `bash` — read-only (allowlist / sandbox) | 🛡️ prompt | 🛡️ prompt | ⚖️ classifier → dialog | ✅ auto | 🔒 Kernel sandbox / graceful fallback |
-| `bash` — anything else | 🛡️ prompt | 🛡️ prompt | ⚖️ classifier → dialog `*` | ✅ auto | ⛔ Policy blocked |
+| `Shell` (`bash` / `powershell`, etc.) — read-only (allowlist / sandbox) | 🛡️ prompt | 🛡️ prompt | ⚖️ classifier → dialog | ✅ auto | 🔒 Kernel sandbox / graceful fallback |
+| `Shell` (`bash` / `powershell`, etc.) — anything else | 🛡️ prompt | 🛡️ prompt | ⚖️ classifier → dialog `*` | ✅ auto | ⛔ Write-intent / remote-effect blocked, otherwise 🔒 sandbox-wrapped |
+| **External / third-party MCP tools** (non-built-in) | 🛡️ prompt | 🛡️ prompt | ⚖️ classifier → dialog | ✅ auto | ⛔ Physically blocked |
 | read-family, no rule, **inside** workspace | ✅ auto | ✅ auto | ✅ auto | ✅ auto | ✅ auto |
 | read-family, no rule, **outside** workspace (except skill dirs `*`) | 🛡️ ask dialog | 🛡️ ask dialog | 🛡️ ask dialog | 🛡️ ask dialog | 🛡️ ask dialog |
 | read-family, matched **`default`** rule | 🛡️ prompt | 📝 prompt | ⚖️ classifier → dialog `*` | ✅ auto | ✅ auto |
@@ -117,7 +119,10 @@ The five modes form an automation ramp — `manual → auto-edit → auto → yo
 - **Protected path** = workspace-sensitive locations (`.pi/`, `.git/`, `AGENTS.md`, dotfiles such as `.bashrc` / `.zshrc` / `.profile`, env and keys `.env*` / `id_rsa*` / `id_ed25519*`, credential files `.pypirc` / `.git-credentials`, CLI configs `.config/gh/` / `.config/glab-cli/`, and cloud/cluster definitions `helm/` / `k8s/` / `iam/`). In `auto` these route through the classifier instead of the fast path.
 - **Classifier → dialog**: the two-stage LLM classifier reviews the call with its conversation context. If flagged risky, an interactive dialog shows the risk reason before the same `1`–`5` choices; if deemed safe, the call proceeds without any prompt.
 - **Skill dirs** `*` = user-level `~/.pi/agent/skills/**` and `~/.agents/skills/**` (always exempt) plus project-level `.pi/skills/**` and `.agents/skills/**` (exempt only when the project is trusted). Explicit `deny` / `ask` rules still win over this whitelist.
-- **Read-only `bash` & Tiered Sandboxing**: in `readonly` mode, shell commands are wrapped in OS kernel-level sandboxes (macOS `sandbox-exec`, Linux `bwrap`) to prevent writes physically; in Windows or sandbox-less environments, it falls back gracefully to a strict read-only allowlist (`git status`, `ls`, `grep`, `cargo check`, etc.). **In `auto` the read-only fast path is retired**: the analysis now only feeds the "static structure" display line of `auto` dialogs — display, not verdict. Every rule-unmatched shell call, `ls` included, goes through the classifier; pin a command back to 0 s with an `allow` rule.
+- **Read-only Shell & tiered sandboxing (layer order restored)**: in `readonly` mode, when an OS kernel-level read-only sandbox is available (macOS `sandbox-exec`, Linux `bwrap`), **the sandbox comes first** — the static layer only blocks explicit local write intent (`rm`, write redirections, compilers, `sed -i`, `find -delete`, etc.) and remote/session side effects the sandbox cannot contain (`git push`, `npm publish`, `ssh`, non-GET `curl`, etc.); everything else is handed to the sandbox wrapped — complex exploration such as `python test.py`, `pytest`, and `cargo check` is no longer killed prematurely by the allowlist. On Windows or sandbox-less environments it degrades to a strict read-only allowlist (`git status`, `ls`, `grep`, `cargo check`, etc.; `2>/dev/null` null redirects are allowed, global flags like `git -C <dir>` are pierced, and creating operations such as `git branch <name>` / `git tag <name>`, `--output` file writes, and `$(...)` command substitution are blocked). **In `auto` the read-only fast path is retired**: the analysis now only feeds the "static structure" display line of `auto` dialogs — display, not verdict. Every rule-unmatched shell call, `ls` included, goes through the classifier; pin a command back to 0 s with an `allow` rule.
+- **Compound-command rule matching semantics**: for commands joined by `&&`, `||`, `;`, `|`, `&`, an `allow` rule requires **every segment to match** before approval (`git status && rm -rf /` is never approved by `Bash(git *)`); `deny` / `ask` / `default` rules take effect when **any segment matches** (`ls && rm -rf /` is still intercepted by `Bash(rm *)`). Commands containing `$(…)` substitution or backticks never take part in fuzzy `allow` matching.
+- **Unified shell tool governance**: the Windows built-in `powershell` and `pwsh` tools (and `run_shell_command`) receive exactly the same gates as `bash` — approval dialogs, classifier review, and rule matching behave identically across all modes.
+- **External / third-party MCP tool backstop**: non-built-in third-party/MCP tools are no longer silently approved — in `readonly` non-read tools are physically blocked; in `manual` / `auto-edit` they go straight to a human approval dialog (English denial in headless runs); in `auto` they are submitted to the two-stage classifier, and flagged calls open a dialog.
 - **Destructive Git Operations**: `git push --force-with-lease` is treated as a safe collaborative operation exempt from high-risk regex fallbacks and judged by the classifier; bare `--force` / `-f` and destructive rewrites are strictly intercepted by deterministic heuristics.
 
 ### 2.3 Headless (non-interactive) runs
@@ -128,6 +133,7 @@ English denial message instead — the model is told why and how to proceed safe
 - `ask` rule → `[Permission: ask] Rule … requires interactive confirmation …`
 - classifier flag → `[Auto Mode] … blocked by the safety classifier …`
 - manual-mode prompts → `[Manual Mode] … no interactive UI …`
+- external/third-party tool needs a human → `[Manual Mode] Third-party tool "…" requires human approval in headless mode.` (in `readonly` it is directly `[Read-Only Mode] Tool "…" is not a recognized read-only exploration tool.`)
 - loop hard limit → `[Circuit Breaker] … do not retry …`
 
 In `auto` headless runs, a classifier *availability* problem silently falls back to the
@@ -147,7 +153,7 @@ Tool(specifier)
 | :--- | :--- | :--- |
 | `Read` | `read`, `grep`, `find`, `ls` (and aliases) | `Read(/src/**)`, `Read(.env*)`, `Read(~/.ssh/**)` |
 | `Edit` | `edit`, `write` | `Edit(/package.json)`, `Edit(./config/**)` |
-| `Bash` | `bash` | `Bash(git status)`, `Bash(git push *)`, `Bash(sudo *)` |
+| `Bash` | `bash`, `powershell`, `pwsh`, `run_shell_command`, and other shell tools | `Bash(git status)`, `Bash(git push *)`, `Bash(sudo *)` |
 
 **Scope prefixes** (applied to the specifier):
 
@@ -412,16 +418,17 @@ Pi deliberately ships no approval mechanism of its own (the official docs state 
 from this plugin. The two "auto"s belong to entirely different subsystems and merely share
 a word.
 
-### 5.8 Dealing with Classifier 403 (Region Blocked), 401 (Auth Failed), or Timeouts
+### 5.8 Dealing with Classifier 403 (Region Blocked), 402 (Insufficient Balance), 401 (Auth Failed), or Timeouts
 
-The plugin embeds an upstream error diagnostics extractor (`upstream-error-extractor`). When model requests fail, it avoids swallowing errors into a generic exception. Instead, it emits structured diagnostic logs to the console and passes exact short codes and troubleshooting suggestions directly to the UI dialog:
+The plugin embeds an upstream error diagnostics extractor (`upstream-error-extractor`). When model requests fail, it avoids swallowing errors into a generic exception. Instead, it writes structured diagnostic logs safely to a dedicated log file (defaults to `~/.pi/agent/logs/approval-mode.log`, completely eliminating bare console writes that corrupt TUI rendering and cursor alignment), while passing exact short codes and troubleshooting suggestions directly to the UI dialog:
 
 | Short Code | Typical Cause | Plugin Behavior & Solution |
 | :--- | :--- | :--- |
 | **`upstream_403(Region Blocked)`** | Provider region restriction or Cloudflare block | Emits error UI notification and appends "🔧 排障建议" in approval dialogs. **Fix**: Adjust proxy rules to route classifier API endpoints through supported regions |
+| **`upstream_402(Insufficient Balance)`** | Provider account balance or quota exhausted | Emits error UI notification and appends "🔧 排障建议" in approval dialogs. **Fix**: Top up account balance in the provider console or switch models via `/classifier-model` |
 | **`upstream_401(Auth Failed)`** | Missing/invalid API key or expired permissions | Emits error notification. **Fix**: Verify environment variables and `models.json` keys |
 | **`upstream_429(Rate Limited)`** | Rate limit or quota exhaustion | Falls back to human review. **Fix**: Retry later or switch models via `/classifier-model` |
-| **`network_error`** | Network disconnected or proxy port down | Logs connection failure. **Fix**: Ensure proxy client (e.g. port 7890) is running |
+| **`network_error`** | Network disconnected or proxy port down | Dedicated log records connection failure. **Fix**: Ensure proxy client (e.g. port 7890) is running |
 | **`stage2_timeout(...)`** | Network hung or slow proxy response | Warns of possible proxy hang. **Fix**: Increase `classifierTimeoutMs` or check proxy stability |
 
 ---
