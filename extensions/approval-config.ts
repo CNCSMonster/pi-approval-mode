@@ -128,71 +128,128 @@ export function loadApprovalConfig(
 }
 
 // ==========================================
-// 项目级自然语言审批策略加载 (.pi/approval-policy.md)
+// 自然语言审批策略加载 (~/.pi/agent/approval-policy.md 与 .pi/approval-policy.md)
 // ==========================================
 
-export const PROJECT_POLICY_MAX_LENGTH = 3000;
+export const GLOBAL_POLICY_MAX_LENGTH = 2500;
+export const PROJECT_POLICY_MAX_LENGTH = 2500;
+
+export interface LoadApprovalPoliciesResult {
+	globalPolicy?: string;
+	projectPolicy?: string;
+	projectPolicyFound: boolean;
+	projectPolicyBlocked: boolean;
+	globalPolicyTruncated: boolean;
+	projectPolicyTruncated: boolean;
+}
 
 export interface LoadProjectApprovalPolicyResult {
 	policy: string | undefined;
 	policyFound: boolean;
 	policyBlocked: boolean;
 	policyTruncated: boolean;
+	globalPolicy?: string;
+	projectPolicy?: string;
 }
 
 /**
- * 加载项目级自然语言审批策略（.pi/approval-policy.md）。
+ * 分层加载全局用户偏好与项目工作区审批策略。
  *
- * 信任闸核验：未受信任的工作区禁止加载，防止恶意项目 Prompt Injection 提权。
- * 预算控制：超出 PROJECT_POLICY_MAX_LENGTH (3000) 字符时安全截断并记录 debug 提示。
+ * 信任层级与安全隔离：
+ * 1. 全局策略（~/.pi/agent/approval-policy.md）：用户个人跨项目基准，信任度最高，无条件读取生效。
+ * 2. 项目策略（.pi/approval-policy.md）：工作区定制特征，经信任闸（isTrusted）核验；未信任时绝对阻断。
+ * 3. 预算控制：全局与项目级各自独立享受 2500 字符预算截断，超长部分安全截断。
  *
  * @param cwd        工作区根目录
  * @param isTrusted  项目是否受信任（ctx.isProjectTrusted()）
  * @param agentDir   pi agent 配置目录（运行时 getAgentDir()，单测注入临时目录）
+ */
+export function loadApprovalPolicies(
+	cwd: string,
+	isTrusted: boolean,
+	agentDir: string,
+): LoadApprovalPoliciesResult {
+	let globalPolicy: string | undefined;
+	let projectPolicy: string | undefined;
+	let projectPolicyFound = false;
+	let projectPolicyBlocked = false;
+	let globalPolicyTruncated = false;
+	let projectPolicyTruncated = false;
+
+	// 1. 全局级策略（用户个人基准偏好，始终加载）
+	const globalPolicyPath = join(agentDir, "approval-policy.md");
+	if (existsSync(globalPolicyPath)) {
+		try {
+			const raw = readFileSync(globalPolicyPath, "utf-8").trim();
+			if (raw.length > 0) {
+				if (raw.length > GLOBAL_POLICY_MAX_LENGTH) {
+					globalPolicy = raw.slice(0, GLOBAL_POLICY_MAX_LENGTH);
+					globalPolicyTruncated = true;
+					console.debug(
+						`[ApprovalMode] 全局审批偏好超出预算上限 (${GLOBAL_POLICY_MAX_LENGTH} 字符)，已安全截断（原始长度: ${raw.length}）。`,
+					);
+				} else {
+					globalPolicy = raw;
+				}
+			}
+		} catch {
+			// ignore
+		}
+	}
+
+	// 2. 项目级策略（工作区专属定制，经信任闸核验）
+	const projectPolicyPath = join(cwd, ".pi", "approval-policy.md");
+	if (existsSync(projectPolicyPath)) {
+		projectPolicyFound = true;
+		if (isTrusted) {
+			try {
+				const raw = readFileSync(projectPolicyPath, "utf-8").trim();
+				if (raw.length > 0) {
+					if (raw.length > PROJECT_POLICY_MAX_LENGTH) {
+						projectPolicy = raw.slice(0, PROJECT_POLICY_MAX_LENGTH);
+						projectPolicyTruncated = true;
+						console.debug(
+							`[ApprovalMode] 项目审批策略超出预算上限 (${PROJECT_POLICY_MAX_LENGTH} 字符)，已安全截断（原始长度: ${raw.length}）。`,
+						);
+					} else {
+						projectPolicy = raw;
+					}
+				}
+			} catch {
+				// ignore
+			}
+		} else {
+			projectPolicyBlocked = true;
+		}
+	}
+
+	return {
+		globalPolicy,
+		projectPolicy,
+		projectPolicyFound,
+		projectPolicyBlocked,
+		globalPolicyTruncated,
+		projectPolicyTruncated,
+	};
+}
+
+/**
+ * 兼容性封装：返回兼顾旧 API 签名的结果。
  */
 export function loadProjectApprovalPolicy(
 	cwd: string,
 	isTrusted: boolean,
 	agentDir: string,
 ): LoadProjectApprovalPolicyResult {
-	let policy: string | undefined;
-	let policyFound = false;
-	let policyBlocked = false;
-	let policyTruncated = false;
-
-	// 1. 全局级策略（可选）
-	const globalPolicyPath = join(agentDir, "approval-policy.md");
-	if (existsSync(globalPolicyPath)) {
-		try {
-			policy = readFileSync(globalPolicyPath, "utf-8");
-		} catch {
-			// ignore
-		}
-	}
-
-	// 2. 项目级策略覆盖（经信任闸核验）
-	const projectPolicyPath = join(cwd, ".pi", "approval-policy.md");
-	if (existsSync(projectPolicyPath)) {
-		policyFound = true;
-		if (isTrusted) {
-			try {
-				policy = readFileSync(projectPolicyPath, "utf-8");
-			} catch {
-				// ignore
-			}
-		} else {
-			policyBlocked = true;
-		}
-	}
-
-	// 3. 预算控制截断
-	if (policy !== undefined && policy.length > PROJECT_POLICY_MAX_LENGTH) {
-		policy = policy.slice(0, PROJECT_POLICY_MAX_LENGTH);
-		policyTruncated = true;
-		console.debug(
-			`[ApprovalMode] 项目审批策略超出预算上限 (${PROJECT_POLICY_MAX_LENGTH} 字符)，已安全截断（原始长度: ${policy.length}）。`,
-		);
-	}
-
-	return { policy, policyFound, policyBlocked, policyTruncated };
+	const res = loadApprovalPolicies(cwd, isTrusted, agentDir);
+	// 兼容策略：如果存在项目策略则返回项目策略，否则返回全局策略；但同时附带分层字段
+	const policy = res.projectPolicy ?? res.globalPolicy;
+	return {
+		policy,
+		policyFound: res.projectPolicyFound,
+		policyBlocked: res.projectPolicyBlocked,
+		policyTruncated: res.projectPolicyTruncated || res.globalPolicyTruncated,
+		globalPolicy: res.globalPolicy,
+		projectPolicy: res.projectPolicy,
+	};
 }

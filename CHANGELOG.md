@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-10-12
+
+### ✨ Features
+- **Hierarchical Natural Language Approval Policies**:
+  - **Dual-Tier Composition & Coexistence**: Replaces destructive workspace overriding with segmented inheritance. Both global personal security preferences (`~/.pi/agent/approval-policy.md`) and project workspace policies (`.pi/approval-policy.md`) load concurrently and coexist in dedicated sections within the classifier prompt.
+  - **Independent Truncation Budgets**: Grants dedicated, independent 2,500-character budgets to global and project policies, providing explicit UI notifications when either policy exceeds its limits.
+  - **Trust Gate Anti-Hijacking Isolation**: In untrusted workspaces (`isTrusted === false`), project policies are hard blocked while the user's global preferences remain strictly enforced, preventing prompt injection privilege escalation from untrusted third-party repositories.
+  - **Immutable Three-Tier Precedence Hierarchy**: Embeds clear arbitration rules (`Default HARD BLOCK > Global User Security Preferences > Project Workspace Context & Policies`) into system prompt decision principles, strictly preventing project policies from relaxing global user boundaries and erring on the side of blocking during ambiguity.
+  - **User Manual & Guide Synchronization**: Documented natural language approval policy usage and inheritance semantics in user guides.
+
 ## [0.10.0] - 2026-10-11
 
 ### 🛡️ Security & Robustness Hardening

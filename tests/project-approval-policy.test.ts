@@ -67,7 +67,7 @@ describe("项目级自然语言审批策略挂载与分类器提示词注入", (
 		assert.equal(result.policyBlocked, true, "未受信任时 policyBlocked 必须为 true");
 	});
 
-	it("超过 3000 字符时安全截断", () => {
+	it("超过 2500 字符时安全截断", () => {
 		const cwd = join(TMP_ROOT, "truncation-project");
 		const agentDir = join(TMP_ROOT, "agent-dir");
 		mkdirSync(join(cwd, ".pi"), { recursive: true });
@@ -79,23 +79,23 @@ describe("项目级自然语言审批策略挂载与分类器提示词注入", (
 		const result = loadProjectApprovalPolicy(cwd, true, agentDir);
 
 		assert.equal(result.policy!.length, PROJECT_POLICY_MAX_LENGTH, "截断后长度必须等于 PROJECT_POLICY_MAX_LENGTH");
-		assert.equal(result.policy!.length, 3000, "截断后长度必须为 3000");
+		assert.equal(result.policy!.length, 2500, "截断后长度必须为 2500");
 		assert.equal(result.policyTruncated, true, "policyTruncated 必须为 true");
-		assert.equal(result.policy, "A".repeat(3000), "截断内容必须为前 3000 字符");
+		assert.equal(result.policy, "A".repeat(2500), "截断内容必须为前 2500 字符");
 	});
 
-	it("恰好 3000 字符时不截断", () => {
+	it("恰好 2500 字符时不截断", () => {
 		const cwd = join(TMP_ROOT, "exact-project");
 		const agentDir = join(TMP_ROOT, "agent-dir");
 		mkdirSync(join(cwd, ".pi"), { recursive: true });
 		mkdirSync(agentDir, { recursive: true });
 
-		const exactPolicy = "B".repeat(3000);
+		const exactPolicy = "B".repeat(2500);
 		writeFileSync(join(cwd, ".pi", "approval-policy.md"), exactPolicy, "utf-8");
 
 		const result = loadProjectApprovalPolicy(cwd, true, agentDir);
 
-		assert.equal(result.policy!.length, 3000, "恰好 3000 字符不应截断");
+		assert.equal(result.policy!.length, 2500, "恰好 2500 字符不应截断");
 		assert.equal(result.policyTruncated, false, "恰好上限时 policyTruncated 必须为 false");
 	});
 

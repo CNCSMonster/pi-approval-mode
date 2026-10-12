@@ -332,6 +332,26 @@ Stage 1 fast screening is engineered to allow over 95% of benign tool calls in ~
    - Run `/classifier-model --stage1 <provider/model>` to switch to a more responsive, reliable model;
    - If failures are due to network latency, raise `classifierTimeoutMs` in `~/.pi/agent/approval-config.json`.
 
+### 4.5 Custom Natural Language Approval Policies (Hierarchical Baseline & Workspace Context)
+
+Beyond deterministic DSL permission rules (`approval-rules.json`), the system natively supports Markdown natural language policies dynamically injected into the classifier's system prompt:
+
+#### 4.5.1 Two-Tier Hierarchical Architecture & Independent Budgets
+- **Global User Baseline Preferences** (`~/.pi/agent/approval-policy.md`):
+  - Defines cross-project personal security baselines (e.g. "always block unconventional kill -9", "block unauthorized changes to global git configs", "allow local static analysis commands without prompts");
+  - Protected by an independent **2,500-character** budget truncation limit.
+- **Project Workspace Context & Policies** (`.pi/approval-policy.md`):
+  - Defines workspace-specific environment profiles and operational context (e.g. "this is a Vite web app, localhost:5173 is a routine dev server", "database migrations under /prisma/migrations require review");
+  - Protected by an independent **2,500-character** budget truncation limit.
+
+#### 4.5.2 Composition, Inheritance & Anti-Hijacking Isolation
+1. **Segmented Composition, No Overwrites**: Project policies and user global preferences **coexist in distinct dedicated sections** within the system prompt. Opening a new repo will never silently erase your carefully maintained global security baselines;
+2. **Project Trust Gate Isolation**: If the current workspace is untrusted (`isTrusted === false`), project-level policies are **hard blocked and discarded**, but **your global user preferences continue to be strictly enforced**, eliminating prompt injection privilege escalation from untrusted open-source repos;
+3. **Immutable Three-Tier Precedence Hierarchy**:
+   - Precedence Ladder: **`Default HARD BLOCK > Global User Security Preferences > Project Workspace Context & Policies`**;
+   - Invariant: Project policies may expand soft blocks or clarify routine benign tasks, but **CAN NEVER override, bypass, or weaken global user preferences or default hard blocks**;
+   - Conflict Resolution: If rules appear ambiguous or conflicting, the classifier **always favors the stricter restriction (err on the side of blocking)**.
+
 ---
 
 ## 5. FAQ & Troubleshooting

@@ -74,7 +74,10 @@ import {
 	ALL_MODES,
 	normalizeMode,
 	loadApprovalConfig,
+	loadApprovalPolicies,
 	loadProjectApprovalPolicy,
+	GLOBAL_POLICY_MAX_LENGTH,
+	PROJECT_POLICY_MAX_LENGTH,
 	isThinkingLevel,
 	EXTENDED_THINKING_LEVELS,
 	type ApprovalMode,
@@ -118,7 +121,10 @@ export {
 	ALL_MODES,
 	normalizeMode,
 	loadApprovalConfig,
+	loadApprovalPolicies,
 	loadProjectApprovalPolicy,
+	GLOBAL_POLICY_MAX_LENGTH,
+	PROJECT_POLICY_MAX_LENGTH,
 	isThinkingLevel,
 	EXTENDED_THINKING_LEVELS,
 	sanitizeUntrustedDetail,
@@ -945,7 +951,8 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 	let classifierStage2TimeoutMs = 3000;
 	let latestCtx: ExtensionContext | undefined;
 
-	// 项目级自然语言审批策略缓存（session_start/reload 时加载，分类器调用时注入）
+	// 全局与项目级自然语言审批策略缓存（session_start/reload 时加载，分类器调用时注入）
+	let cachedGlobalPolicy: string | undefined;
 	let cachedProjectPolicy: string | undefined;
 	let cachedClassifierBasePrompt: string = CLASSIFIER_BASE_PROMPT;
 
@@ -1078,14 +1085,31 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		const { config: fileConfig, projectConfigBlocked } = loadApprovalConfig(ctx.cwd, isTrusted, getAgentDir());
 		const projectRulesBlocked = permissionManager.isProjectRulesBlocked();
 
-		// 加载项目级自然语言审批策略（过信任闸 + 预算截断）
-		const { policy: loadedPolicy, policyBlocked: projectPolicyBlocked, policyTruncated } =
-			loadProjectApprovalPolicy(ctx.cwd, isTrusted, getAgentDir());
-		cachedProjectPolicy = loadedPolicy;
-		cachedClassifierBasePrompt = buildClassifierBasePrompt(cachedProjectPolicy);
-		if (policyTruncated) {
+		// 分层加载全局用户偏好与项目审批策略（过信任闸 + 独立预算截断）
+		const {
+			globalPolicy: loadedGlobalPolicy,
+			projectPolicy: loadedProjectPolicy,
+			projectPolicyBlocked,
+			globalPolicyTruncated,
+			projectPolicyTruncated,
+		} = loadApprovalPolicies(ctx.cwd, isTrusted, getAgentDir());
+
+		cachedGlobalPolicy = loadedGlobalPolicy;
+		cachedProjectPolicy = loadedProjectPolicy;
+		cachedClassifierBasePrompt = buildClassifierBasePrompt({
+			globalPolicy: cachedGlobalPolicy,
+			projectPolicy: cachedProjectPolicy,
+		});
+
+		if (globalPolicyTruncated) {
 			ctx.ui.notify(
-				`⚠️ [ApprovalMode] 项目审批策略 (.pi/approval-policy.md) 超出 3000 字符预算上限，已安全截断。`,
+				`⚠️ [ApprovalMode] 全局审批偏好 (~/.pi/agent/approval-policy.md) 超出 ${GLOBAL_POLICY_MAX_LENGTH} 字符上限，已安全截断。`,
+				"warning",
+			);
+		}
+		if (projectPolicyTruncated) {
+			ctx.ui.notify(
+				`⚠️ [ApprovalMode] 项目审批策略 (.pi/approval-policy.md) 超出 ${PROJECT_POLICY_MAX_LENGTH} 字符上限，已安全截断。`,
 				"warning",
 			);
 		}
@@ -1093,7 +1117,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		// 若当前项目未受信任且携带项目级配置或规则，发出明确安全告警
 		if (!isTrusted && (projectConfigBlocked || projectRulesBlocked || projectPolicyBlocked)) {
 			ctx.ui.notify(
-				`⚠️ 检测到当前工作区未受信任（Untrusted）。为防御恶意安全策略劫持，项目级审批配置与规则已被安全闸阻断禁用，仅加载用户全局配置。如需启用请使用 --approve 信任项目。`,
+				`⚠️ 检测到当前工作区未受信任（Untrusted）。为防御恶意安全策略劫持，项目级审批配置与规则已被安全闸阻断禁用，继续生效用户全局安全偏好。如需启用请使用 --approve 信任项目。`,
 				"warning",
 			);
 		}
