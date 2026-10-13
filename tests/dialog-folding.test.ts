@@ -477,3 +477,76 @@ test(" E2E: 翻页穿透特性探测与键盘事件转发", async () => {
 	compNoApi.handleInput("\x1b[5~");
 	compNoApi.handleInput("\x1b[6~");
 });
+
+test(" 详情折叠: 展开态分页展示与指示行切片 (零偏移 / 中间页 / 底部页)", () => {
+	const content = Array.from({ length: 30 }, (_, i) => `item_line_${i + 1}`).join("\n");
+	const maxExpandedLines = 10;
+
+	// 1. 首页 (pageOffset = 0)
+	const page0 = formatFoldableDetail(
+		{ content, width: 80, isExpanded: true, maxExpandedLines, pageOffset: 0 },
+		dummyTheme,
+	);
+	assert.equal(page0.isFoldable, true);
+	assert.equal(page0.hasMorePages, true);
+	assert.ok(page0.lines.some((l) => l.includes("item_line_1")), "首页包含首行");
+	assert.ok(!page0.lines.some((l) => l.includes("上方还有")), "首页无上方提示");
+	assert.ok(page0.lines.some((l) => l.includes("按 PgDn 下翻")), "首页包含向后翻页提示");
+
+	// 2. 中间页 (pageOffset = 10)
+	const pageMid = formatFoldableDetail(
+		{ content, width: 80, isExpanded: true, maxExpandedLines, pageOffset: 10 },
+		dummyTheme,
+	);
+	assert.equal(pageMid.hasMorePages, true);
+	assert.ok(pageMid.lines.some((l) => l.includes("上方还有 10 行，按 PgUp 上翻")), "中间页包含上方提示");
+	assert.ok(pageMid.lines.some((l) => l.includes("item_line_11")), "中间页展示对应行");
+	assert.ok(pageMid.lines.some((l) => l.includes("按 PgDn 下翻")), "中间页包含下方提示");
+
+	// 3. 底部页 (pageOffset = 25)
+	const pageEnd = formatFoldableDetail(
+		{ content, width: 80, isExpanded: true, maxExpandedLines, pageOffset: 25 },
+		dummyTheme,
+	);
+	assert.equal(pageEnd.hasMorePages, true);
+	assert.ok(pageEnd.lines.some((l) => l.includes("item_line_30")), "底部页包含末行");
+	assert.ok(pageEnd.lines.some((l) => l.includes("[已翻阅至底部，按 PgUp 上翻 / v 折叠收起]")), "包含触底提示");
+});
+
+test(" E2E: 展开超长详情时 PgUp/PgDn 就地翻阅详情，折叠态穿透翻阅历史", async () => {
+	const h = await setupInteractiveTuiDialog({ terminalRows: 40, hasScrollApi: true });
+	// 构造 100 行超长命令
+	const longCmd = Array.from({ length: 100 }, (_, i) => `echo "step_${i + 1}"`).join("\n");
+
+	await h.handlers["tool_call"]({ toolName: "bash", input: { command: longCmd } }, h.ctx);
+	const comp = h.getRendered();
+
+	// 1. 折叠态：按 PageDown/PageUp 应该穿透至背景历史
+	comp.handleInput("\x1b[6~");
+	assert.deepEqual(h.scrollCalls, ["page-down"], "折叠态 PageDown 应调用 scrollTranscript");
+	h.scrollCalls.length = 0;
+
+	// 2. 按 "v" 展开
+	comp.handleInput("v");
+	let rendered = comp.render(80).join("\n");
+	assert.ok(rendered.includes("[PgUp/PgDn] 翻阅详情"), "展开态底栏提示切换为翻阅详情");
+	assert.ok(rendered.includes("step_1"), "展开第一页可见 step_1");
+	assert.ok(rendered.includes("按 PgDn 下翻"), "第一页底部有 PgDn 引导");
+
+	// 3. 展开态按 PageDown：就地翻页，不得调用 scrollTranscript
+	comp.handleInput("\x1b[6~");
+	assert.equal(h.scrollCalls.length, 0, "展开态 PageDown 必须被弹窗消费，绝不穿透背景");
+
+	rendered = comp.render(80).join("\n");
+	assert.ok(rendered.includes("上方还有"), "翻页后出现上方提示");
+	assert.ok(rendered.includes("step_35") || rendered.includes("step_40"), "翻页后后续内容可见");
+
+	// 4. 再次按 "v" 收起：状态复原为折叠态，翻页键恢复为翻背景
+	comp.handleInput("v");
+	rendered = comp.render(80).join("\n");
+	assert.ok(rendered.includes("[PgUp/PgDn] 翻阅历史"), "收起后底栏恢复为翻阅历史");
+
+	comp.handleInput("\x1b[5~");
+	assert.deepEqual(h.scrollCalls, ["page-up"], "收起后 PageUp 恢复调用 scrollTranscript");
+});
+

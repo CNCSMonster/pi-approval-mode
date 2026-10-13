@@ -43,7 +43,10 @@ Every dialog offers five actions — **press the number key `1`–`5` for instan
 Options `2`–`4` write an `allow` rule at the corresponding tier, so the same action never bothers you again at that scope.
 
 **Dialog interaction & display protections**:
-- **Details folding & toggle hotkeys**: Long commands or bulky tool inputs are bounded by a dynamic vertical height budget. Calls spanning $\ge 7$ visual lines fold by default (showing head 3 and tail 2 visual lines), with single extra-long lines protected via head-and-tail character truncation. Press **`v`** or Pi-native **`Ctrl+O`** at any time to toggle between folded and expanded views;
+- **Details folding, expansion & collaborative paging**: Long commands or bulky tool inputs are bounded by a dynamic vertical height budget. Calls spanning $\ge 7$ visual lines fold by default (showing head 3 and tail 2 visual lines), with single extra-long lines protected via head-and-tail character truncation:
+  - **In folded state**: press **`PgUp`** / **`PgDn`** to freely scroll background transcript history (hint: `[PgUp/PgDn] 翻阅历史`);
+  - **In expanded state**: press **`v`** or Pi-native **`Ctrl+O`** to expand details. When content exceeds the viewport budget, **`PgUp`** / **`PgDn`** automatically switches to page through the multi-page tool arguments (hint: `[PgUp/PgDn] 翻阅详情`), allowing you to review long content down to the very last line;
+  - Press **`v`** or **`Ctrl+O`** again at any time to instantly refold and reset paging back to transcript scrolling;
 - **Batch progress awareness**: When an assistant turn dispatches multiple tool calls in a batch, the dialog title automatically highlights `(Batch X/Y)` to indicate the current call's position in the sequence;
 - **Short terminal degradation**: In small viewports ($\le 28$ rows), the dialog automatically switches to a compact layout, hiding decorative lines and option descriptions to guarantee that choices 1–5 and keybinding hints are fully visible and never clipped;
 - **Serialized dialog mutex**: when the model dispatches multiple pending tool calls concurrently in one turn, approval dialogs are presented **serially in arrival order** (built-in mutex), so dialogs never overlap and keybindings never race.

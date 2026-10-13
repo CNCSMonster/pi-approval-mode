@@ -121,6 +121,7 @@ export interface FoldedDetailResult {
 	isFoldable: boolean;
 	totalVisualLines: number;
 	totalChars: number;
+	hasMorePages?: boolean;
 }
 
 export interface FormatDetailOptions {
@@ -130,6 +131,7 @@ export interface FormatDetailOptions {
 	indent?: string;
 	contIndent?: string;
 	maxExpandedLines?: number;
+	pageOffset?: number;
 }
 
 /**
@@ -186,23 +188,55 @@ export function formatFoldableDetail(
 	if (isExpanded) {
 		const lines: string[] = [];
 		const isExceededBudget = rawVisualLines.length > maxExpandedLines;
-		const displayLines = isExceededBudget
-			? rawVisualLines.slice(0, maxExpandedLines)
-			: rawVisualLines;
+		const offset = Math.max(0, options.pageOffset ?? 0);
+
+		if (!isExceededBudget) {
+			for (const l of rawVisualLines) {
+				lines.push(theme.fg("text", l));
+			}
+			const hint = `[已展开完整内容，按 v 或 Ctrl+O 折叠收起]`;
+			for (const hl of wrapDialogLine(hint, safeWidth, indent, contIndent)) {
+				lines.push(theme.fg("muted", hl));
+			}
+			return {
+				lines,
+				isFoldable: true,
+				totalVisualLines: rawVisualLineCount,
+				totalChars,
+				hasMorePages: false,
+			};
+		}
+
+		// 超出单屏预算，动态计算指示行配额扣减与窗口切片
+		const topSlot = offset > 0 ? 1 : 0;
+		const availBeforeBottom = Math.max(1, maxExpandedLines - topSlot);
+		const bottomSlot = offset + availBeforeBottom < rawVisualLineCount ? 1 : 0;
+		const contentBudget = Math.max(1, maxExpandedLines - topSlot - bottomSlot);
+
+		const sliceStart = Math.min(rawVisualLineCount, offset);
+		const sliceEnd = Math.min(rawVisualLineCount, sliceStart + contentBudget);
+		const displayLines = rawVisualLines.slice(sliceStart, sliceEnd);
+
+		if (topSlot > 0) {
+			const topHint = `⋯ (上方还有 ${sliceStart} 行，按 PgUp 上翻) ⋯`;
+			for (const hl of wrapDialogLine(topHint, safeWidth, indent, contIndent)) {
+				lines.push(theme.fg("muted", hl));
+			}
+		}
 
 		for (const l of displayLines) {
 			lines.push(theme.fg("text", l));
 		}
 
-		if (isExceededBudget) {
-			const omitted = rawVisualLineCount - maxExpandedLines;
-			const hint = `⋯ (受终端高度预算限制已展开至 ${maxExpandedLines} 行，余 ${omitted} 行未展示，按 v 或 Ctrl+O 折叠) ⋯`;
-			for (const hl of wrapDialogLine(hint, safeWidth, indent, contIndent)) {
+		if (bottomSlot > 0) {
+			const omitted = rawVisualLineCount - sliceEnd;
+			const bottomHint = `⋯ (受终端高度预算限制已展开至 ${maxExpandedLines} 行，余 ${omitted} 行未展示，按 PgDn 下翻 / v 折叠) ⋯`;
+			for (const hl of wrapDialogLine(bottomHint, safeWidth, indent, contIndent)) {
 				lines.push(theme.fg("muted", hl));
 			}
 		} else {
-			const hint = `[已展开完整内容，按 v 或 Ctrl+O 折叠收起]`;
-			for (const hl of wrapDialogLine(hint, safeWidth, indent, contIndent)) {
+			const bottomHint = `[已翻阅至底部，按 PgUp 上翻 / v 折叠收起]`;
+			for (const hl of wrapDialogLine(bottomHint, safeWidth, indent, contIndent)) {
 				lines.push(theme.fg("muted", hl));
 			}
 		}
@@ -212,6 +246,7 @@ export function formatFoldableDetail(
 			isFoldable: true,
 			totalVisualLines: rawVisualLineCount,
 			totalChars,
+			hasMorePages: topSlot > 0 || bottomSlot > 0,
 		};
 	}
 

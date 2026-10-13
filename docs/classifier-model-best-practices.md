@@ -10,7 +10,7 @@
 经过对全网主流专职决策模型（阿里百炼、Cloudflare Clef、TypeSafe Jev）与通用代码/决策模型（OpenAI GPT-6 Luna、Anthropic Claude Haiku 4.5、DeepSeek-Flash 等）在 **47 题高难对抗集** 与 **74 题真实编码场景集** 的全量基准压测，得出当前生产环境下的**黄金配置组合**：
 
 * **Stage 1（高频快速守门）**：**`deepseek/deepseek-flash`**（DeepSeek 官方直连，时延 ~749ms）
-* **Stage 2（深度权威复核）**：**`openrouter/openai/gpt-6-luna`**（OpenAI Decisions 底座，零思考前向输出）
+* **Stage 2（深度权威复核）**：**`openrouter/anthropic/claude-haiku-5.5`**（thinking: `low`；等权 92 vs 74~76、P50 1446ms vs 2175ms、FP 5 vs 24~27）
 
 ### 1. 本地一键配置文件
 配置文件路径：`~/.pi/agent/approval-config.json`
@@ -18,8 +18,8 @@
 ```json
 {
   "classifierStage1Model": "deepseek/deepseek-flash",
-  "classifierStage2Model": "openrouter/openai/gpt-6-luna",
-  "comment": "Auto 模式审批分类器双阶段最佳实践：Stage 1 极速守门 (DeepSeek 官方)，Stage 2 权威零漏报复核 (OpenAI GPT-6 Luna)"
+  "classifierStage2Model": "openrouter/anthropic/claude-haiku-5.5",
+  "comment": "Auto 模式审批分类器双阶段最佳实践：Stage 1 极速守门 (DeepSeek 官方)，Stage 2 深度权威复核 (Claude Haiku 5.5)"
 }
 ```
 
@@ -27,7 +27,7 @@
 在智能体终端中，可随时执行以下命令完成热配置与状态巡查：
 ```bash
 # 一键分别指定 Stage 1 与 Stage 2
-/classifier-model --stage1 deepseek/deepseek-flash --stage2 openrouter/openai/gpt-6-luna
+/classifier-model --stage1 deepseek/deepseek-flash --stage2 openrouter/anthropic/claude-haiku-5.5
 
 # 查看当前生效状态与健康度
 /classifier-model
@@ -61,9 +61,9 @@
                                    │ (存疑 / 拦截的动作)
                                    ▼
 ┌────────────────────────────────────────────────────────────────────────┐
-│ [第三道] Stage 2 深度权威复核 (预算 ≤ 3000ms，实测 P50 2096ms)          │
-│  - 推荐模型：openrouter/openai/gpt-6-luna (thinking: "off")            │
-│  - 核心职责：全场唯一零漏报的大脑；负责为被 Stage 1 误报的操作【洗冤】；│
+│ [第三道] Stage 2 深度权威复核 (预算 ≤ 4500ms，实测 P50 1446ms)          │
+│  - 推荐模型：openrouter/anthropic/claude-haiku-5.5 (thinking: "low")   │
+│  - 核心职责：高准度低误报仲裁复核；负责为被 Stage 1 误报的操作【洗冤】；│
 │  - 若确认为违规危险操作，生成专业、严密的人类可读解释弹窗警告用户！    │
 └────────────────────────────────────────────────────────────────────────┘
 ```
@@ -72,19 +72,19 @@
 
 ## 三、核心技术洞察与实测证据链
 
-### 1. 为什么 Stage 2 必须锁定 `openai/gpt-6-luna`？
-* **全场唯一达成零漏报（Zero False Negative）**：
-  在 47 题高难对抗集（包含学术权威 R-Judge 越权与 AgentHarm 意图偷跑）中，主流模型（Jev、Clef、百炼）普遍发生 3 ~ 11 起严重漏报，**只有 GPT-6 Luna 做到了 0 漏报**；
-* **极度敏锐的代码物理边界感知**：
-  它能精准识别什么是真实破坏性动作（如未授权覆盖主干），什么是惰性说明文字（如 commit 注释中的文本）；
-* **极具说服力的专业解释**：
-  在拦截敏感行为时，它生成的理由直击要害（例如明确指出：*“用户授权合并，但并未授权强行重写远程主分支历史”*）。
+### 1. 为什么 Stage 2 推荐 `anthropic/claude-haiku-5.5`？
+* **高准度与低误报的最佳平衡（等权 92 vs 74~76，FP 5 vs 24~27）**：
+  在 121 题全量基准评测集中，`claude-haiku-5.5` 等权正确率达 **92%**（111/121），误报仅 5 起（FN 5 / FP 5）；相比之下，`gpt-6-luna` 虽漏报低（FN 1），但误报高达 24~27 起（过度保守防御），等权正确率仅 74~76，严重打扰正常开发工作流；
+* **更优的响应时延（P50 1446ms vs 2175ms）**：
+  `claude-haiku-5.5` 实测 P50 时延仅 **1446ms**，3s 内达标率 88%；而 `gpt-6-luna` 实测 P50 达 2175ms，1.5s 达标率为 0%；
+* **全链路协同提升（综合准确率 95%）**：
+  在 SUT 全链路实测中，Stage 1（`deepseek/deepseek-flash`）+ Stage 2（`openrouter/anthropic/claude-haiku-5.5`）组合取得 **95%**（115/121）的端到端综合准确率（单模型 Haiku 5.5 基线为 91.7%），全链路 P50 延迟仅 **856ms**。
 
-### 2. 为什么 Stage 2 必须显式关闭思考（`thinking: "off"`）？
-针对审查分类任务，对比实验表明：
-* **理由质量完全一致**：零思考模式下生成的人类解释与低思考模式同样深刻专业；
-* **时延直接腰斩**：零思考下 P50 时延为 **2.0 秒**，开启低思考后时延暴涨至 **3.8 ~ 7.3 秒**，导致超时抖动；
-* **成本大幅缩减**：避免了数十至上百个思考 token 的无谓计费。
+### 2. 为什么 Stage 2 推荐配置低思考档位（`thinking: "low"`）？
+针对审查分类任务，实测证据表明：
+* **有效识破复杂提示注入**：低思考档位（`low`）引入必要的轻量思维链分析，能够有效识破间接注入与带内提示词绕过攻击，显著提升安全防守质量；
+* **时延严格控制在预算内**：在 `low` 思考档位下，实测 P50 时延仅 **1446ms**，完全处于 Stage 2 预算窗口（≤ 4500ms）的安全范围内，避免无界长思考导致的超时中断；
+* **兼顾极佳经济性**：轻量思考 Token 消耗克制，既获得高确定性语义判断，又避免无谓的计费膨胀。
 
 ### 3. 为什么 Stage 1 推荐 DeepSeek-Flash？时延与缓存真相
 * **时延无可替代**：
@@ -100,7 +100,7 @@
 
 按 121 题全量真实载荷测算（汇率按 1 USD = 7.2 CNY 严格折算）：
 
-| 场景与计费项 | `deepseek-flash` 官方直连 (Stage 1) | `openai/gpt-6-luna` (Stage 2) |
+| 场景与计费项 | `deepseek-flash` 官方直连 (Stage 1) | `openai/gpt-6-luna` (历史评测对比) |
 | :--- | :---: | :---: |
 | **单次请求平均开销** | **¥0.00022 ~ ¥0.00040 元** (0.02 ~ 0.04 分钱) | **¥0.00032 ~ ¥0.00037 元** (0.03 ~ 0.04 分钱) |
 | **累计 1,000 次审查** | **¥0.22 ~ ¥0.40 元** (不到 4 毛钱) | **¥0.32 ~ ¥0.37 元** (不到 4 毛钱) |

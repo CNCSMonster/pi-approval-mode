@@ -2295,9 +2295,13 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 			const result = await ctx.ui.custom<ApprovalAction | null>((tui, theme, _kb, done) => {
 				// 指纹短路弹窗默认拒绝态（光标停在 Block；Esc 本就=拒绝）
 				let selectedIndex = denyByDefault ? Math.max(0, options.findIndex((o) => o.action === "block")) : 0;
-				// 详情折叠/展开状态
+				// 详情折叠/展开与翻页状态
 				let isExpanded = false;
 				let hasFoldableDetails = false;
+				let detailPageOffset = 0;
+				let hasHiddenPages = false;
+				let maxVisualLinesAcrossDetails = 0;
+				let lastDetailCapacity = 10;
 
 				function refresh() {
 					tui.requestRender();
@@ -2320,22 +2324,31 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 							matchesKey(data, Key.ctrl("o"))
 						) {
 							isExpanded = !isExpanded;
+							detailPageOffset = 0;
 							refresh();
 							return;
 						}
 
-						// 键盘翻页穿透 (特性探测：若无安全可靠扩展 API 则不假装滚动)
-						const scrollApi = (ctx.ui as any)?.scrollTranscript;
-						if (typeof scrollApi === "function") {
-							if (matchesKey(data, Key.pageUp) || data === "\x1b[5~" || data === "\x1b[1;2A") {
-								try {
-									scrollApi.call(ctx.ui, "page-up");
-								} catch {}
+						// 键盘翻页分流（三位一体协同视觉：展开态且超预算翻阅长详情，折叠态翻阅背景历史）
+						const isPgUp = matchesKey(data, Key.pageUp) || data === "\x1b[5~" || data === "\x1b[1;2A";
+						const isPgDn = matchesKey(data, Key.pageDown) || data === "\x1b[6~" || data === "\x1b[1;2B";
+						if (isPgUp || isPgDn) {
+							if (isExpanded && hasHiddenPages) {
+								const pageStep = Math.max(3, lastDetailCapacity - 2);
+								if (isPgUp) {
+									detailPageOffset = Math.max(0, detailPageOffset - pageStep);
+								} else {
+									const maxOffset = Math.max(0, maxVisualLinesAcrossDetails - lastDetailCapacity);
+									detailPageOffset = Math.min(maxOffset, detailPageOffset + pageStep);
+								}
+								refresh();
 								return;
 							}
-							if (matchesKey(data, Key.pageDown) || data === "\x1b[6~" || data === "\x1b[1;2B") {
+
+							const scrollApi = (ctx.ui as any)?.scrollTranscript;
+							if (typeof scrollApi === "function") {
 								try {
-									scrollApi.call(ctx.ui, "page-down");
+									scrollApi.call(ctx.ui, isPgUp ? "page-up" : "page-down");
 								} catch {}
 								return;
 							}
@@ -2405,8 +2418,18 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 							addLine("");
 						}
 
+						// 视口容量计算：
+						// 折叠态受 transcript 保留预算限制 (budget.maxDetailsLines)
+						// 展开态利用除 chrome (头部+选项+底栏) 外的最大视口空间，确保选项 1-5 绝不被挤出屏幕
+						const chromeHeight = budget.isDegraded ? 8 : 13;
+						const expandedCapacity = Math.max(8, terminalRows - chromeHeight);
+						const detailCapacity = isExpanded ? expandedCapacity : budget.maxDetailsLines;
+						lastDetailCapacity = detailCapacity;
+
 						// 详细信息展示区（带高度预算折叠、连续空行合并、超长单逻辑行保护）
 						hasFoldableDetails = false;
+						hasHiddenPages = false;
+						maxVisualLinesAcrossDetails = 0;
 						for (const item of sanitizedDetails) {
 							addLine(`${theme.fg("muted", item.label)}:`, "  ");
 							const formatted = formatFoldableDetail(
@@ -2416,15 +2439,30 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 									isExpanded,
 									indent: "    ",
 									contIndent: "    ",
-									maxExpandedLines: isExpanded ? 50 : budget.maxDetailsLines,
+									maxExpandedLines: detailCapacity,
+									pageOffset: isExpanded ? detailPageOffset : 0,
 								},
 								theme,
 							);
 							if (formatted.isFoldable) {
 								hasFoldableDetails = true;
 							}
+							if (formatted.hasMorePages) {
+								hasHiddenPages = true;
+							}
+							if (formatted.totalVisualLines > maxVisualLinesAcrossDetails) {
+								maxVisualLinesAcrossDetails = formatted.totalVisualLines;
+							}
 							for (const fl of formatted.lines) {
 								lines.push(fl);
+							}
+						}
+
+						// 终端尺寸变化时的越界钳制
+						if (isExpanded) {
+							const maxPossibleOffset = Math.max(0, maxVisualLinesAcrossDetails - 10);
+							if (detailPageOffset > maxPossibleOffset) {
+								detailPageOffset = maxPossibleOffset;
 							}
 						}
 
@@ -2455,12 +2493,18 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 						}
 						// 底栏快捷提示：自适应终端高度与能力探测
 						const foldHint = hasFoldableDetails ? " | [v / Ctrl+O] 展开/折叠" : "";
-						const scrollHint = typeof (ctx.ui as any)?.scrollTranscript === "function" ? " | [PgUp/PgDn] 翻阅历史" : "";
+						const scrollHint = (isExpanded && hasHiddenPages)
+							? " | [PgUp/PgDn] 翻阅详情"
+							: (typeof (ctx.ui as any)?.scrollTranscript === "function" ? " | [PgUp/PgDn] 翻阅历史" : "");
+						const degradedFoldHint = hasFoldableDetails ? " | v 展开/折叠" : "";
+						const degradedScrollHint = (isExpanded && hasHiddenPages)
+							? " | PgUp/Dn 详情"
+							: (typeof (ctx.ui as any)?.scrollTranscript === "function" ? " | PgUp/Dn 历史" : "");
 						if (budget.isDegraded) {
 							addLine(
 								theme.fg(
 									"muted",
-									`[快捷提示] 1-${options.length} 选择${hasFoldableDetails ? " | v 展开/折叠" : ""} | ↑/↓ 移动 | Enter 确认 | Esc 拒绝`,
+									`[快捷提示] 1-${options.length} 选择${degradedFoldHint}${degradedScrollHint} | ↑/↓ 移动 | Enter 确认 | Esc 拒绝`,
 								),
 								"  ",
 							);
@@ -2632,6 +2676,8 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 		const { toolName } = event;
 		currentToolCallId = (event as any).toolCallId;
 		const input = (event.input ?? {}) as Record<string, any>;
+
+		logClassifierDebug(`[ApprovalMode] tool_call triggered: tool=${toolName}, currentMode=${currentMode}, hasUI=${ctx.hasUI}`);
 
 		if (!permissionManager) {
 			const isTrusted = typeof ctx.isProjectTrusted === "function" ? ctx.isProjectTrusted() : true;

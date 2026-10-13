@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-13
+
+### ✨ Features & TUI Improvements
+- **Approval Dialog In-Place Pagination & Viewport Height Protection**:
+  - **In-Place Detail Pagination**: In expanded view (`v` / `Ctrl+O`), tool calls with long commands or script contents can be scrolled in-place using `PgUp` / `PgDn`, with dynamic slice indicators showing remaining lines above and below.
+  - **Tri-State Intent Decoupling**: In collapsed view (default), `PgUp` / `PgDn` seamlessly passthrough to scroll the background conversation transcript; in expanded view, `PgUp` / `PgDn` navigate details in-place without adding new keybindings.
+  - **Dynamic Viewport Chrome Protection**: Automatically reserves terminal rows for dialog chrome (headers, options 1-5, and shortcuts), dynamically sizing detail capacity so approval actions are never pushed off-screen.
+  - **Slot-Aware Slice Calculation**: Deducts top/bottom indicator rows from detail slices to eliminate viewport overflow and terminal jitter.
+
+### 📚 Documentation & Best Practices
+- **Stage 2 Classifier Recommendation**: Updated recommended model for Stage 2 to `anthropic/claude-haiku-5.5` across best practice guidelines and user documentation.
+- **User Guide Synchronization**: Updated English and Chinese user manuals to document folding, in-place paging, and transcript scrolling behaviors.
+
 ## [0.11.0] - 2026-10-12
 
 ### ✨ Features
