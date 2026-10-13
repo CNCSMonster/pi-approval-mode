@@ -6,6 +6,7 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { logClassifierDebug } from "./logger.ts";
 import type { DenialLimits } from "./denial-tracker.ts";
 
 // ==========================================
@@ -185,7 +186,7 @@ export function loadApprovalPolicies(
 				if (raw.length > GLOBAL_POLICY_MAX_LENGTH) {
 					globalPolicy = raw.slice(0, GLOBAL_POLICY_MAX_LENGTH);
 					globalPolicyTruncated = true;
-					console.debug(
+					logClassifierDebug(
 						`[ApprovalMode] 全局审批偏好超出预算上限 (${GLOBAL_POLICY_MAX_LENGTH} 字符)，已安全截断（原始长度: ${raw.length}）。`,
 					);
 				} else {
@@ -208,7 +209,7 @@ export function loadApprovalPolicies(
 					if (raw.length > PROJECT_POLICY_MAX_LENGTH) {
 						projectPolicy = raw.slice(0, PROJECT_POLICY_MAX_LENGTH);
 						projectPolicyTruncated = true;
-						console.debug(
+						logClassifierDebug(
 							`[ApprovalMode] 项目审批策略超出预算上限 (${PROJECT_POLICY_MAX_LENGTH} 字符)，已安全截断（原始长度: ${raw.length}）。`,
 						);
 					} else {

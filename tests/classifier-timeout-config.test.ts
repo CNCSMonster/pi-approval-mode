@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import approvalModeExtension from "../extensions/approval-mode.ts";
 // 通过命名空间访问新导出，改码前该导出为 undefined（调用即抛错 → 干净地红），不会导致整文件 import 失败。
 import * as approvalModule from "../extensions/approval-mode.ts";
+import { clearRecentLogs, getRecentLogs } from "../extensions/logger.ts";
 
 // 环境隔离：HOME / USERPROFILE → mkdtemp，绝不写真实 ~/.pi；配置一律经项目级 .pi/approval-config.json 注入。
 const sandboxHome = mkdtempSync(join(tmpdir(), "pi-ctc-home-"));
@@ -57,8 +58,6 @@ async function startWithConfig(config: Record<string, unknown>, complete: Comple
 	};
 
 	const notices: string[] = [];
-	const warns: string[] = [];
-	const debugs: string[] = [];
 	const ctx: any = {
 		modelRegistry: registry,
 		model: ctxModel,
@@ -74,16 +73,11 @@ async function startWithConfig(config: Record<string, unknown>, complete: Comple
 		sessionManager: { getBranch: () => [] },
 	};
 
-	const ow = console.warn;
-	const od = console.debug;
-	console.warn = (...a: any[]) => warns.push(a.join(" "));
-	console.debug = (...a: any[]) => debugs.push(a.join(" "));
-	try {
-		await handlers["session_start"]({ reason: "start" }, ctx);
-	} finally {
-		console.warn = ow;
-		console.debug = od;
-	}
+	clearRecentLogs();
+	await handlers["session_start"]({ reason: "start" }, ctx);
+	const logs = getRecentLogs();
+	const warns = logs.filter((l) => l.includes("[WARN]"));
+	const debugs = logs.filter((l) => l.includes("[DEBUG]"));
 	return { handlers, ctx, notices, warns, debugs };
 }
 
@@ -93,20 +87,13 @@ const DANGER = "sudo rm -rf /tmp/ctc-fixture";
 // 纯函数 spy：捕获 console.warn/debug（用于 C3/C5/C6 直接注入 JS 原生值，含 JSON 无法表达的 NaN）。
 function callApply(fileConfig: any): { ret: any; warns: string[]; debugs: string[]; notified: string[] } {
 	const apply = (approvalModule as any).applyClassifierTimeoutConfig;
-	const warns: string[] = [];
-	const debugs: string[] = [];
 	const notified: string[] = [];
 	const ctx = { ui: { notify: (m: string) => notified.push(m) } };
-	const ow = console.warn;
-	const od = console.debug;
-	console.warn = (...a: any[]) => warns.push(a.join(" "));
-	console.debug = (...a: any[]) => debugs.push(a.join(" "));
-	try {
-		var ret = apply(fileConfig, ctx);
-	} finally {
-		console.warn = ow;
-		console.debug = od;
-	}
+	clearRecentLogs();
+	const ret = apply(fileConfig, ctx);
+	const logs = getRecentLogs();
+	const warns = logs.filter((l) => l.includes("[WARN]"));
+	const debugs = logs.filter((l) => l.includes("[DEBUG]"));
 	return { ret, warns, debugs, notified };
 }
 

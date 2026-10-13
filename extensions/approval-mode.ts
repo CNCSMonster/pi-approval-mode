@@ -466,12 +466,10 @@ export function applyClassifierTimeoutConfig(
 		stage2 = CLASSIFIER_TIMEOUT_DEFAULT_STAGE2;
 		const message =
 			`[ApprovalMode] 分类器超时配置违规：${violation}；stage1/stage2 整体回退默认 ${CLASSIFIER_TIMEOUT_DEFAULT_STAGE1}/${CLASSIFIER_TIMEOUT_DEFAULT_STAGE2}ms。`;
-		console.warn(message);
 		logClassifierWarn(message);
 		ctx?.ui?.notify?.(message, "warning");
 	}
 
-	console.debug(`[ApprovalMode] 分类器超时 effective: stage1=${stage1}ms stage2=${stage2}ms`);
 	logClassifierDebug(`[ApprovalMode] 分类器超时 effective: stage1=${stage1}ms stage2=${stage2}ms`);
 	return { stage1, stage2, violated: Boolean(violation) };
 }
@@ -548,7 +546,6 @@ export function applyClassifierThinkingConfig(
 			violated = true;
 			const msg = `[ApprovalMode] 分类器思考配置违规：${fieldName} 收到 ${JSON.stringify(raw)}（非法枚举值，可用：${EXTENDED_THINKING_LEVELS.join(", ")}）；${stageName} 思考回退未指定。`;
 			if (!ctx?.silent) {
-				console.warn(msg);
 				logClassifierWarn(msg);
 				if (ctx?.hasUI !== false) ctx?.ui?.notify?.(msg, "warning");
 			}
@@ -566,7 +563,6 @@ export function applyClassifierThinkingConfig(
 			const modelLabel = model ? `${model.provider}/${model.id}` : "当前模型";
 			const msg = `[ApprovalMode] 分类器思考配置不受支持：模型 "${modelLabel}" 不支持思考档位 "${raw}"（该模型支持：${supported.join(", ")}）；${stageName} 思考回退未指定。`;
 			if (!ctx?.silent) {
-				console.warn(msg);
 				logClassifierWarn(msg);
 				if (ctx?.hasUI !== false) ctx?.ui?.notify?.(msg, "warning");
 			}
@@ -589,7 +585,6 @@ export function applyClassifierThinkingConfig(
 	const stage2 = resolveStage("stage2", "classifierStage2Thinking", fileConfig.classifierStage2Thinking, s2Model);
 
 	if (!ctx?.silent) {
-		console.debug(`[ApprovalMode] 分类器思考配置 effective: stage1=${stage1.effectiveSummary} stage2=${stage2.effectiveSummary}`);
 		logClassifierDebug(`[ApprovalMode] 分类器思考配置 effective: stage1=${stage1.effectiveSummary} stage2=${stage2.effectiveSummary}`);
 	}
 

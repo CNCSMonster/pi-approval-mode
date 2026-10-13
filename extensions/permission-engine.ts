@@ -32,6 +32,7 @@
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, normalize, relative } from "node:path";
+import { logClassifierError } from "./logger.ts";
 import { stripLeadingEnvVars, tokenizeShellCommand } from "./shell-analyzer.ts";
 
 export type DecisionType = "deny" | "ask" | "allow" | "default";
@@ -881,7 +882,7 @@ export class PermissionManager {
 			};
 			writeFileSync(filePath, JSON.stringify(data, null, 2), "utf-8");
 		} catch (err) {
-			console.error(`[permission-engine] 保存规则失败 (${filePath}):`, err);
+			logClassifierError(`[permission-engine] 保存规则失败 (${filePath}):`, err);
 		}
 	}
 }

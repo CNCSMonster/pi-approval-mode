@@ -200,20 +200,24 @@ test("Stage 2 遭遇 402 异常时弹窗清晰展示余额排障建议且控制�
 	}
 });
 
-test("分类器研判核心热路径禁止包含裸 console.* 直写", () => {
-	const approvalModeFile = path.resolve(process.cwd(), "extensions/approval-mode.ts");
-	const content = fs.readFileSync(approvalModeFile, "utf8");
+test("分类器研判核心热路径与配置解析禁止包含裸 console.* 直写", () => {
+	const filesToCheck = [
+		"extensions/approval-mode.ts",
+		"extensions/approval-config.ts",
+		"extensions/permission-engine.ts",
+	];
 
-	// 提取 runTwoStageClassifier 函数体
-	const fnMatch = content.match(/async function runTwoStageClassifier\([\s\S]*?\n\t\}\n/);
-	assert.ok(fnMatch, "必须能提取到 runTwoStageClassifier 函数定义");
-	const fnBody = fnMatch[0];
+	for (const relPath of filesToCheck) {
+		const filePath = path.resolve(process.cwd(), relPath);
+		const content = fs.readFileSync(filePath, "utf8");
 
-	// 断言函数体中不包含裸写 console.log / console.error / console.warn
-	const forbiddenConsoleMatch = fnBody.match(/\bconsole\.(?:log|error|warn)\b/);
-	assert.strictEqual(
-		forbiddenConsoleMatch,
-		null,
-		`分类器运行热路径 (runTwoStageClassifier) 严禁包含 console.* 直写，必须使用 safe logger，实测匹配到: ${forbiddenConsoleMatch?.[0]}`,
-	);
+		// 剥离注释后进行匹配
+		const codeOnly = content.replace(/\/\*[\s\S]*?\*\/|\/\/.*/g, "");
+		const match = codeOnly.match(/\bconsole\.(?:log|error|warn|debug|info)\b/);
+		assert.strictEqual(
+			match,
+			null,
+			`文件 ${relPath} 严禁包含裸写 console.*（必须使用 safe logger），实测匹配到: ${match?.[0]}`,
+		);
+	}
 });

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-10-14
+
+### 🐛 Bug Fixes & TUI Stability
+- **Eliminate Bare Console Writes in Configuration Loaders**:
+  - Replaced remaining `console.debug`, `console.warn`, and `console.error` calls across `applyClassifierThinkingConfig`, `applyClassifierTimeoutConfig`, policy loader truncation alerts, and permission engine persistence with safe file logger (`logClassifier*`).
+  - Completely prevents unbuffered ANSI writes to standard output, eliminating cursor coordinate desynchronization and input line freeze when executing `/classifier-model`.
+  - Added repository-wide static test assertions to ensure zero bare `console.*` writes in runtime modules.
+
 ## [0.12.0] - 2026-10-13
 
 ### ✨ Features & TUI Improvements
