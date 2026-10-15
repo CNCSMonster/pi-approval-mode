@@ -122,6 +122,10 @@ test("切换至未受信项目时阻断项目配置并复位，不泄漏上一�
 
 	// 在项目目录写入项目配置
 	writeFileSync(
+		join(isolatedWorkspace, ".pi", "settings.json"),
+		"{}",
+	);
+	writeFileSync(
 		join(isolatedWorkspace, ".pi", "approval-config.json"),
 		JSON.stringify({
 			classifierModel: "test/project-model",

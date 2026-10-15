@@ -154,8 +154,20 @@ export function tokenizeShellCommand(cmd: string): { tokens: Token[]; hasCommand
 	while (i < len) {
 		const char = cmd[i];
 
-		// 跳过空白字符
-		if (/\s/.test(char)) {
+		// 换行符（CRLF / LF / CR）在无引号上下文下作为命令终止操作符
+		if (char === "\r" && i + 1 < len && cmd[i + 1] === "\n") {
+			tokens.push({ type: "op", value: "\n" });
+			i += 2;
+			continue;
+		}
+		if (char === "\n" || char === "\r") {
+			tokens.push({ type: "op", value: "\n" });
+			i++;
+			continue;
+		}
+
+		// 跳过水平空白字符（空格与 Tab）
+		if (char === " " || char === "\t") {
 			i++;
 			continue;
 		}
@@ -284,13 +296,50 @@ export function tokenizeShellCommand(cmd: string): { tokens: Token[]; hasCommand
 				continue;
 			}
 
-			// 双引号字符串：解释转义字符
+			// 双引号字符串：解释转义字符与内部命令替换
 			if (c === '"') {
 				i++;
 				while (i < len && cmd[i] !== '"') {
 					if (cmd[i] === "\\" && i + 1 < len) {
 						word += cmd[i + 1];
 						i += 2;
+					} else if (cmd[i] === "$" && i + 1 < len && cmd[i + 1] === "(") {
+						// 双引号内部的 $(...) 命令替换
+						hasCommandSubstitution = true;
+						i += 2;
+						let depth = 1;
+						let sub = "";
+						while (i < len && depth > 0) {
+							if (cmd[i] === "$" && i + 1 < len && cmd[i + 1] === "(") {
+								depth++;
+								sub += "$(";
+								i += 2;
+							} else if (cmd[i] === ")") {
+								depth--;
+								if (depth > 0) sub += ")";
+								i++;
+							} else {
+								sub += cmd[i];
+								i++;
+							}
+						}
+						tokens.push({ type: "subst", value: sub });
+					} else if (cmd[i] === "`") {
+						// 双引号内部的反引号命令替换
+						hasCommandSubstitution = true;
+						i++;
+						let sub = "";
+						while (i < len && cmd[i] !== "`") {
+							if (cmd[i] === "\\" && i + 1 < len && (cmd[i + 1] === "`" || cmd[i + 1] === "\\" || cmd[i + 1] === "$")) {
+								sub += cmd[i + 1];
+								i += 2;
+							} else {
+								sub += cmd[i];
+								i++;
+							}
+						}
+						if (i < len && cmd[i] === "`") i++;
+						tokens.push({ type: "subst", value: sub });
 					} else {
 						word += cmd[i];
 						i++;
@@ -541,7 +590,10 @@ export function analyzeShellCommand(rawCommand: string): ShellAnalysisResult {
 	let currentSegment: Token[] = [];
 
 	for (const t of tokens) {
-		if (t.type === "op" && (t.value === "&&" || t.value === "||" || t.value === ";" || t.value === "&")) {
+		if (
+			t.type === "op" &&
+			(t.value === "&&" || t.value === "||" || t.value === ";" || t.value === "&" || t.value === "\n")
+		) {
 			if (currentSegment.length > 0) {
 				compoundSegments.push(currentSegment);
 				currentSegment = [];

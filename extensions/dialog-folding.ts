@@ -114,6 +114,56 @@ export function truncateLongLogicLine(
 }
 
 /**
+ * 单行物理列宽强制裁剪：
+ * 使用 visibleWidth 计算物理显示列宽（全角/CJK/Emoji 等），
+ * 超过 maxWidth 时精确截断并补省略号 "…"，确保单行物理宽度严格 <= maxWidth，
+ * 杜绝在窄屏终端下因软折行产生未预期的高度溢出。
+ */
+export function truncateVisualLine(str: string, maxWidth: number): string {
+	const safeMax = Math.max(1, maxWidth);
+	if (visibleWidth(str) <= safeMax) {
+		return str;
+	}
+
+	let low = 0;
+	let high = str.length;
+	let best = 0;
+	while (low <= high) {
+		const mid = Math.floor((low + high) / 2);
+		const slice = str.slice(0, mid);
+		if (visibleWidth(slice + "…") <= safeMax) {
+			best = mid;
+			low = mid + 1;
+		} else {
+			high = mid - 1;
+		}
+	}
+	return str.slice(0, best) + "…";
+}
+
+/**
+ * 详情项数据结构
+ */
+export interface DialogDetailItem {
+	label: string;
+	content: string;
+}
+
+/**
+ * 诊断元数据优先级全序权重：
+ * 🚨 致命安全/死循环预警 (P0) > ⛔ 拦截原因 (P1) > ⚠️ 降级说明 (P2) > 操作摘要 (P3) > 静态特征 (P4) > 🔧 排障建议 (P5)
+ */
+export function getMetadataPriority(label: string): number {
+	if (label.includes("死循环") || label.includes("致命") || label.includes("高危")) return 0;
+	if (label.includes("拦截原因")) return 1;
+	if (label.includes("降级") || label.includes("熔断")) return 2;
+	if (label.includes("操作摘要")) return 3;
+	if (label.includes("静态结构") || label.includes("特征")) return 4;
+	if (label.includes("排障") || label.includes("建议")) return 5;
+	return 6;
+}
+
+/**
  * 详情折叠版式计算与格式化结果
  */
 export interface FoldedDetailResult {
@@ -122,6 +172,9 @@ export interface FoldedDetailResult {
 	totalVisualLines: number;
 	totalChars: number;
 	hasMorePages?: boolean;
+	contentBudget?: number;
+	maxOffset?: number;
+	step?: number;
 }
 
 export interface FormatDetailOptions {
@@ -207,18 +260,31 @@ export function formatFoldableDetail(
 			};
 		}
 
-		// 超出单屏预算，动态计算指示行配额扣减与窗口切片
+		// 超出单屏预算：执行两遍无依赖槽位判定算法，杜绝末页槽位循环依赖
 		const topSlot = offset > 0 ? 1 : 0;
-		const availBeforeBottom = Math.max(1, maxExpandedLines - topSlot);
-		const bottomSlot = offset + availBeforeBottom < rawVisualLineCount ? 1 : 0;
-		const contentBudget = Math.max(1, maxExpandedLines - topSlot - bottomSlot);
 
-		const sliceStart = Math.min(rawVisualLineCount, offset);
+		// Pass 1: 假定保留底槽（占用 1 行），计算保守净正文预算
+		const cbWithBottom = Math.max(1, maxExpandedLines - topSlot - 1);
+
+		// Pass 2: 检查保守预算下是否还有未显示内容
+		const hasMoreBelow = (offset + cbWithBottom) < rawVisualLineCount;
+
+		// 底部槽位决策：
+		// 下方有剩余行时为 1（显示未完提示）；
+		// 下方无剩余行但上方有偏移时为 1（显示已触底提示，恒定占位防高度突增）；
+		// 仅当首屏在预留底槽前提下即可看完全部内容时为 0
+		const bottomSlot = hasMoreBelow ? 1 : (topSlot > 0 ? 1 : 0);
+		const contentBudget = bottomSlot > 0 ? cbWithBottom : Math.max(1, maxExpandedLines - topSlot);
+
+		const sliceStart = Math.min(rawVisualLineCount, Math.max(0, offset));
 		const sliceEnd = Math.min(rawVisualLineCount, sliceStart + contentBudget);
 		const displayLines = rawVisualLines.slice(sliceStart, sliceEnd);
 
+		const maxOffset = Math.max(0, rawVisualLineCount - Math.max(1, maxExpandedLines - 2));
+		const step = Math.max(1, contentBudget - 2);
+
 		if (topSlot > 0) {
-			const topHint = `⋯ (上方还有 ${sliceStart} 行，按 PgUp 上翻) ⋯`;
+			const topHint = `▲ 已上翻 (上方余 ${sliceStart} 行) · [Home/g 顶 | PgUp 上翻]`;
 			for (const hl of wrapDialogLine(topHint, safeWidth, indent, contIndent)) {
 				lines.push(theme.fg("muted", hl));
 			}
@@ -229,15 +295,17 @@ export function formatFoldableDetail(
 		}
 
 		if (bottomSlot > 0) {
-			const omitted = rawVisualLineCount - sliceEnd;
-			const bottomHint = `⋯ (受终端高度预算限制已展开至 ${maxExpandedLines} 行，余 ${omitted} 行未展示，按 PgDn 下翻 / v 折叠) ⋯`;
-			for (const hl of wrapDialogLine(bottomHint, safeWidth, indent, contIndent)) {
-				lines.push(theme.fg("muted", hl));
-			}
-		} else {
-			const bottomHint = `[已翻阅至底部，按 PgUp 上翻 / v 折叠收起]`;
-			for (const hl of wrapDialogLine(bottomHint, safeWidth, indent, contIndent)) {
-				lines.push(theme.fg("muted", hl));
+			if (sliceEnd < rawVisualLineCount) {
+				const omitted = rawVisualLineCount - sliceEnd;
+				const bottomHint = `▼ [行 ${sliceStart + 1}–${sliceEnd} / 共 ${rawVisualLineCount} 行] (余 ${omitted} 行) · [End/G 底 | PgDn 下翻 | v 收起]`;
+				for (const hl of wrapDialogLine(bottomHint, safeWidth, indent, contIndent)) {
+					lines.push(theme.fg("muted", hl));
+				}
+			} else {
+				const bottomHint = `✔ [已到底部 (共 ${rawVisualLineCount} 行)] · [Enter 确认 | Esc/v 收起]`;
+				for (const hl of wrapDialogLine(bottomHint, safeWidth, indent, contIndent)) {
+					lines.push(theme.fg("muted", hl));
+				}
 			}
 		}
 
@@ -247,6 +315,9 @@ export function formatFoldableDetail(
 			totalVisualLines: rawVisualLineCount,
 			totalChars,
 			hasMorePages: topSlot > 0 || bottomSlot > 0,
+			contentBudget,
+			maxOffset,
+			step,
 		};
 	}
 
@@ -295,11 +366,18 @@ export function formatFoldableDetail(
 		}
 	}
 
+	const defaultContentBudget = Math.max(1, maxExpandedLines - 2);
+	const defaultMaxOffset = Math.max(0, rawVisualLineCount - defaultContentBudget);
+	const defaultStep = Math.max(1, defaultContentBudget - 2);
+
 	return {
 		lines,
 		isFoldable: true,
 		totalVisualLines: rawVisualLineCount,
 		totalChars,
+		contentBudget: defaultContentBudget,
+		maxOffset: defaultMaxOffset,
+		step: defaultStep,
 	};
 }
 
@@ -308,29 +386,129 @@ export function formatFoldableDetail(
  */
 export interface HeightBudget {
 	isDegraded: boolean;
+	isLockedCompact: boolean;
+	tier: "locked" | "compact" | "footer_expanded" | "meta_expanded" | "standard";
+	chromeHeight: number;
+	headerLines: number;
+	metaLines: number;
+	footerLines: number;
+	expandedHeroCapacity: number;
+	safeHeight: number;
 	maxDialogHeight: number;
 	minTranscriptRows: number;
 	maxDetailsLines: number;
 }
 
 /**
- * 根据终端总行数计算高度预算
- * - 标准模式 (terminalRows > 28): 保留 >= 55% 且 >= 10 行视口给 transcript
- * - 矮终端降级 (terminalRows <= 28): 保留 >= 6 行视口给 transcript
+ * 依据真实终端行数动态计算高度预算：
+ * 采用铬饰平滑渐进式分配律与 H_min=16 刚性守卫：
+ * 1. H < 16: 极矮锁定态，禁止展开，锁定紧凑摘要；
+ * 2. 16 <= H <= 25: 紧凑基础态 (Chrome=9)，W_hero = H - 10 (单调递增，H=24 时为 14)；
+ * 3. 26 <= H <= 27: 舒展页脚态 (Chrome=10)，W_hero = H - 11 (平滑无反缩)；
+ * 4. 28 <= H <= 29: 双行诊断态 (Chrome=11)，W_hero = H - 12 (平滑无反缩)；
+ * 5. H >= 30: 标准全量态 (Chrome=12)，W_hero = H - 13 (平滑无反缩)。
+ * 任意 H 跃迁点严格满足 Delta W_hero >= 0。
  */
-export function calculateHeightBudget(terminalRows: number, chromeHeight = 13): HeightBudget {
-	const H = Math.max(10, terminalRows);
-	const isDegraded = H <= 28;
+export function calculateHeightBudget(terminalRows: number, _defaultChromeHeight = 13): HeightBudget {
+	const H = Math.max(1, terminalRows);
+	const safeHeight = Math.max(1, H - 1);
 
-	const minTranscriptRows = isDegraded ? 6 : Math.max(10, Math.ceil(H * 0.55));
-	const maxDialogHeight = Math.max(1, H - minTranscriptRows);
-	const maxDetailsLines = Math.max(5, maxDialogHeight - chromeHeight);
+	if (H < 16) {
+		const chromeHeight = 9;
+		const minTranscriptRows = Math.max(1, H - chromeHeight);
+		return {
+			isDegraded: true,
+			isLockedCompact: true,
+			tier: "locked",
+			chromeHeight,
+			headerLines: 2,
+			metaLines: 1,
+			footerLines: 6,
+			expandedHeroCapacity: 0,
+			safeHeight,
+			maxDialogHeight: Math.min(H, chromeHeight),
+			minTranscriptRows,
+			maxDetailsLines: 5,
+		};
+	}
 
+	if (H <= 25) {
+		const chromeHeight = 9;
+		const expandedHeroCapacity = H - 10;
+		const minTranscriptRows = Math.max(1, Math.min(6, Math.floor(H * 0.25)));
+		return {
+			isDegraded: true,
+			isLockedCompact: false,
+			tier: "compact",
+			chromeHeight,
+			headerLines: 2,
+			metaLines: 1,
+			footerLines: 6,
+			expandedHeroCapacity,
+			safeHeight,
+			maxDialogHeight: safeHeight,
+			minTranscriptRows,
+			maxDetailsLines: Math.max(5, expandedHeroCapacity),
+		};
+	}
+
+	if (H <= 27) {
+		const chromeHeight = 10;
+		const expandedHeroCapacity = H - 11;
+		const minTranscriptRows = Math.max(6, Math.floor(H * 0.3));
+		return {
+			isDegraded: false,
+			isLockedCompact: false,
+			tier: "footer_expanded",
+			chromeHeight,
+			headerLines: 2,
+			metaLines: 1,
+			footerLines: 7,
+			expandedHeroCapacity,
+			safeHeight,
+			maxDialogHeight: safeHeight,
+			minTranscriptRows,
+			maxDetailsLines: Math.max(5, expandedHeroCapacity),
+		};
+	}
+
+	if (H <= 29) {
+		const chromeHeight = 11;
+		const expandedHeroCapacity = H - 12;
+		const minTranscriptRows = Math.max(6, Math.floor(H * 0.3));
+		return {
+			isDegraded: false,
+			isLockedCompact: false,
+			tier: "meta_expanded",
+			chromeHeight,
+			headerLines: 2,
+			metaLines: 2,
+			footerLines: 7,
+			expandedHeroCapacity,
+			safeHeight,
+			maxDialogHeight: safeHeight,
+			minTranscriptRows,
+			maxDetailsLines: Math.max(5, expandedHeroCapacity),
+		};
+	}
+
+	// H >= 30
+	const chromeHeight = 12;
+	const expandedHeroCapacity = H - 13;
+	const minTranscriptRows = Math.max(10, Math.ceil(H * 0.4));
 	return {
-		isDegraded,
-		maxDialogHeight,
+		isDegraded: false,
+		isLockedCompact: false,
+		tier: "standard",
+		chromeHeight,
+		headerLines: 3,
+		metaLines: 2,
+		footerLines: 7,
+		expandedHeroCapacity,
+		safeHeight,
+		maxDialogHeight: safeHeight,
 		minTranscriptRows,
-		maxDetailsLines,
+		maxDetailsLines: Math.max(5, expandedHeroCapacity),
 	};
 }
 

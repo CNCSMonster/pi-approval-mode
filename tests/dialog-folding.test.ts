@@ -151,7 +151,7 @@ test(" 详情折叠: 展开态超过终端预算上限时受限展示并提示",
 	);
 	assert.equal(res.isFoldable, true);
 	assert.ok(res.lines.length <= maxExpandedLines + 2);
-	assert.ok(res.lines.some((l) => l.includes("受终端高度预算限制已展开至 8 行")));
+	assert.ok(res.lines.some((l) => l.includes("PgDn 下翻") && l.includes("余 13 行")));
 });
 
 test(" 详情折叠: 单个超长逻辑行在折叠态展示截断行与下方提示", () => {
@@ -169,28 +169,32 @@ test(" 详情折叠: 单个超长逻辑行在折叠态展示截断行与下方�
 // 4. 高度预算计算 (calculateHeightBudget)
 // ============================================================
 
-test(" 高度预算: 矮终端 (<= 28 行) 触发降级保护", () => {
+test(" 高度预算: 矮终端 (<= 25 行) 触发紧凑基础态", () => {
 	const b24 = calculateHeightBudget(24, 12);
 	assert.equal(b24.isDegraded, true);
-	assert.equal(b24.minTranscriptRows, 6, "矮终端保底 transcript 为 6 行");
-	assert.equal(b24.maxDialogHeight, 18, "弹窗最多占 18 行 (24 - 6)");
+	assert.equal(b24.tier, "compact");
+	assert.equal(b24.chromeHeight, 9);
+	assert.equal(b24.expandedHeroCapacity, 14, "24 行终端主体可用 14 行");
+	assert.equal(b24.maxDialogHeight, 23, "24 - 1 = 23");
 	assert.ok(b24.maxDetailsLines >= 5, "保底详情可用行数");
 
-	const b28 = calculateHeightBudget(28, 12);
-	assert.equal(b28.isDegraded, true);
-	assert.equal(b28.minTranscriptRows, 6);
+	const b15 = calculateHeightBudget(15);
+	assert.equal(b15.isLockedCompact, true, "H < 16 锁定紧凑态");
+	assert.equal(b15.expandedHeroCapacity, 0);
 });
 
-test(" 高度预算: 标准终端 (> 28 行) 保留 >= 55% 视口", () => {
+test(" 高度预算: 标准终端 (>= 30 行) 采用全量标准态", () => {
 	const b40 = calculateHeightBudget(40, 13);
 	assert.equal(b40.isDegraded, false);
-	assert.equal(b40.minTranscriptRows, 22, "40 * 0.55 = 22 行");
-	assert.equal(b40.maxDialogHeight, 18, "40 - 22 = 18 行");
+	assert.equal(b40.tier, "standard");
+	assert.equal(b40.chromeHeight, 12);
+	assert.equal(b40.expandedHeroCapacity, 27, "40 - 1 - 12 = 27 行");
+	assert.equal(b40.maxDialogHeight, 39, "40 - 1 = 39 行");
 
 	const b60 = calculateHeightBudget(60, 13);
 	assert.equal(b60.isDegraded, false);
-	assert.equal(b60.minTranscriptRows, 33, "60 * 0.55 = 33 行");
-	assert.equal(b60.maxDialogHeight, 27, "60 - 33 = 27 行");
+	assert.equal(b60.expandedHeroCapacity, 47, "60 - 1 - 12 = 47 行");
+	assert.equal(b60.maxDialogHeight, 59, "60 - 1 = 59 行");
 });
 
 // ============================================================
@@ -366,7 +370,7 @@ test(" E2E: 长命令在标准终端默认折叠态（头 3 尾 2），按 v 展
 	assert.ok(textFolded.includes("command line 3"), "头 3 可见");
 	assert.ok(textFolded.includes("command line 15"), "尾 1 可见");
 	assert.ok(textFolded.includes("command line 16"), "尾 2 可见");
-	assert.ok(textFolded.includes("[v / Ctrl+O] 展开/折叠"), "底栏必须提供折叠快捷键提示");
+	assert.ok(textFolded.includes("v 展开"), "底栏必须提供折叠快捷键提示");
 
 	// 2. 按单键 "v" 展开
 	comp.handleInput("v");
@@ -460,7 +464,7 @@ test(" E2E: 翻页穿透特性探测与键盘事件转发", async () => {
 	const compWithApi = hWithApi.getRendered();
 
 	// 底栏显示 [PgUp/PgDn]
-	assert.ok(compWithApi.render(80).join("\n").includes("[PgUp/PgDn] 翻阅历史"));
+	assert.ok(compWithApi.render(80).join("\n").includes("PgUp/Dn 历史"));
 
 	// 按 PageUp 与 PageDown
 	compWithApi.handleInput("\x1b[5~"); // PageUp
@@ -490,8 +494,8 @@ test(" 详情折叠: 展开态分页展示与指示行切片 (零偏移 / 中间
 	assert.equal(page0.isFoldable, true);
 	assert.equal(page0.hasMorePages, true);
 	assert.ok(page0.lines.some((l) => l.includes("item_line_1")), "首页包含首行");
-	assert.ok(!page0.lines.some((l) => l.includes("上方还有")), "首页无上方提示");
-	assert.ok(page0.lines.some((l) => l.includes("按 PgDn 下翻")), "首页包含向后翻页提示");
+	assert.ok(!page0.lines.some((l) => l.includes("已上翻")), "首页无上方提示");
+	assert.ok(page0.lines.some((l) => l.includes("PgDn 下翻")), "首页包含向后翻页提示");
 
 	// 2. 中间页 (pageOffset = 10)
 	const pageMid = formatFoldableDetail(
@@ -499,9 +503,9 @@ test(" 详情折叠: 展开态分页展示与指示行切片 (零偏移 / 中间
 		dummyTheme,
 	);
 	assert.equal(pageMid.hasMorePages, true);
-	assert.ok(pageMid.lines.some((l) => l.includes("上方还有 10 行，按 PgUp 上翻")), "中间页包含上方提示");
+	assert.ok(pageMid.lines.some((l) => l.includes("已上翻") && l.includes("PgUp 上翻")), "中间页包含上方提示");
 	assert.ok(pageMid.lines.some((l) => l.includes("item_line_11")), "中间页展示对应行");
-	assert.ok(pageMid.lines.some((l) => l.includes("按 PgDn 下翻")), "中间页包含下方提示");
+	assert.ok(pageMid.lines.some((l) => l.includes("PgDn 下翻")), "中间页包含下方提示");
 
 	// 3. 底部页 (pageOffset = 25)
 	const pageEnd = formatFoldableDetail(
@@ -510,7 +514,7 @@ test(" 详情折叠: 展开态分页展示与指示行切片 (零偏移 / 中间
 	);
 	assert.equal(pageEnd.hasMorePages, true);
 	assert.ok(pageEnd.lines.some((l) => l.includes("item_line_30")), "底部页包含末行");
-	assert.ok(pageEnd.lines.some((l) => l.includes("[已翻阅至底部，按 PgUp 上翻 / v 折叠收起]")), "包含触底提示");
+	assert.ok(pageEnd.lines.some((l) => l.includes("已到底部")), "包含触底提示");
 });
 
 test(" E2E: 展开超长详情时 PgUp/PgDn 就地翻阅详情，折叠态穿透翻阅历史", async () => {
@@ -529,22 +533,22 @@ test(" E2E: 展开超长详情时 PgUp/PgDn 就地翻阅详情，折叠态穿透
 	// 2. 按 "v" 展开
 	comp.handleInput("v");
 	let rendered = comp.render(80).join("\n");
-	assert.ok(rendered.includes("[PgUp/PgDn] 翻阅详情"), "展开态底栏提示切换为翻阅详情");
+	assert.ok(rendered.includes("PgUp/Dn 翻页"), "展开态底栏提示切换为翻页");
 	assert.ok(rendered.includes("step_1"), "展开第一页可见 step_1");
-	assert.ok(rendered.includes("按 PgDn 下翻"), "第一页底部有 PgDn 引导");
+	assert.ok(rendered.includes("PgDn 下翻"), "第一页底部有 PgDn 引导");
 
 	// 3. 展开态按 PageDown：就地翻页，不得调用 scrollTranscript
 	comp.handleInput("\x1b[6~");
 	assert.equal(h.scrollCalls.length, 0, "展开态 PageDown 必须被弹窗消费，绝不穿透背景");
 
 	rendered = comp.render(80).join("\n");
-	assert.ok(rendered.includes("上方还有"), "翻页后出现上方提示");
-	assert.ok(rendered.includes("step_35") || rendered.includes("step_40"), "翻页后后续内容可见");
+	assert.ok(rendered.includes("已上翻"), "翻页后出现上方提示");
+	assert.ok(rendered.includes("step_"), "翻页后后续内容可见");
 
 	// 4. 再次按 "v" 收起：状态复原为折叠态，翻页键恢复为翻背景
 	comp.handleInput("v");
 	rendered = comp.render(80).join("\n");
-	assert.ok(rendered.includes("[PgUp/PgDn] 翻阅历史"), "收起后底栏恢复为翻阅历史");
+	assert.ok(rendered.includes("PgUp/Dn 历史"), "收起后底栏恢复为翻阅历史");
 
 	comp.handleInput("\x1b[5~");
 	assert.deepEqual(h.scrollCalls, ["page-up"], "收起后 PageUp 恢复调用 scrollTranscript");

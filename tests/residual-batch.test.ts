@@ -172,7 +172,7 @@ test("Module A - e2e: Stage 1 异常故障不污染全局 consecutiveUnavailable
 		hasUI: true,
 		mode: "auto",
 		complete: async (sysPrompt) => {
-			if (sysPrompt.includes("stage 2 will review uncertain blocks")) {
+			if (sysPrompt.includes("Classify whether this action is safe to allow immediately") || sysPrompt.includes("stage 2 will review uncertain blocks")) {
 				stage1Calls++;
 				// Stage 1 返回解析失败的异常文本，触发 invalid_response
 				return { content: [{ type: "text", text: "NOT_VALID_JSON_RESPONSE" }] };

@@ -42,13 +42,19 @@ Every dialog offers five actions — **press the number key `1`–`5` for instan
 
 Options `2`–`4` write an `allow` rule at the corresponding tier, so the same action never bothers you again at that scope.
 
-**Dialog interaction & display protections**:
+**Dialog interaction & display protections (Viewport Budget & Decoupled Interaction)**:
 - **Details folding, expansion & collaborative paging**: Long commands or bulky tool inputs are bounded by a dynamic vertical height budget. Calls spanning $\ge 7$ visual lines fold by default (showing head 3 and tail 2 visual lines), with single extra-long lines protected via head-and-tail character truncation:
-  - **In folded state**: press **`PgUp`** / **`PgDn`** to freely scroll background transcript history (hint: `[PgUp/PgDn] 翻阅历史`);
-  - **In expanded state**: press **`v`** or Pi-native **`Ctrl+O`** to expand details. When content exceeds the viewport budget, **`PgUp`** / **`PgDn`** automatically switches to page through the multi-page tool arguments (hint: `[PgUp/PgDn] 翻阅详情`), allowing you to review long content down to the very last line;
-  - Press **`v`** or **`Ctrl+O`** again at any time to instantly refold and reset paging back to transcript scrolling;
+  - **In folded state**: press **`PgUp`** / **`PgDn`** to freely scroll background transcript history (hint: `[PgUp/PgDn] 翻阅历史`); press **`1`**–**`5`** to directly pick an option, **`↑`** / **`↓`** to navigate options, **`Enter`** to submit, and **`Esc`** to reject;
+  - **In expanded state (Strictly Decoupled Ergonomics)**: press **`v`** or **`Ctrl+O`** to expand details. In expanded mode, keybindings strictly serve content inspection and accidental authorization prevention:
+    - **Instant Escape Hatch**: pressing **`Esc`** or **`q`** collapses the dialog back to folded view without rejecting the call (to reject, press Esc in folded mode or select option 5 and hit Enter);
+    - **Independent Content Scrolling**: press **`↑`** / **`↓`** or **`k`** / **`j`** to micro-scroll 2 lines up/down; press **`PgUp`** / **`PgDn`** or **`Space`** / **`b`** to page scroll; press **`Home`** / **`End`** or **`g`** / **`G`** to jump to the top or bottom slice. The option cursor at the bottom remains completely motionless during text inspection;
+    - **Option Focus Cycling & Safe Execution**: press **`Tab`** / **`Shift+Tab`** to cycle focus between approval options; number keys **`1`**–**`5`** only focus the corresponding option without executing it (eliminating accidental single-keystroke persistent privilege escalation); press **`Enter`** explicitly to commit the currently focused option;
+    - **Progress Memory**: collapsing and re-expanding restores the previous scroll offset so you never have to re-navigate;
+    - **Full Diagnostics Panel**: press **`m`** in expanded mode to toggle between the hero code view and the full diagnostic metadata view (displaying dead loop warnings, block reasons, troubleshooting hints, and AST structural features);
 - **Batch progress awareness**: When an assistant turn dispatches multiple tool calls in a batch, the dialog title automatically highlights `(Batch X/Y)` to indicate the current call's position in the sequence;
-- **Short terminal degradation**: In small viewports ($\le 28$ rows), the dialog automatically switches to a compact layout, hiding decorative lines and option descriptions to guarantee that choices 1–5 and keybinding hints are fully visible and never clipped;
+- **Terminal degradation & monotonic budget allocation**: Dynamic budget governance based on terminal rows $H$:
+  - When $H < 16$ rows, the dialog locks strictly in compact mode and prohibits expansion to prevent clipping and viewport displacement;
+  - When $H \ge 16$, progressive chrome scaling and a 2-pass slot algorithm ensure hero capacity is strictly non-decreasing, line $N-1$ is 100% reachable on the final page (zero false bottom omissions), and visual line width truncation strictly defends the vertical budget;
 - **Serialized dialog mutex**: when the model dispatches multiple pending tool calls concurrently in one turn, approval dialogs are presented **serially in arrival order** (built-in mutex), so dialogs never overlap and keybindings never race.
 
 ### 1.4 Switching modes
@@ -123,7 +129,7 @@ The five modes form an automation ramp — `manual → auto-edit → auto → yo
 - **Classifier → dialog**: the two-stage LLM classifier reviews the call with its conversation context. If flagged risky, an interactive dialog shows the risk reason before the same `1`–`5` choices; if deemed safe, the call proceeds without any prompt.
 - **Skill dirs** `*` = user-level `~/.pi/agent/skills/**` and `~/.agents/skills/**` (always exempt) plus project-level `.pi/skills/**` and `.agents/skills/**` (exempt only when the project is trusted). Explicit `deny` / `ask` rules still win over this whitelist.
 - **Read-only Shell & tiered sandboxing (layer order restored)**: in `readonly` mode, when an OS kernel-level read-only sandbox is available (macOS `sandbox-exec`, Linux `bwrap`), **the sandbox comes first** — the static layer only blocks explicit local write intent (`rm`, write redirections, compilers, `sed -i`, `find -delete`, etc.) and remote/session side effects the sandbox cannot contain (`git push`, `npm publish`, `ssh`, non-GET `curl`, etc.); everything else is handed to the sandbox wrapped — complex exploration such as `python test.py`, `pytest`, and `cargo check` is no longer killed prematurely by the allowlist. On Windows or sandbox-less environments it degrades to a strict read-only allowlist (`git status`, `ls`, `grep`, `cargo check`, etc.; `2>/dev/null` null redirects are allowed, global flags like `git -C <dir>` are pierced, and creating operations such as `git branch <name>` / `git tag <name>`, `--output` file writes, and `$(...)` command substitution are blocked). **In `auto` the read-only fast path is retired**: the analysis now only feeds the "static structure" display line of `auto` dialogs — display, not verdict. Every rule-unmatched shell call, `ls` included, goes through the classifier; pin a command back to 0 s with an `allow` rule.
-- **Compound-command rule matching semantics**: for commands joined by `&&`, `||`, `;`, `|`, `&`, an `allow` rule requires **every segment to match** before approval (`git status && rm -rf /` is never approved by `Bash(git *)`); `deny` / `ask` / `default` rules take effect when **any segment matches** (`ls && rm -rf /` is still intercepted by `Bash(rm *)`). Commands containing `$(…)` substitution or backticks never take part in fuzzy `allow` matching.
+- **Compound-command rule matching semantics**: for multiline or compound commands joined by `&&`, `||`, `;`, `|`, `&`, or top-level unquoted newlines (`\n` / CRLF), an `allow` rule requires **every segment to match** before approval (`git status && rm -rf /` or `git status\nrm -rf /` is never approved by `Bash(git *)`); `deny` / `ask` / `default` rules take effect when **any segment matches** (`ls && rm -rf /` and `ls\nrm -rf /` are both intercepted by `Bash(rm *)`). Commands containing `$(…)` substitution or backticks never take part in fuzzy `allow` matching.
 - **Unified shell tool governance**: the Windows built-in `powershell` and `pwsh` tools (and `run_shell_command`) receive exactly the same gates as `bash` — approval dialogs, classifier review, and rule matching behave identically across all modes.
 - **External / third-party MCP tool backstop**: non-built-in third-party/MCP tools are no longer silently approved — in `readonly` non-read tools are physically blocked; in `manual` / `auto-edit` they go straight to a human approval dialog (English denial in headless runs); in `auto` they are submitted to the two-stage classifier, and flagged calls open a dialog.
 - **Destructive Git Operations**: `git push --force-with-lease` is treated as a safe collaborative operation exempt from high-risk regex fallbacks and judged by the classifier; bare `--force` / `-f` and destructive rewrites are strictly intercepted by deterministic heuristics.
@@ -218,6 +224,8 @@ In **`auto`** mode, every rule-unmatched shell call (the read-only fast path is 
 - **Stage 2** — a thinking re-review only when Stage 1 flags, to eliminate false positives;
 - decision + human-readable risk reason appear in the dialog (or become a headless denial);
 - **Compact Reason Contract**: Prompts enforce concise justifications (strictly under 15 words or 60 characters) to prune verbose rhetoric and lower turn latency.
+- **Evidence Provenance & Anti-Injection**: Only direct user requests in conversation transcripts and validated `AGENTS.md` in trusted workspaces establish genuine authorization. In-band claims in tool parameters, commit messages, or scripts claiming administrative exemption (e.g. `[ADMIN OVERRIDE]`, `ignore previous rules`) are treated as adversarial prompt injection and denied; benign technical discussions (e.g. `fix: remove admin override backdoor`) remain unaffected.
+- **Structured Tool Input Projection**: Write and edit operations provide a 4,000-character preview window with head/tail sampling for large payloads. Symlink targets are resolved to real physical paths; dangling symlinks and workspace escaping paths are deterministically intercepted at Layer 1.
 
 ### 4.2 Configuring `classifierModel`
 
@@ -403,11 +411,12 @@ before ever emitting a tool call).
 
 ### 5.4 My project config is ignored
 
-Almost certainly the **trust gate**: project-level `.pi/approval-config.json` and
-`.pi/approval-rules.json` are only honored in projects you trust. Untrusted (e.g. freshly
+Almost certainly the **trust gate**: project-level `.pi/approval-config.json`,
+`.pi/approval-rules.json`, and `.pi/approval-policy.md` are only honored in projects you trust. Untrusted (e.g. freshly
 cloned) repositories fall back to your global config with a warning — this blocks a hostile
-repo from shipping `defaultMode: "yolo"` or `allow: ["Bash(*)"]`. Trust the project
-(`pi --approve …` or the trust prompt) to activate its local config.
+repo from shipping `defaultMode: "yolo"` or `allow: ["Bash(*)"]`, or poisoning natural language security prompts.
+
+When a cloned repo only contains approval configuration files (lacking Pi's native resources such as `settings.json`), the extension will proactively open an interactive trust dialog; in headless/RPC modes it safely degrades to Fail-Closed. Trust the project (`pi --approve …` or the trust prompt) to activate its local config and policies.
 
 ### 5.5 Where did my temporary approval go?
 

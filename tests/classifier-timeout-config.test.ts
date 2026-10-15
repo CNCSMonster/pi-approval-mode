@@ -27,6 +27,7 @@ interface E2E {
 async function startWithConfig(config: Record<string, unknown>, complete: CompleteMode): Promise<E2E> {
 	const cwd = mkdtempSync(join(tmpdir(), "pi-ctc-cwd-"));
 	mkdirSync(join(cwd, ".pi"), { recursive: true });
+	writeFileSync(join(cwd, ".pi", "settings.json"), "{}", "utf-8");
 	writeFileSync(join(cwd, ".pi", "approval-config.json"), JSON.stringify(config), "utf-8");
 
 	const handlers: Record<string, any> = {};

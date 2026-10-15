@@ -12,22 +12,118 @@
  */
 
 import { Buffer } from "node:buffer";
+import { lstatSync, readlinkSync, realpathSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
 /** Transcript 窗口：最近 N 条 message entry（对齐 qwen-code `MAX_TRANSCRIPT_MESSAGES = 40`）。 */
 export const MAX_TRANSCRIPT_MESSAGES = 40;
 
-/** 投影预览长度：单个字符串字段最多暴露的字符数（对齐 qwen-code 的 300 字符窗口）。 */
-export const PROJECTION_PREVIEW_LENGTH = 300;
+/** 投影预览长度：提升至 4000 字符（约 4KB），使常规日常代码文件不发生截断。 */
+export const PROJECTION_PREVIEW_LENGTH = 4000;
 
-/** edit 工具多区块投影上限：仅投影前 N 个 edit 块，其余计入 edits_count。 */
-export const EDIT_PREVIEW_MAX = 5;
+/** 超长内容头部采样长度 */
+export const PROJECTION_HEAD_LENGTH = 1500;
+
+/** 超长内容尾部采样长度 */
+export const PROJECTION_TAIL_LENGTH = 1500;
+
+/** edit 工具多区块投影上限：提升至 10 个 edit 块。 */
+export const EDIT_PREVIEW_MAX = 10;
+
+/**
+ * 路径投影真实目标解析结果
+ */
+export interface PathProjectionResult {
+	path: string;
+	resolved_path?: string;
+	dangling_symlink?: boolean;
+	resolution_failed?: boolean;
+	resolved_from?: "direct" | "ancestor" | "lexical";
+}
+
+/**
+ * 解析路径真实物理目标，区分三类情形：
+ * 1. 目标或祖先存在（正常文件或新建文件，解析真实物理路径）
+ * 2. 悬垂符号链接（链接本身存在但指向不存在目标，高危，标记 dangling_symlink: true）
+ * 3. 真实解析失败（权限、循环、断链等，标记 resolution_failed: true）
+ */
+export function resolvePathForProjection(targetPath: string, cwd: string): PathProjectionResult {
+	if (typeof targetPath !== "string" || !targetPath.trim()) {
+		return { path: targetPath ?? "" };
+	}
+	const rawPath = targetPath;
+	const fullPath = isAbsolute(targetPath) ? targetPath : resolve(cwd, targetPath);
+
+	try {
+		// 1. 检查物理状态（lstat 不跟随符号链接）
+		let stat;
+		try {
+			stat = lstatSync(fullPath);
+		} catch (err: any) {
+			if (err?.code === "ENOENT") {
+				// 文件不存在：向上逐级寻找最近存在的祖先目录
+				let currentDir = dirname(fullPath);
+				const remainingParts: string[] = [basename(fullPath)];
+
+				while (currentDir && currentDir !== dirname(currentDir)) {
+					try {
+						const dirStat = lstatSync(currentDir);
+						if (dirStat.isDirectory()) {
+							const realAncestor = realpathSync(currentDir);
+							const resolved = join(realAncestor, ...remainingParts);
+							return {
+								path: rawPath,
+								resolved_path: resolved,
+								resolved_from: "ancestor",
+							};
+						}
+					} catch {
+						remainingParts.unshift(basename(currentDir));
+						currentDir = dirname(currentDir);
+					}
+				}
+				// 祖先目录都不存在（例如 mock 虚拟路径）：词法解析回退
+				return { path: rawPath, resolved_path: fullPath, resolved_from: "lexical" };
+			}
+			return { path: rawPath, resolution_failed: true };
+		}
+
+		// 2. 检查符号链接
+		if (stat.isSymbolicLink()) {
+			try {
+				const real = realpathSync(fullPath);
+				return { path: rawPath, resolved_path: real, resolved_from: "direct" };
+			} catch (err: any) {
+				if (err?.code === "ENOENT") {
+					// 悬垂符号链接：链接本身存在，但目标不存在
+					let linkTarget = "";
+					try {
+						linkTarget = readlinkSync(fullPath);
+					} catch {}
+					return {
+						path: rawPath,
+						resolved_path: linkTarget ? resolve(dirname(fullPath), linkTarget) : undefined,
+						dangling_symlink: true,
+					};
+				}
+				return { path: rawPath, resolution_failed: true };
+			}
+		}
+
+		// 3. 常规文件或目录存在
+		const real = realpathSync(fullPath);
+		return { path: rawPath, resolved_path: real, resolved_from: "direct" };
+	} catch {
+		return { path: rawPath, resolution_failed: true };
+	}
+}
 
 /**
  * 投影工具输入参数为分类器可见的最小字段集。
  *
  * @param toolName 工具名（pi 工具：bash / edit / write / read / ...）
  * @param input    工具调用原始参数
- * @param cwd      当前工作目录（bash 投影需要）
+ * @param cwd      当前工作目录（bash 投影及路径解析需要）
  */
 export function projectToolInput(
 	toolName: string,
@@ -38,23 +134,19 @@ export function projectToolInput(
 		case "bash":
 			return projectBashInput(input, cwd);
 		case "edit":
-			return projectEditInput(input);
+			return projectEditInput(input, cwd);
 		case "write":
-			return projectWriteInput(input);
+			return projectWriteInput(input, cwd);
 		case "read":
-			// 读类投影：只暴露目标路径，不暴露文件内容
-			return { path: typeof input.path === "string" ? input.path : "" };
+			return projectReadInput(input, cwd);
 		case "grep":
 		case "find":
-			return {
-				path: typeof input.path === "string" ? input.path : "",
-				pattern: typeof input.pattern === "string" ? input.pattern : "",
-			};
+			return projectSearchInput(toolName, input, cwd);
 		case "ls":
-			return { path: typeof input.path === "string" ? input.path : "" };
+			return projectLsInput(input, cwd);
 		default:
-			// 未知工具 → 最小化投影，安全优先
-			return { toolName };
+			// 未知工具 → 最小化投影，安全优先，附带 unknown_tool 标记
+			return { toolName, unknown_tool: true };
 	}
 }
 
@@ -65,35 +157,82 @@ function projectBashInput(input: Record<string, any>, cwd: string): Record<strin
 	};
 }
 
-function projectEditInput(input: Record<string, any>): Record<string, any> {
-	const edits = Array.isArray(input.edits) ? input.edits : [];
-
-	const previews = edits.slice(0, EDIT_PREVIEW_MAX).map((edit: any) => {
-		const oldText = edit && typeof edit.oldText === "string" ? edit.oldText : "";
-		const newText = edit && typeof edit.newText === "string" ? edit.newText : "";
-		const truncated =
-			oldText.length > PROJECTION_PREVIEW_LENGTH || newText.length > PROJECTION_PREVIEW_LENGTH;
-		return {
-			old_preview: oldText.slice(0, PROJECTION_PREVIEW_LENGTH),
-			new_preview: newText.slice(0, PROJECTION_PREVIEW_LENGTH),
-			truncated,
-		};
-	});
-
+function projectReadInput(input: Record<string, any>, cwd: string): Record<string, any> {
+	const rawPath = typeof input.path === "string" ? input.path : "";
+	const pathInfo = resolvePathForProjection(rawPath, cwd);
 	return {
-		path: typeof input.path === "string" ? input.path : "",
-		edits_count: edits.length,
-		edits_preview: previews,
+		...pathInfo,
 	};
 }
 
-function projectWriteInput(input: Record<string, any>): Record<string, any> {
-	const content = typeof input.content === "string" ? input.content : "";
+function projectSearchInput(toolName: string, input: Record<string, any>, cwd: string): Record<string, any> {
+	const rawPath = typeof input.path === "string" ? input.path : "";
+	const pathInfo = resolvePathForProjection(rawPath, cwd);
 	return {
-		path: typeof input.path === "string" ? input.path : "",
-		byte_count: Buffer.byteLength(content, "utf8"),
-		content_preview: content.slice(0, PROJECTION_PREVIEW_LENGTH),
-		content_truncated: content.length > PROJECTION_PREVIEW_LENGTH,
+		...pathInfo,
+		pattern: typeof input.pattern === "string" ? input.pattern : "",
+	};
+}
+
+function projectLsInput(input: Record<string, any>, cwd: string): Record<string, any> {
+	const rawPath = typeof input.path === "string" ? input.path : "";
+	const pathInfo = resolvePathForProjection(rawPath, cwd);
+	return {
+		...pathInfo,
+	};
+}
+
+function projectEditInput(input: Record<string, any>, cwd: string): Record<string, any> {
+	const rawPath = typeof input.path === "string" ? input.path : "";
+	const pathInfo = resolvePathForProjection(rawPath, cwd);
+	const edits = Array.isArray(input.edits) ? input.edits : [];
+
+	let hasChunkTruncated = false;
+	const previews = edits.slice(0, EDIT_PREVIEW_MAX).map((edit: any) => {
+		const oldText = edit && typeof edit.oldText === "string" ? edit.oldText : "";
+		const newText = edit && typeof edit.newText === "string" ? edit.newText : "";
+		const chunkTruncated =
+			oldText.length > PROJECTION_PREVIEW_LENGTH || newText.length > PROJECTION_PREVIEW_LENGTH;
+		if (chunkTruncated) hasChunkTruncated = true;
+		return {
+			old_preview: chunkTruncated ? oldText.slice(0, PROJECTION_PREVIEW_LENGTH) : oldText,
+			new_preview: chunkTruncated ? newText.slice(0, PROJECTION_PREVIEW_LENGTH) : newText,
+			truncated: chunkTruncated,
+		};
+	});
+
+	const isGlobalTruncated = edits.length > EDIT_PREVIEW_MAX || hasChunkTruncated;
+
+	return {
+		...pathInfo,
+		edits_count: edits.length,
+		edits_preview: previews,
+		content_truncated: isGlobalTruncated,
+	};
+}
+
+function projectWriteInput(input: Record<string, any>, cwd: string): Record<string, any> {
+	const rawPath = typeof input.path === "string" ? input.path : "";
+	const pathInfo = resolvePathForProjection(rawPath, cwd);
+	const content = typeof input.content === "string" ? input.content : "";
+	const byteLength = Buffer.byteLength(content, "utf8");
+	const isTruncated = content.length > PROJECTION_PREVIEW_LENGTH;
+
+	if (!isTruncated) {
+		return {
+			...pathInfo,
+			byte_count: byteLength,
+			content_preview: content,
+			content_truncated: false,
+		};
+	}
+
+	return {
+		...pathInfo,
+		byte_count: byteLength,
+		preview_head: content.slice(0, PROJECTION_HEAD_LENGTH),
+		preview_tail: content.slice(-PROJECTION_TAIL_LENGTH),
+		content_truncated: true,
 	};
 }
 

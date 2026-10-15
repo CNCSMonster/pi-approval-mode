@@ -139,6 +139,7 @@ test("A5: auto 下读取 ssh 私钥进入分类器（断言进分类器，非被
 test("A6: allow 规则命中的 bash 仍走 0.0s 快路径，deny 规则压过一切", async () => {
 	const cwd = mkdtempSync(join(tmpdir(), "pi-auto-bash-rules-"));
 	mkdirSync(join(cwd, ".pi"), { recursive: true });
+	writeFileSync(join(cwd, ".pi", "settings.json"), "{}", "utf-8");
 	writeFileSync(
 		join(cwd, ".pi", "approval-rules.json"),
 		JSON.stringify({ allow: ["Bash(git status)"], ask: [], deny: ["Bash(ls *)"], default: [] }),
@@ -221,15 +222,15 @@ test("A10: 策略词条无 destructive_git_operations，分类器基础 prompt �
 });
 
 // ============================================================
-// A11：分析调用与弹窗展示行保留——auto 分类器判拦弹窗仍含"静态结构特征"
+// A11：去红鲱鱼——auto 分类器判拦弹窗不再展示无因果关系的静态只读白名单特征
 // ============================================================
 
-test("A11: auto 分类器判拦弹窗保留静态结构特征展示行（分析调用未下线）", async () => {
+test("A11: auto 分类器判拦弹窗不展示误导性的静态只读白名单特征展示行", async () => {
 	const h = await setup({ hasUI: true, complete: "block" });
 
 	const r = await callBash(h, "ls -la");
 	assert.ok(h.classifyCalls() >= 1, "必须经过分类器研判");
 	assert.strictEqual(h.dialogs.length, 1, "判拦 → 人审弹窗");
-	assert.match(h.dialogs[0], /静态结构特征/, "弹窗展示行必须保留（展示≠裁决）");
+	assert.doesNotMatch(h.dialogs[0], /静态结构特征/, "弹窗展示行必须移除无因果关系的白名单红鲱鱼");
 	assert.strictEqual(r?.block, true, "默认拒绝出口不变");
 });

@@ -266,7 +266,7 @@ export function evaluateTier1StaticReadonlyGate(command: string): { isSafe: bool
 
 	// 2) 按复合操作符切分，逐段静态分析
 	const segments = trimmed
-		.split(/(?:&&|\|\||;|\|)/)
+		.split(/(?:&&|\|\||;|\||\r?\n)/)
 		.map((s) => s.trim())
 		.filter(Boolean);
 
@@ -323,8 +323,17 @@ export function evaluateTier1StaticReadonlyGate(command: string): { isSafe: bool
 		) {
 			return { isSafe: false, reason: "tar create/extract writes files and is forbidden in read-only mode" };
 		}
-		if (bin === "find" && args.includes("-delete")) {
-			return { isSafe: false, reason: "find -delete alters filesystem in read-only mode" };
+		if (bin === "find") {
+			const dangerousFindArg = args.find((a) =>
+				["-exec", "-execdir", "-ok", "-okdir", "-delete"].includes(a)
+			);
+			if (dangerousFindArg) {
+				return { isSafe: false, reason: `find ${dangerousFindArg} executes commands or alters filesystem in read-only mode` };
+			}
+		}
+		if (bin === "env" && args.length > 0) {
+			// env 后跟任何选项或子命令都可能用于包装执行（例如 env rm -rf /）
+			return { isSafe: false, reason: "env with arguments can execute arbitrary commands in read-only mode" };
 		}
 		// awk/gawk/mawk 的 system() 可执行任意命令，脱离静态研判与沙盒预期
 		if (bin.endsWith("awk") && seg.includes("system(")) {
@@ -365,9 +374,9 @@ export function evaluateStrictReadOnlyCommand(command: string): { isSafe: boolea
 		};
 	}
 
-	// 3. 切分复合命令（;, &&, ||, |）并逐一校验
+	// 3. 切分复合命令（;, &&, ||, |, \n）并逐一校验
 	const subCommands = trimmed
-		.split(/(?:&&|\|\||;|\|)/)
+		.split(/(?:&&|\|\||;|\||\r?\n)/)
 		.map((cmd) => cmd.trim())
 		.filter(Boolean);
 
@@ -532,6 +541,24 @@ function evaluateSingleCommandReadOnly(subCmd: string): { isSafe: boolean; reaso
 		"uname",
 		"whoami",
 	]);
+
+	if (root === "find") {
+		const dangerousFindArg = parts.slice(1).find((a) =>
+			["-exec", "-execdir", "-ok", "-okdir", "-delete"].includes(a)
+		);
+		if (dangerousFindArg) {
+			return { isSafe: false, reason: `find ${dangerousFindArg} executes commands or alters filesystem in read-only mode` };
+		}
+		return { isSafe: true };
+	}
+
+	if (root === "env") {
+		// 仅允许无参数的 env 打印环境变量；带任何参数（如 env cmd 或 env -i cmd）均可能借壳执行
+		if (parts.length > 1) {
+			return { isSafe: false, reason: "env with arguments is forbidden in read-only mode" };
+		}
+		return { isSafe: true };
+	}
 
 	if (allowedRoots.has(root)) {
 		return { isSafe: true };

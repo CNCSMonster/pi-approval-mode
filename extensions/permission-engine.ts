@@ -231,6 +231,7 @@ export function matchesCommandPattern(
 
 	// 按照控制/逻辑操作符（&&, ||, ;, |, &）切分为多个子命令段
 	const segments: string[] = [];
+	const substSegments: string[] = [];
 	let currentWords: string[] = [];
 	for (const token of tokens) {
 		if (
@@ -240,7 +241,8 @@ export function matchesCommandPattern(
 				token.value === ";" ||
 				token.value === "&" ||
 				token.value === "|" ||
-				token.value === "|&")
+				token.value === "|&" ||
+				token.value === "\n")
 		) {
 			if (currentWords.length > 0) {
 				segments.push(currentWords.join(" "));
@@ -248,19 +250,29 @@ export function matchesCommandPattern(
 			}
 		} else if (token.type === "word") {
 			currentWords.push(token.value);
+		} else if (token.type === "subst") {
+			// 命令替换中提取出的子命令
+			substSegments.push(token.value);
 		}
 	}
 	if (currentWords.length > 0) {
 		segments.push(currentWords.join(" "));
 	}
 
-	// 复合命令聚合:
+	// 复合命令与内嵌命令替换聚合:
 	// - "all" : 每段均需命中 (npm test && npm run lint 需两段均命中 allow);
-	// - "any" : 任一段命中即生效 (deny `Bash(rm *)` 需拦截 `ls && rm -rf /`)。
-	if (segments.length > 1) {
+	// - "any" : 任一段命中即生效 (deny `Bash(rm *)` 需拦截 `ls && rm -rf /`，也需拦截 `echo $(rm -rf /)`)。
+	const allCandidateSegments = [...segments, ...substSegments];
+	if (allCandidateSegments.length > 1) {
 		return mode === "all"
-			? segments.every((seg) => matchesSingleCommandPattern(seg, rawPat))
-			: segments.some((seg) => matchesSingleCommandPattern(seg, rawPat));
+			? allCandidateSegments.every((seg) => matchesSingleCommandPattern(seg, rawPat))
+			: allCandidateSegments.some((seg) => matchesSingleCommandPattern(seg, rawPat));
+	}
+
+	if (substSegments.length > 0 && mode === "any") {
+		// 单段但是包含 subst（如 echo $(rm -rf /)），检查主段或任一替换段
+		if (matchesSingleCommandPattern(rawCmd, rawPat)) return true;
+		return substSegments.some((sub) => matchesSingleCommandPattern(sub, rawPat));
 	}
 
 	return matchesSingleCommandPattern(rawCmd, rawPat);

@@ -89,7 +89,7 @@ test(" stage1-classifier: buildStage1ClassifierContext 形态对齐官方 exampl
 	const q = ctx.questions[STAGE1_QUESTION_KEY];
 	assert.strictEqual(STAGE1_QUESTION_KEY, "shouldBlock");
 	assert.strictEqual(q.type, "bool");
-	assert.ok(q.instructions.includes("blocked for human approval"));
+	assert.ok(q.instructions.includes("allowed or denied"));
 	assert.strictEqual(typeof q.criteria.true, "string");
 	assert.strictEqual(typeof q.criteria.false, "string");
 	assert.ok(q.criteria.true.length > 0);

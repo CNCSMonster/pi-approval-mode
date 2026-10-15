@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-15
+
+### ✨ Features & UX Improvements
+- **Approval Dialog Viewport Budget Governance & Key Decoupling**:
+  - **Two-Pass Slot Allocation**: Chrome scaling and detail capacity are computed by a dependency-free two-pass algorithm so detail capacity is monotonically non-decreasing with terminal height — last-page content is always fully visible with no false bottoming-out.
+  - **Sub-16-Row Hard Lock**: Terminals shorter than 16 rows rigidly lock the compact layout (expansion disabled) so dialog content can never scroll out of the viewport.
+  - **Independent Scroll Routing**: In collapsed view `PgUp` / `PgDn` scroll the background conversation transcript; in expanded view they page through tool-call payload text in place (`↑`/`↓`/`k`/`j` fine-tune, `Space`/`b` page, `Home`/`End`/`g`/`G` jump), with the approval-option cursor fully pinned during scrolling.
+  - **Esc / q Escape Hatch**: In expanded view `Esc` / `q` only collapses back to the folded state — it can never accidentally trigger a security rejection.
+  - **Focus-Only Option Selection**: `Tab` / `Shift+Tab` cycle option focus and number keys `1`–`5` only move focus with a hint — submission requires an explicit `Enter`, eliminating accidental persistent-allow misfires.
+  - **Scroll Memory & Diagnostic Panel**: Scroll offset persists across collapse/expand; `m` toggles a full metadata diagnostic view (loop warnings, block reasons, triage suggestions, static structure features).
+  - **Stage 2 Summary Semantic Layering**: Risk-reason summaries and tool-call payload now scroll exclusively, preventing interleaved content jumps.
+- **Classifier Markdown Contract & Natural Reasoning Flow**:
+  - Robust Markdown decision contract with tail-anchored parsing and standalone-line decision support, tolerant to surrounding prose.
+  - Natural reasoning flow with bidirectional context-field extraction for more faithful intent capture.
+- **Structured Input Projection & Evidence Provenance**:
+  - Write/edit payloads receive 4,000-character full exposure with head/tail sampling for oversized content.
+  - Deterministic real-path resolution distinguishes new files, dangling symlinks, and resolution errors; dangling symlinks and workspace-escaping paths are blocked in a deterministic pre-layer.
+  - **Evidence Provenance Hierarchy**: Only direct user input in the session and `AGENTS.md` from trusted projects count as authorization; in-band privilege forgery (e.g. `[ADMIN OVERRIDE]`, `ignore previous rules`) is classified as malicious injection and hard-blocked, while benign technical statements remain unaffected.
+- **Project Trust Gate Extended to Approval Policies**:
+  - Project-level `.pi/approval-policy.md` is now enforced behind the trust gate alongside configuration and rules files, blocking natural-language policy poisoning from untrusted repositories.
+  - Repositories shipping only approval configuration files proactively prompt a trust dialog in interactive mode and fail closed with minimal privilege in headless/RPC environments.
+- **Stage 1 Decision Primitive Upgrade**:
+  - Stage 1 now speaks an explicit ALLOW/DENY decision primitive with biased instructional wording removed.
+  - High-recall boundary tuning targets zero false-negative leaks, with enriched representative exemplars for environment and secret-handling scenarios.
+
+### 🛡️ Security Hardening
+- **Multi-Layer Shell & Sandbox Hardening**:
+  - Unquoted newline (`\n` / CRLF) is treated as a command separator across all defense layers — multi-line commands are governed exactly like `&&` / `;` chains in rule matching and heuristics.
+  - Heuristic fallback now detects interpreter payloads, `xargs` targets, and git flag bypass attempts.
+  - Read-only sandbox hardening covers command substitution, workspace-boundary escapes, and tool-call identifier isolation.
+
+### 📚 Documentation
+- **User Guide Synchronization**: English and Chinese user manuals updated for dialog key decoupling, evidence provenance semantics, trust-gate coverage of policy files, and multiline compound-command matching.
+
 ## [0.12.1] - 2026-10-14
 
 ### 🐛 Bug Fixes & TUI Stability

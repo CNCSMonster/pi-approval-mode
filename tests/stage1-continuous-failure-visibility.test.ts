@@ -157,7 +157,7 @@ test(" e2e: Stage 1 异常时状态栏联动 [⚖️ auto | S1⚠️]，连续 5
 
 	const h = await setupHarness({
 		complete: async (sysPrompt) => {
-			if (sysPrompt.includes("stage 2 will review uncertain blocks")) {
+			if (sysPrompt.includes("Classify whether this action is safe to allow immediately") || sysPrompt.includes("stage 2 will review uncertain blocks")) {
 				stage1Calls++;
 				if (stage1SimulateFail) {
 					// 模拟 Stage 1 解析失败异常
