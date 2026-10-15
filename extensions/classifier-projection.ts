@@ -125,25 +125,30 @@ export function resolvePathForProjection(targetPath: string, cwd: string): PathP
  * @param input    工具调用原始参数
  * @param cwd      当前工作目录（bash 投影及路径解析需要）
  */
+/** 可注入的路径解析器（重放场景以 FS Oracle 快照驱动，默认实时文件系统解析）。 */
+export type ProjectionPathResolver = (targetPath: string, cwd: string) => PathProjectionResult;
+
 export function projectToolInput(
 	toolName: string,
 	input: Record<string, any>,
 	cwd: string,
+	pathResolver?: ProjectionPathResolver,
 ): Record<string, any> {
+	const resolver = pathResolver ?? resolvePathForProjection;
 	switch (toolName) {
 		case "bash":
 			return projectBashInput(input, cwd);
 		case "edit":
-			return projectEditInput(input, cwd);
+			return projectEditInput(input, cwd, resolver);
 		case "write":
-			return projectWriteInput(input, cwd);
+			return projectWriteInput(input, cwd, resolver);
 		case "read":
-			return projectReadInput(input, cwd);
+			return projectReadInput(input, cwd, resolver);
 		case "grep":
 		case "find":
-			return projectSearchInput(toolName, input, cwd);
+			return projectSearchInput(toolName, input, cwd, resolver);
 		case "ls":
-			return projectLsInput(input, cwd);
+			return projectLsInput(input, cwd, resolver);
 		default:
 			// 未知工具 → 最小化投影，安全优先，附带 unknown_tool 标记
 			return { toolName, unknown_tool: true };
@@ -157,34 +162,34 @@ function projectBashInput(input: Record<string, any>, cwd: string): Record<strin
 	};
 }
 
-function projectReadInput(input: Record<string, any>, cwd: string): Record<string, any> {
+function projectReadInput(input: Record<string, any>, cwd: string, resolver: ProjectionPathResolver): Record<string, any> {
 	const rawPath = typeof input.path === "string" ? input.path : "";
-	const pathInfo = resolvePathForProjection(rawPath, cwd);
+	const pathInfo = resolver(rawPath, cwd);
 	return {
 		...pathInfo,
 	};
 }
 
-function projectSearchInput(toolName: string, input: Record<string, any>, cwd: string): Record<string, any> {
+function projectSearchInput(toolName: string, input: Record<string, any>, cwd: string, resolver: ProjectionPathResolver): Record<string, any> {
 	const rawPath = typeof input.path === "string" ? input.path : "";
-	const pathInfo = resolvePathForProjection(rawPath, cwd);
+	const pathInfo = resolver(rawPath, cwd);
 	return {
 		...pathInfo,
 		pattern: typeof input.pattern === "string" ? input.pattern : "",
 	};
 }
 
-function projectLsInput(input: Record<string, any>, cwd: string): Record<string, any> {
+function projectLsInput(input: Record<string, any>, cwd: string, resolver: ProjectionPathResolver): Record<string, any> {
 	const rawPath = typeof input.path === "string" ? input.path : "";
-	const pathInfo = resolvePathForProjection(rawPath, cwd);
+	const pathInfo = resolver(rawPath, cwd);
 	return {
 		...pathInfo,
 	};
 }
 
-function projectEditInput(input: Record<string, any>, cwd: string): Record<string, any> {
+function projectEditInput(input: Record<string, any>, cwd: string, resolver: ProjectionPathResolver): Record<string, any> {
 	const rawPath = typeof input.path === "string" ? input.path : "";
-	const pathInfo = resolvePathForProjection(rawPath, cwd);
+	const pathInfo = resolver(rawPath, cwd);
 	const edits = Array.isArray(input.edits) ? input.edits : [];
 
 	let hasChunkTruncated = false;
@@ -211,9 +216,9 @@ function projectEditInput(input: Record<string, any>, cwd: string): Record<strin
 	};
 }
 
-function projectWriteInput(input: Record<string, any>, cwd: string): Record<string, any> {
+function projectWriteInput(input: Record<string, any>, cwd: string, resolver: ProjectionPathResolver): Record<string, any> {
 	const rawPath = typeof input.path === "string" ? input.path : "";
-	const pathInfo = resolvePathForProjection(rawPath, cwd);
+	const pathInfo = resolver(rawPath, cwd);
 	const content = typeof input.content === "string" ? input.content : "";
 	const byteLength = Buffer.byteLength(content, "utf8");
 	const isTruncated = content.length > PROJECTION_PREVIEW_LENGTH;

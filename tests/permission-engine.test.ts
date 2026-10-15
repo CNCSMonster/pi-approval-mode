@@ -195,3 +195,71 @@ test("PermissionManager - 跨层冲突检测与压死警告 ", () => {
 	}
 });
 
+test("PermissionManager - matchedLayer 归因：命中规则携带来源层（session / project / user）", () => {
+	const tmpDir = mkdtempSync(join(tmpdir(), "pi-perm-layer-test-"));
+	try {
+		const pm = new PermissionManager(tmpDir, tmpDir);
+		pm.addRule("allow", "Bash(npm run *)", "session");
+		pm.addRule("ask", "Bash(rm -rf *)", "project");
+		pm.addRule("deny", "Bash(curl *)", "user");
+		pm.addRule("default", "Bash(docker run *)", "project");
+
+		const deny = pm.evaluate({ cwd: tmpDir, toolName: "bash", input: { command: "curl https://example.com" } });
+		assert.equal(deny.decision, "deny");
+		assert.equal(deny.matchedRule, "Bash(curl *)");
+		assert.equal(deny.matchedLayer, "user");
+
+		const ask = pm.evaluate({ cwd: tmpDir, toolName: "bash", input: { command: "rm -rf build" } });
+		assert.equal(ask.decision, "ask");
+		assert.equal(ask.matchedLayer, "project");
+
+		const def = pm.evaluate({ cwd: tmpDir, toolName: "bash", input: { command: "docker run -it alpine" } });
+		assert.equal(def.decision, "default");
+		assert.equal(def.matchedRule, "Bash(docker run *)");
+		assert.equal(def.matchedLayer, "project");
+
+		const allow = pm.evaluate({ cwd: tmpDir, toolName: "bash", input: { command: "npm run test" } });
+		assert.equal(allow.decision, "allow");
+		assert.equal(allow.matchedLayer, "session");
+
+		const none = pm.evaluate({ cwd: tmpDir, toolName: "bash", input: { command: "git status" } });
+		assert.equal(none.decision, "default");
+		assert.equal(none.matchedRule, undefined);
+		assert.equal(none.matchedLayer, undefined);
+	} finally {
+		rmSync(tmpDir, { recursive: true, force: true });
+	}
+});
+
+test("PermissionManager - matchedLayer 归因：跨层同态规则按 session → project → user 扫描序归因", () => {
+	const dirA = mkdtempSync(join(tmpdir(), "pi-perm-layer-a-"));
+	const dirB = mkdtempSync(join(tmpdir(), "pi-perm-layer-b-"));
+	const dirC = mkdtempSync(join(tmpdir(), "pi-perm-layer-c-"));
+	try {
+		const pmA = new PermissionManager(dirA, dirA);
+		pmA.addRule("allow", "Bash(git status)", "session");
+		pmA.addRule("allow", "Bash(git status)", "project");
+		pmA.addRule("allow", "Bash(git status)", "user");
+		const rA = pmA.evaluate({ cwd: dirA, toolName: "bash", input: { command: "git status" } });
+		assert.equal(rA.decision, "allow");
+		assert.equal(rA.matchedLayer, "session");
+
+		const pmB = new PermissionManager(dirB, dirB);
+		pmB.addRule("allow", "Bash(git status)", "project");
+		pmB.addRule("allow", "Bash(git status)", "user");
+		const rB = pmB.evaluate({ cwd: dirB, toolName: "bash", input: { command: "git status" } });
+		assert.equal(rB.decision, "allow");
+		assert.equal(rB.matchedLayer, "project");
+
+		const pmC = new PermissionManager(dirC, dirC);
+		pmC.addRule("allow", "Bash(git status)", "user");
+		const rC = pmC.evaluate({ cwd: dirC, toolName: "bash", input: { command: "git status" } });
+		assert.equal(rC.decision, "allow");
+		assert.equal(rC.matchedLayer, "user");
+	} finally {
+		rmSync(dirA, { recursive: true, force: true });
+		rmSync(dirB, { recursive: true, force: true });
+		rmSync(dirC, { recursive: true, force: true });
+	}
+});
+

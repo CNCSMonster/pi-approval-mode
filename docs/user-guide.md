@@ -43,6 +43,7 @@ Every dialog offers five actions — **press the number key `1`–`5` for instan
 Options `2`–`4` write an `allow` rule at the corresponding tier, so the same action never bothers you again at that scope.
 
 **Dialog interaction & display protections (Viewport Budget & Decoupled Interaction)**:
+- **Fact payload always displayed (human reviewers must see it)**: The factual payload of every pending tool call is presented directly in the dialog — for `bash` the full command (`准备执行命令`), for `edit` the matched/replaced text pairs (`修改载荷`), for `write` the complete write content (`修改载荷`), and for external/MCP tools the complete call arguments (`调用参数`); AI transcriptions (operation summaries / risk assessments) are auxiliary only and never replace or crowd out fact payloads. Oversized payloads use head-and-tail sampling with the omitted amount explicitly stated — never silently dropped;
 - **Details folding, expansion & collaborative paging**: Long commands or bulky tool inputs are bounded by a dynamic vertical height budget. Calls spanning $\ge 7$ visual lines fold by default (showing head 3 and tail 2 visual lines), with single extra-long lines protected via head-and-tail character truncation:
   - **In folded state**: press **`PgUp`** / **`PgDn`** to freely scroll background transcript history (hint: `[PgUp/PgDn] 翻阅历史`); press **`1`**–**`5`** to directly pick an option, **`↑`** / **`↓`** to navigate options, **`Enter`** to submit, and **`Esc`** to reject;
   - **In expanded state (Strictly Decoupled Ergonomics)**: press **`v`** or **`Ctrl+O`** to expand details. In expanded mode, keybindings strictly serve content inspection and accidental authorization prevention:
@@ -50,10 +51,10 @@ Options `2`–`4` write an `allow` rule at the corresponding tier, so the same a
     - **Independent Content Scrolling**: press **`↑`** / **`↓`** or **`k`** / **`j`** to micro-scroll 2 lines up/down; press **`PgUp`** / **`PgDn`** or **`Space`** / **`b`** to page scroll; press **`Home`** / **`End`** or **`g`** / **`G`** to jump to the top or bottom slice. The option cursor at the bottom remains completely motionless during text inspection;
     - **Option Focus Cycling & Safe Execution**: press **`Tab`** / **`Shift+Tab`** to cycle focus between approval options; number keys **`1`**–**`5`** only focus the corresponding option without executing it (eliminating accidental single-keystroke persistent privilege escalation); press **`Enter`** explicitly to commit the currently focused option;
     - **Progress Memory**: collapsing and re-expanding restores the previous scroll offset so you never have to re-navigate;
-    - **Full Diagnostics Panel**: press **`m`** in expanded mode to toggle between the hero code view and the full diagnostic metadata view (displaying dead loop warnings, block reasons, troubleshooting hints, and AST structural features);
+    - **Full Detail Panel (`m` available in any state)**: press **`m`** to toggle between the hero code view and the full detail panel; the panel contains the fact payload together with all auxiliary information (dead loop warnings, block reasons, troubleshooting hints, AST structural features, etc.), supports paging and `End`/`G` jump-to-bottom — available even in folded state and under the $H < 16$ locked-compact tier, guaranteeing no information is ever permanently invisible at any terminal height. The panel is a browsing state: **`Esc`** / **`q`** only exits the panel back to the code view and never triggers a rejection; number keys in the panel only focus options without direct submission;
 - **Batch progress awareness**: When an assistant turn dispatches multiple tool calls in a batch, the dialog title automatically highlights `(Batch X/Y)` to indicate the current call's position in the sequence;
 - **Terminal degradation & monotonic budget allocation**: Dynamic budget governance based on terminal rows $H$:
-  - When $H < 16$ rows, the dialog locks strictly in compact mode and prohibits expansion to prevent clipping and viewport displacement;
+  - When $H < 16$ rows, the dialog locks strictly in compact mode and prohibits expansion; total dialog height never exceeds $H$ (including $H = 10$ ultra-short terminals), the fact payload stays visible in at least an inline single-line form, and the full payload remains reachable via the **`m`** full detail panel;
   - When $H \ge 16$, progressive chrome scaling and a 2-pass slot algorithm ensure hero capacity is strictly non-decreasing, line $N-1$ is 100% reachable on the final page (zero false bottom omissions), and visual line width truncation strictly defends the vertical budget;
 - **Serialized dialog mutex**: when the model dispatches multiple pending tool calls concurrently in one turn, approval dialogs are presented **serially in arrival order** (built-in mutex), so dialogs never overlap and keybindings never race.
 
@@ -487,4 +488,84 @@ so `grep`ing the suite is the fastest way to find the authoritative answer for a
 edge case of the matrix in §2.
 
 ---
+
+## 7. Business Scenario Data Capture (opt-in, OFF by default)
+
+> **In one sentence**: when enabled, the extension records every tool call — both the raw facts at the
+> decision-funnel entrance and the terminal verdict — as two-phase events in a local directory,
+> for offline evaluation and classifier tuning. **Off by default**, and even when on, data never leaves your machine.
+
+### 7.1 Enabling / disabling
+
+Capture can **only be enabled by the global config or an environment variable** (single-direction rule):
+
+- Global config `~/.pi/agent/approval-config.json`:
+
+  ```json
+  { "captureDataset": { "enabled": true } }
+  ```
+
+- Or the environment variable (effective when the global config does not explicitly set `enabled`):
+
+  ```bash
+  export PI_APPROVAL_MODE_CAPTURE=1
+  ```
+
+When active, session start shows:
+
+```
+[ApprovalMode] 🟡 业务场景数据采集已激活 (存储于 ~/.pi/agent/approval-captures/)
+```
+
+To disable: set `enabled` to `false` in the global config (an explicit `false` cannot be overridden by the env var).
+
+**Single-direction tightening**: the project-level `.pi/approval-config.json` can **never enable** capture —
+it may only tighten (`enabled: false`, smaller `maxDiskBytes` / `retentionDays`, extra `excludeWorkspaces`).
+Untrusted workspaces are always excluded.
+
+### 7.2 Options (`captureDataset`)
+
+| Key | Default | Description |
+| :--- | :--- | :--- |
+| `enabled` | `false` | Master switch (global config only) |
+| `maxDiskBytes` | 52428800 (50MB) | Total quota for the capture directory; oldest files evicted first |
+| `retentionDays` | 30 | Retention window; expired files are cleaned up automatically |
+| `scrubSecrets` | `true` | Deep field scrub before anything hits disk (API keys / tokens / JWT / private keys / `.env` values / URI credentials); **`false` is only honored from the global config** — use with care |
+| `excludeWorkspaces` | `[]` | Workspace glob list; a match disables capture entirely |
+| `syncWrite` | `false` | fsync every event synchronously (throughput traded for durability; forensic use) |
+| `captureSelf` | `false` | Whether to record accesses to the capture directory/config itself (dropped by default, self-pollution guard) |
+
+### 7.3 Data & privacy
+
+- Location: `~/.pi/agent/approval-captures/` (directory 0700, files 0600);
+- **Risk boundary (please read)**: if `~/.pi` is synced wholesale by a cloud backup / sync drive
+  (OneDrive, Dropbox, iCloud, …), capture data may leave the machine with it — exclude this path
+  from sync, or turn capture off. The `policies/` subdirectory should not be shared, backed up or
+  exported on its own (content addressing allows offline dictionary probing of hash existence);
+- Two events per tool call: **event A** at the funnel entrance (pre-projection raw call / branch entries / environment)
+  and **event B** at the terminal (who made the final call, rule provenance, classifier snapshot),
+  reconciled by `callId`;
+- Capture itself is **zero outbound**;
+- A deep scrub pass (the same pipeline used for classifier inputs) runs before writing
+  (length-preserving placeholders `[REDACTED:<class>:<bytes>]`).
+
+### 7.4 Delete & export (capture ships with deletion rights)
+
+From the `pi-approval-mode` repo:
+
+```bash
+npm run dataset:delete -- --call-id <callId>        # delete one call (both A/B records)
+npm run dataset:delete -- --before 2026-10-01       # delete records up to that date (inclusive)
+npm run dataset:delete -- --all --yes               # full wipe (requires explicit --yes)
+npm run dataset:export  -- --out ./my-export.jsonl  # export to a standalone JSONL (re-scrubbed at export)
+```
+
+### 7.5 Advanced: offline replay & benchmark import (eval tooling, in the `pi-approval-mode-evals` repo)
+
+```bash
+npm run eval:replay --                      # dry-run: replay plan + L1/L2 fidelity report (zero model calls)
+npm run dataset:import-capture -- --list    # browse candidate samples (FP/TP candidates & mining pool)
+```
+
+Real-model replay (`eval:replay --model ... --confirm`) incurs API cost and outbound traffic and requires explicit confirmation.
 

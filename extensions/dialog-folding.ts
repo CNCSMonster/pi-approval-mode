@@ -142,7 +142,8 @@ export function truncateVisualLine(str: string, maxWidth: number): string {
 }
 
 /**
- * 详情项数据结构
+ * 详情项数据结构（primary 标记事实载荷主体：命令全文/修改载荷/调用参数，
+ * 由调用点显式指定，供主体代码视图与全量详情面板消费）
  */
 export interface DialogDetailItem {
 	label: string;
@@ -151,16 +152,87 @@ export interface DialogDetailItem {
 
 /**
  * 诊断元数据优先级全序权重：
- * 🚨 致命安全/死循环预警 (P0) > ⛔ 拦截原因 (P1) > ⚠️ 降级说明 (P2) > 操作摘要 (P3) > 静态特征 (P4) > 🔧 排障建议 (P5)
+ * 🚨 致命安全/死循环预警 (P0) > ⛔ 拦截原因 (P1) > ⚠️ 降级说明 (P2) > 事实载荷：命令全文/调用参数/修改载荷 (P3) > 操作摘要 (P4) > 静态特征 (P5) > 🔧 排障建议 (P6) > 其他 (P7)
  */
 export function getMetadataPriority(label: string): number {
+	// 人类审批回答的核心问题是"工具到底要做什么"——事实载荷类标签必须排在 AI 转述之前，
+	// 否则短载荷 + 长转述时，命令/参数会被挤出首屏两行 meta 预览（事实失明）。
 	if (label.includes("死循环") || label.includes("致命") || label.includes("高危")) return 0;
 	if (label.includes("拦截原因")) return 1;
 	if (label.includes("降级") || label.includes("熔断")) return 2;
-	if (label.includes("操作摘要")) return 3;
-	if (label.includes("静态结构") || label.includes("特征")) return 4;
-	if (label.includes("排障") || label.includes("建议")) return 5;
-	return 6;
+	if (
+		label.includes("准备执行命令") ||
+		label.includes("调用参数") ||
+		label.includes("修改载荷") ||
+		label.includes("写入内容") ||
+		label.includes("修改详情") ||
+		label.includes("目标文件") ||
+		label.includes("读取目标") ||
+		label.includes("调用目标") ||
+		label.includes("外部工具") ||
+		label.includes("未知工具") ||
+		label.includes("越界读取")
+	) {
+		return 3;
+	}
+	if (label.includes("操作摘要")) return 4;
+	if (label.includes("静态结构") || label.includes("特征")) return 5;
+	if (label.includes("排障") || label.includes("建议")) return 6;
+	return 7;
+}
+
+/**
+ * 显式主体选择：调用点以 primary: true 标记事实载荷项时优先选中；
+ * 否则回退到内容最长项（兼容旧行为）。废除"最长项即主体"的裸启发式，
+ * 防止长 AI 转述文本把短命令/参数挤出主体代码视图。
+ */
+export function selectPrimaryDetailIndex(details: DialogDetailItem[]): number {
+	const flagged = details.findIndex((d) => d.primary === true);
+	if (flagged >= 0) return flagged;
+	return details.reduce(
+		(maxIdx, cur, idx, arr) => (cur.content.length > arr[maxIdx].content.length ? idx : maxIdx),
+		0,
+	);
+}
+
+export interface ContentViewportPlan {
+	/** 元数据预览行数 */
+	metaLines: number;
+	/** 主体标签行数（0 时标签内联进首行） */
+	heroLabelLines: number;
+	/** 主体正文可用行数（含折叠提示行） */
+	heroLines: number;
+	/** 标签与首行内联的紧凑形态（heroLines === 1 时） */
+	inlineLabel: boolean;
+}
+
+/**
+ * 内容区行数分配（纯函数，供布局数学核算与测试）。
+ * 代入极值验证：H=10 → 槽位 1（内联单行）；H=12 → 槽位 3（标签+头尾双行）；
+ * H=15 → 槽位 6（标准头 3 提示 尾 2）；H=24/40 → meta 预览 + 主体递增。
+ */
+export function allocateContentViewport(
+	contentSlot: number,
+	opts: { wantMetaPreview: boolean; hasPrimary: boolean; maxMetaLines: number },
+): ContentViewportPlan {
+	const slot = Math.max(0, contentSlot);
+	if (slot === 0) return { metaLines: 0, heroLabelLines: 0, heroLines: 0, inlineLabel: false };
+	if (!opts.hasPrimary) {
+		return {
+			metaLines: Math.min(opts.maxMetaLines, slot),
+			heroLabelLines: 0,
+			heroLines: 0,
+			inlineLabel: false,
+		};
+	}
+	// 事实载荷优先：先给主体保留至少 3 行（标签+头+尾），剩余才给 meta 预览
+	const metaLines = opts.wantMetaPreview && slot >= 5 ? Math.min(opts.maxMetaLines, slot - 3) : 0;
+	const heroArea = slot - metaLines;
+	if (heroArea >= 2) {
+		return { metaLines, heroLabelLines: 1, heroLines: heroArea - 1, inlineLabel: false };
+	}
+	// 仅 1 行槽位：标签内联进首行，保证事实载荷仍有一行可见
+	return { metaLines: 0, heroLabelLines: 0, heroLines: 1, inlineLabel: true };
 }
 
 /**
@@ -185,6 +257,8 @@ export interface FormatDetailOptions {
 	contIndent?: string;
 	maxExpandedLines?: number;
 	pageOffset?: number;
+	/** 折叠态总行数预算（含折叠提示行）；默认 6 = 头 3 + 提示 + 尾 2 */
+	foldedLinesBudget?: number;
 }
 
 /**
@@ -207,6 +281,7 @@ export function formatFoldableDetail(
 		indent = "    ",
 		contIndent = indent,
 		maxExpandedLines = 50,
+		foldedLinesBudget = 6,
 	} = options;
 
 	const safeWidth = Math.max(10, width);
@@ -261,20 +336,27 @@ export function formatFoldableDetail(
 		}
 
 		// 超出单屏预算：执行两遍无依赖槽位判定算法，杜绝末页槽位循环依赖
-		const topSlot = offset > 0 ? 1 : 0;
+		// 极小预算保护：提示行总和不得挤占正文（正文 >= 1 行恒成立，提示行按底优先裁剪）
+		let topSlot = offset > 0 ? 1 : 0;
 
-		// Pass 1: 假定保留底槽（占用 1 行），计算保守净正文预算
+		// Pass 1：假定保留底槽（占用 1 行），计算保守净正文预算
 		const cbWithBottom = Math.max(1, maxExpandedLines - topSlot - 1);
 
-		// Pass 2: 检查保守预算下是否还有未显示内容
+		// Pass 2：检查保守预算下是否还有未显示内容
 		const hasMoreBelow = (offset + cbWithBottom) < rawVisualLineCount;
 
 		// 底部槽位决策：
 		// 下方有剩余行时为 1（显示未完提示）；
 		// 下方无剩余行但上方有偏移时为 1（显示已触底提示，恒定占位防高度突增）；
 		// 仅当首屏在预留底槽前提下即可看完全部内容时为 0
-		const bottomSlot = hasMoreBelow ? 1 : (topSlot > 0 ? 1 : 0);
-		const contentBudget = bottomSlot > 0 ? cbWithBottom : Math.max(1, maxExpandedLines - topSlot);
+		let bottomSlot = hasMoreBelow ? 1 : (topSlot > 0 ? 1 : 0);
+
+		// 极小预算收敛：提示行最多占 maxExpandedLines - 1 行，优先保留底提示（位置/触底语义）
+		const maxHintLines = Math.max(0, maxExpandedLines - 1);
+		bottomSlot = Math.min(bottomSlot, maxHintLines);
+		topSlot = Math.min(topSlot, maxHintLines - bottomSlot);
+
+		const contentBudget = Math.max(1, maxExpandedLines - topSlot - bottomSlot);
 
 		const sliceStart = Math.min(rawVisualLineCount, Math.max(0, offset));
 		const sliceEnd = Math.min(rawVisualLineCount, sliceStart + contentBudget);
@@ -321,7 +403,8 @@ export function formatFoldableDetail(
 		};
 	}
 
-	// 折叠态 (Compact Mode): 头 3 视觉行 + 折叠提示 + 尾 2 视觉行
+	// 折叠态 (Compact Mode): 预算内头尾分显 + 折叠提示行（默认 6 行 = 头 3 + 提示 + 尾 2，
+	// 矮终端按 foldedLinesBudget 缩放，保证不超出内容区槽位）
 	// 对各逻辑行应用超长单逻辑行上限（最多 2 个视觉行）
 	const protectedLines: string[] = [];
 	for (const line of consolidated) {
@@ -332,46 +415,13 @@ export function formatFoldableDetail(
 	}
 
 	const lines: string[] = [];
-	const headCount = 3;
-	const tailCount = 2;
-
-	if (protectedLines.length < headCount + tailCount) {
-		// 当单逻辑行超长截断后总视觉行数不足 5 行时（如单行超长截断为 2 行，行内已首尾双显）
-		for (const l of protectedLines) {
-			lines.push(theme.fg("text", l));
-		}
-		const hiddenCount = Math.max(1, rawVisualLineCount - protectedLines.length);
-		const foldHint = `⋯ (还有 ${hiddenCount} 视觉行未展示，共 ${rawVisualLineCount} 视觉行，按 v 或 Ctrl+O 展开) ⋯`;
-		for (const hl of wrapDialogLine(foldHint, safeWidth, indent, contIndent)) {
-			lines.push(theme.fg("muted", hl));
-		}
-	} else {
-		// 头 3 视觉行
-		const headLines = protectedLines.slice(0, headCount);
-		for (const l of headLines) {
-			lines.push(theme.fg("text", l));
-		}
-
-		// 中间折叠提示行
-		const hiddenCount = Math.max(1, rawVisualLineCount - (headCount + tailCount));
-		const foldHint = `⋯ (还有 ${hiddenCount} 视觉行未展示，共 ${rawVisualLineCount} 视觉行，按 v 或 Ctrl+O 展开) ⋯`;
-		for (const hl of wrapDialogLine(foldHint, safeWidth, indent, contIndent)) {
-			lines.push(theme.fg("muted", hl));
-		}
-
-		// 尾 2 视觉行
-		const tailLines = protectedLines.slice(-tailCount);
-		for (const l of tailLines) {
-			lines.push(theme.fg("text", l));
-		}
-	}
+	const foldBudget = Math.max(0, foldedLinesBudget);
+	const foldHint = `⋯ (还有 %HIDDEN% 视觉行未展示，共 ${rawVisualLineCount} 视觉行，按 v 展开 | m 查看全文) ⋯`;
 
 	const defaultContentBudget = Math.max(1, maxExpandedLines - 2);
 	const defaultMaxOffset = Math.max(0, rawVisualLineCount - defaultContentBudget);
 	const defaultStep = Math.max(1, defaultContentBudget - 2);
-
-	return {
-		lines,
+	const baseResult = {
 		isFoldable: true,
 		totalVisualLines: rawVisualLineCount,
 		totalChars,
@@ -379,6 +429,52 @@ export function formatFoldableDetail(
 		maxOffset: defaultMaxOffset,
 		step: defaultStep,
 	};
+
+	if (foldBudget === 0) {
+		// 零槽位：正文不渲染，由调用方保证 m 全文出口（避免无出口的静默丢弃）
+		return { ...baseResult, lines: [] };
+	}
+
+	if (foldBudget === 1) {
+		// 单行紧凑形态：首行 + 行内省略标记（出口：m 全文）
+		const first = protectedLines[0] ?? "";
+		lines.push(theme.fg("text", truncateVisualLine(`${first} ⋯(m 全文)`, Math.max(10, safeWidth - indent.length))));
+		return { ...baseResult, lines };
+	}
+
+	// budget >= 2：1 行提示 + 余下内容行头尾分显（头稍多于尾）
+	const contentLines = foldBudget - 1;
+	const hintRendered = wrapDialogLine(
+		foldHint.replace("%HIDDEN%", String(Math.max(1, rawVisualLineCount - Math.min(protectedLines.length, contentLines)))),
+		safeWidth,
+		indent,
+		contIndent,
+	);
+	const hintText = truncateVisualLine(hintRendered.join(" "), Math.max(10, safeWidth - indent.length));
+
+	if (protectedLines.length <= contentLines) {
+		// 截断保护后总视觉行不足内容槽位：全量展示 + 提示（隐藏行数来自未保护的原始行）
+		for (const l of protectedLines) {
+			lines.push(theme.fg("text", l));
+		}
+		lines.push(theme.fg("muted", hintText));
+		return { ...baseResult, lines };
+	}
+
+	const headCount = Math.floor((contentLines + 1) / 2);
+	const tailCount = contentLines - headCount;
+
+	for (const l of protectedLines.slice(0, headCount)) {
+		lines.push(theme.fg("text", l));
+	}
+	lines.push(theme.fg("muted", hintText));
+	if (tailCount > 0) {
+		for (const l of protectedLines.slice(-tailCount)) {
+			lines.push(theme.fg("text", l));
+		}
+	}
+
+	return { ...baseResult, lines };
 }
 
 /**

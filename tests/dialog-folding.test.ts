@@ -125,7 +125,7 @@ test(" 详情折叠: >= 7 视觉行触发折叠，折叠态展示头 3 尾 2 与
 	assert.ok(res.lines[2].includes("step 3"), "头 3 对应 step 3");
 	assert.ok(res.lines[3].includes("还有 10 视觉行未展示"), "中间提示省略 10 视觉行 (15 - 5)");
 	assert.ok(res.lines[3].includes("共 15 视觉行"), "中间提示包含总视觉行数");
-	assert.ok(res.lines[3].includes("按 v 或 Ctrl+O 展开"), "中间提示包含展开快捷键");
+	assert.ok(res.lines[3].includes("按 v 展开 | m 查看全文"), "中间提示包含展开与全量详情出口快捷键");
 	assert.ok(res.lines[4].includes("step 14"), "尾 1 对应 step 14");
 	assert.ok(res.lines[5].includes("step 15"), "尾 2 对应 step 15");
 });

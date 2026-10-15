@@ -1,6 +1,6 @@
 {
   "name": "pi-approval-mode",
-  "version": "0.13.0",
+  "version": "0.14.0",
   "description": "Multi-tiered tool execution approval, permission memory, and two-stage LLM safety classifier for Pi Coding Agent",
   "keywords": [
     "pi-package",
@@ -18,7 +18,9 @@
     "test": "node scripts/check-coverage.js",
     "test:unit": "node --test --experimental-strip-types tests/*.ts",
     "lint": "npx oxlint --deny-warnings",
-    "check": "npm run lint && npm test"
+    "check": "npm run lint && npm test",
+    "dataset:delete": "node --experimental-strip-types scripts/capture-dataset.ts delete",
+    "dataset:export": "node --experimental-strip-types scripts/capture-dataset.ts export"
   },
   "pi": {
     "extensions": [

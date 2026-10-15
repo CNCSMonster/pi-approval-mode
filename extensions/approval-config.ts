@@ -8,6 +8,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { logClassifierDebug } from "./logger.ts";
 import type { DenialLimits } from "./denial-tracker.ts";
+import type { CaptureDatasetConfig } from "./approval-capture.ts";
 
 // ==========================================
 // 审批模式词汇表与旧名别名（v0.3.0: default → manual）
@@ -70,6 +71,7 @@ export interface ApprovalConfigFile {
 	loopDetection?: LoopDetectionConfig; // 死循环与连续失败统计熔断阈值用户偏好配置
 	denialLimits?: Partial<DenialLimits>; // 无头拦截与连续失败阈值 (对齐 Qwen Code)
 	headlessAbortOnDenialCap?: boolean; // 达到累计拦截上限时是否附带 terminate: true 终止无头任务
+	captureDataset?: CaptureDatasetConfig; // 业务场景数据采集（单向开启：全局/env 可开，项目级只能收紧）
 	comment?: string;
 }
 
@@ -253,4 +255,31 @@ export function loadProjectApprovalPolicy(
 		globalPolicy: res.globalPolicy,
 		projectPolicy: res.projectPolicy,
 	};
+}
+
+/**
+ * 读取采集数据集配置的两层原始来源（不做合并）。
+ *
+ * 单向开启原则要求消费方看到全局与项目两层的**原始**配置分别做裁决：
+ * 全局可开启，项目级只能收紧（enabled→false、降低配额/保留期、追加排除名单）。
+ * 项目级配置仅在受信任工作区读取（未信任时返回 undefined，与信任闸语义一致）。
+ */
+export function loadCaptureDatasetLayers(
+	cwd: string,
+	isTrusted: boolean,
+	agentDir: string,
+): { global?: CaptureDatasetConfig; project?: CaptureDatasetConfig } {
+	const readLayer = (filePath: string): CaptureDatasetConfig | undefined => {
+		if (!existsSync(filePath)) return undefined;
+		try {
+			const data = JSON.parse(readFileSync(filePath, "utf-8"));
+			const capture = data?.captureDataset;
+			return capture && typeof capture === "object" ? (capture as CaptureDatasetConfig) : undefined;
+		} catch {
+			return undefined;
+		}
+	};
+	const globalLayer = readLayer(join(agentDir, "approval-config.json"));
+	const projectLayer = isTrusted ? readLayer(join(cwd, ".pi", "approval-config.json")) : undefined;
+	return { global: globalLayer, project: projectLayer };
 }

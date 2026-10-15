@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-10-15
+
+### ✨ Features & UX Improvements
+- **Business Scenario Data Capture (opt-in, OFF by default)**:
+  - **Two-Phase Capture Engine**: tool-call intake (event A) and the final verdict (event B) are recorded as paired local records for offline evaluation and classifier tuning, with CAS-atomic writes, a quota budget, and orphan reconciliation (process-liveness plus a 24-hour dual threshold).
+  - **Privacy by Default**: capture is strictly opt-in — enable it explicitly via `captureDataset.enabled` in the global config or the `PI_APPROVAL_MODE_CAPTURE=1` environment flag. Project configuration can only tighten (never enable), untrusted workspaces are always excluded, and all captured data stays on the local machine (cloud-sync risk boundary documented).
+  - **Dataset Management Tools**: delete/export tools for captured datasets plus a dataset CLI script, with an injectable path resolver powering snapshot-driven replay scenarios.
+- **Approval Rule Tier Attribution**: rule decisions now report which tier the matched rule came from (`user` / `project` / `session`), making it clear why a call was allowed, asked, or denied.
+
+### 🐛 Bug Fixes & Security Hardening
+- **Approval Dialog Fact Payload Visibility** (safety-critical human review):
+  - Fact payloads are now always displayed for every pending call: edit matched/replaced text pairs, write full content, shell full command, and full external-tool arguments. AI transcriptions (summaries / risk assessments) are auxiliary and never replace the payload; oversized payloads show head/tail samples with the omitted amount explicitly stated.
+  - Hero detail selection uses an explicit primary marking instead of the longest-item heuristic, and fact payloads rank above AI transcriptions in metadata ordering — short commands can no longer be crowded off the first screen by long AI prose.
+  - Viewport height math reworked (header/footer-first allocation with content-slot budgeting and a final clamp): total dialog height never exceeds the target at any terminal height, verified across H=10/12/15/24/40 including ultra-short terminals.
+  - The full detail panel (`m`) is reachable in any state — including folded and sub-16-row locked-compact terminals — guaranteeing no payload line is ever permanently invisible; the panel is a browsing state where `Esc`/`q` only exits the panel and number keys never submit directly.
+  - Jump-to-bottom (`End`/`G`) always lands on the true last page; tiny viewports can no longer let hint lines crowd out the only content line.
+- **Reusable Secret Scrub Pipeline**: secret scrubbing consolidated into a deterministic, reusable pipeline with matched-rule attribution, strengthening defense-in-depth for displayed and recorded tool arguments.
+
 ## [0.13.0] - 2026-10-15
 
 ### ✨ Features & UX Improvements

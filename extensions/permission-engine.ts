@@ -40,6 +40,9 @@ export type DecisionType = "deny" | "ask" | "allow" | "default";
 /** 规则四态类型（allow / ask / default / deny）。 */
 export type RuleVerdict = "allow" | "ask" | "deny" | "default";
 
+/** 规则来源层（命中归因口径；跨层扫描顺序为 session → project → user）。 */
+export type RuleLayer = "user" | "project" | "session";
+
 export interface PermissionRules {
 	allow: string[];
 	ask: string[];
@@ -786,58 +789,45 @@ export class PermissionManager {
 	 * 核心状态机决策求值：
 	 * Deny (3) > Ask (2) > Allow (0) > Default
 	 */
-	public evaluate(ctx: RuleMatchContext): { decision: DecisionType; matchedRule?: string } {
-		// 聚合所有层级的规则 (Union 并集)
-		const allDeny = [
-			...this.sessionRules.deny,
-			...this.projectRules.deny,
-			...this.userRules.deny,
+	public evaluate(ctx: RuleMatchContext): { decision: DecisionType; matchedRule?: string; matchedLayer?: RuleLayer } {
+		// 聚合所有层级的规则 (Union 并集)，并携带每条规则的来源层，供终局归因与采集事件标注
+		const layers: Array<{ layer: RuleLayer; rules: PermissionRules }> = [
+			{ layer: "session", rules: this.sessionRules },
+			{ layer: "project", rules: this.projectRules },
+			{ layer: "user", rules: this.userRules },
 		];
-		const allAsk = [
-			...this.sessionRules.ask,
-			...this.projectRules.ask,
-			...this.userRules.ask,
-		];
-		const allAllow = [
-			...this.sessionRules.allow,
-			...this.projectRules.allow,
-			...this.userRules.allow,
-		];
-		const allDefault = [
-			...this.sessionRules.default,
-			...this.projectRules.default,
-			...this.userRules.default,
-		];
+		const collect = (verdict: RuleVerdict): Array<{ rule: string; layer: RuleLayer }> =>
+			layers.flatMap(({ layer, rules }) => rules[verdict].map((rule) => ({ rule, layer })));
 
 		// 1. 扫描 Deny 规则池 (最高优先级，短路阻断；复合命令 any 聚合：任一段命中即拦)
-		for (const r of allDeny) {
-			const parsed = parseDslRule(r);
+		for (const { rule, layer } of collect("deny")) {
+			const parsed = parseDslRule(rule);
 			if (matchesParsedRule(parsed, ctx, "any")) {
-				return { decision: "deny", matchedRule: r };
+				return { decision: "deny", matchedRule: rule, matchedLayer: layer };
 			}
 		}
 
 		// 2. 扫描 Ask 规则池 (次高优先级，强制人工确认；复合命令 any 聚合：任一段命中即问)
-		for (const r of allAsk) {
-			const parsed = parseDslRule(r);
+		for (const { rule, layer } of collect("ask")) {
+			const parsed = parseDslRule(rule);
 			if (matchesParsedRule(parsed, ctx, "any")) {
-				return { decision: "ask", matchedRule: r };
+				return { decision: "ask", matchedRule: rule, matchedLayer: layer };
 			}
 		}
 
 		// 2.5 扫描 default 规则池 (交给审批模式：auto→classifier，非 auto→人工；any 聚合从严)
-		for (const r of allDefault) {
-			const parsed = parseDslRule(r);
+		for (const { rule, layer } of collect("default")) {
+			const parsed = parseDslRule(rule);
 			if (matchesParsedRule(parsed, ctx, "any")) {
-				return { decision: "default", matchedRule: r };
+				return { decision: "default", matchedRule: rule, matchedLayer: layer };
 			}
 		}
 
 		// 3. 扫描 Allow 规则池 (免审通过；复合命令 all 聚合：每段均命中才放行)
-		for (const r of allAllow) {
-			const parsed = parseDslRule(r);
+		for (const { rule, layer } of collect("allow")) {
+			const parsed = parseDslRule(rule);
 			if (matchesParsedRule(parsed, ctx, "all")) {
-				return { decision: "allow", matchedRule: r };
+				return { decision: "allow", matchedRule: rule, matchedLayer: layer };
 			}
 		}
 

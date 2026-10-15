@@ -121,14 +121,18 @@ test("两遍槽位判定: 未触底页指示行清晰标注绝对行范围与剩
 // 3. 诊断元数据优先级全序与列宽物理裁剪
 // ============================================================
 
-test("诊断元数据优先级: 🚨 致命死循环预警严格置顶", () => {
+test("诊断元数据优先级: 🚨 致命死循环预警严格置顶，事实载荷优先于 AI 转述", () => {
 	assert.equal(getMetadataPriority("🚨 死循环预警"), 0);
 	assert.equal(getMetadataPriority("致命安全告警"), 0);
 	assert.equal(getMetadataPriority("⛔ 拦截原因"), 1);
 	assert.equal(getMetadataPriority("⚠️ 降级说明"), 2);
-	assert.equal(getMetadataPriority("操作摘要"), 3);
-	assert.equal(getMetadataPriority("静态结构特征"), 4);
-	assert.equal(getMetadataPriority("🔧 排障建议"), 5);
+	// 事实载荷类（命令全文/调用参数/修改载荷）必须排在 AI 转述之前
+	assert.equal(getMetadataPriority("准备执行命令"), 3);
+	assert.equal(getMetadataPriority("调用参数"), 3);
+	assert.equal(getMetadataPriority("修改载荷"), 3);
+	assert.equal(getMetadataPriority("操作摘要"), 4);
+	assert.equal(getMetadataPriority("静态结构特征"), 5);
+	assert.equal(getMetadataPriority("🔧 排障建议"), 6);
 
 	// 排序验证
 	const items = [
@@ -427,7 +431,7 @@ test("全量诊断面板: m 键切换诊断视图与代码视图", async () => {
 	// 按 m 切换至全量诊断视图
 	comp.handleInput("m");
 	text = comp.render(80).join("\n");
-	assert.ok(text.includes("诊断与辅助信息全量视图"), "进入全量诊断视图");
+	assert.ok(text.includes("全量详情面板"), "进入全量诊断视图");
 	assert.ok(text.includes("高危写操作尝试"), "操作摘要在全量视图中可见");
 	assert.ok(text.includes("触碰高危系统目录 /etc"), "拦截原因在全量视图中可见");
 
