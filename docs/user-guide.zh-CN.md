@@ -123,7 +123,8 @@ pi install git:github.com/CNCSMonster/pi-approval-mode
 - **受保护路径** = 工作区敏感位置（`.pi/`、`.git/`、`AGENTS.md`、Shell 点文件如 `.bashrc` / `.zshrc` / `.profile`、环境变量与密钥 `.env*` / `id_rsa*` / `id_ed25519*`、凭据文件 `.pypirc` / `.git-credentials`、CLI 配置 `.config/gh/` / `.config/glab-cli/`、基础设施与集群目录 `helm/` / `k8s/` / `iam/` 等）。`auto` 模式下这些路径不走快路径，改走分类器。
 - **分类器 → 弹窗**：两阶段 LLM 分类器结合对话上下文研判该调用。判为有风险则弹窗展示风险理由，之后仍是 `1`–`5` 选择；判为安全则无感放行。
 - **skill 目录** `*` = 用户级 `~/.pi/agent/skills/**` 与 `~/.agents/skills/**`（恒豁免）+ 项目级 `.pi/skills/**` 与 `.agents/skills/**`（仅受信项目豁免）；显式 `deny`/`ask` 规则仍然优先于白名单。
-- **只读 Shell 与分层沙盒（层序归位）**：在 `readonly` 模式下，具备操作系统内核级只读沙盒（macOS `sandbox-exec`、Linux `bwrap`）时**沙盒优先**——静态层只拦截明确的本地写意图（`rm`、写入重定向、编译器、`sed -i`、`find -delete` 等）与沙盒无法约束的远程/会话副作用（`git push`、`npm publish`、`ssh`、非 GET 的 `curl` 等），未命中者一律交由沙盒包裹执行——`python test.py`、`pytest`、`cargo check` 等复杂探查不再被白名单提前扼杀；在 Windows 或无沙盒环境中降级为严格只读命令白名单（`git status`、`ls`、`grep`、`cargo check` 等；放行 `2>/dev/null` 黑洞重定向，穿透 `git -C <dir>` 等全局参数，拦截 `git branch <name>`、`git tag <name>`、`--output` 落盘与 `$(...)` 命令替换）。**在 `auto` 下只读快路径已下线**：该分析现仅为 `auto` 弹窗的“静态结构特征”展示行供料——展示≠裁决。每一条未命中规则的 shell 调用（含 `ls`）都进分类器；想把某命令钉回 0 秒，写一条 `allow` 规则。
+- **只读 Shell 与分层沙盒（层序归位）**：在 `readonly` 模式下，具备操作系统内核级只读沙盒（macOS `sandbox-exec`、Linux `bwrap`）时**沙盒优先**——静态层只拦截明确的本地写意图（`rm`、写入重定向、编译器、`sed -i`、`find -delete` 等）与沙盒无法约束的远程/会话副作用（`git push`、`npm publish`、`ssh`、非 GET 的 `curl` 等，以及网络中继工具 `nc`/`netcat`/`socat`、含命令替换或下载管道的网络外传、解释器内联网络请求），未命中者一律交由沙盒包裹执行——`python test.py`、`pytest`、`cargo check` 等复杂探查不再被白名单提前扼杀。Linux 环境下 `bwrap` 默认开启独立网络栈隔离（`--unshare-net`）与进程间通信隔离（`--unshare-ipc`），即使执行的只读命令试图发起外部 TCP/UDP 连接，也会在内核命名空间层直接被切断连接（`exit 7`），杜绝数据外传；在 Windows 或无沙盒环境中降级为严格只读命令白名单（`git status`、`ls`、`grep`、`cargo check` 等；放行 `2>/dev/null` 黑洞重定向，穿透 `git -C <dir>` 等全局参数，拦截 `git branch <name>`、`git tag <name>`、`--output` 落盘与 `$(...)` 命令替换）。**在 `auto` 下只读快路径已下线**：该分析结果不再进入 `auto` 弹窗（曾有的“静态结构特征”展示行已移除——它与拦截结论无因果关系，会误导归因，如让 `cd` 看起来像被目标路径的白名单拦截）。每一条未命中规则的 shell 调用（含 `ls`）都进分类器；想把某命令钉回 0 秒，写一条 `allow` 规则。
+- **符号链接真实物理路径（realpath）校验**：路径权限匹配（`Read` / `Edit`）在评估 `allow` 规则时，会严格解析目标及其父级目录的真实规范物理路径（`realpath`），防止攻击者在工作区内构造指向区外敏感文件（如 `/etc/passwd`、`~/.ssh/id_rsa`）的符号链接逃逸放行规则；指向不存在路径的断链或越界链接在放行判定中一律保守降级为非放行。
 - **复合命令规则匹配语义**：由 `&&`、`||`、`;`、`|`、`&` 或顶层未引用换行符（`\n` / CRLF）连接的多行或复合命令，`allow` 规则要求**每一段全部命中**才放行（`git status && rm -rf /` 或 `git status\nrm -rf /` 不会被 `Bash(git *)` 放行）；`deny` / `ask` / `default` 规则**任一段命中即生效**（`ls && rm -rf /` 与 `ls\nrm -rf /` 均会被 `Bash(rm *)` 拦截）。含命令替换 `$(…)` 或反引号的命令不参与 `allow` 模糊命中。
 - **Shell 工具统一纳管**：Windows 内置 `powershell`、`pwsh`（及 `run_shell_command`）与 `bash` 享有同等门禁——各模式的审批弹窗、分类器研判与规则匹配口径完全一致。
 - **外部 / 第三方 MCP 工具兜底**：未列入内置工具的第三方/MCP 工具不再静默放行——`readonly` 下非读工具一律物理阻断；`manual` / `auto-edit` 下直呈人工审批弹窗（无头环境改为英文拒绝）；`auto` 下送交两阶段分类器研判，判有风险则弹窗人审。
@@ -263,6 +264,13 @@ $$\text{Deny} > \text{Ask} > \text{Default} > \text{Allow}$$
   - **清空配置**：`/classifier-model clear`（重置全部模型与思考键回到内置默认及主模型）；亦可按目标清除 `/classifier-model clear --stage1`（或 `--stage2` / `--both` / `--thinking`，其中 `clear --thinking` 仅清除思考档位）。
   - **帮助与补全**：`/classifier-model help` 显示语法与示例；支持全流程 Tab 自动补全，候选列表智能剪枝互斥选项，展示模型价格、推理与上下文窗口元数据，并对当前生效模型标注 `✓`；在输入 `--thinking ` 时自动提示 7 个可用档位候选。
   - **语法迁移说明**：旧语法位置参数 `/classifier-model <model>` 与 `/classifier-model default` 已移除，请分别迁移为 `--both <model>` 与 `clear`。
+- **查看或覆写工作区环境指纹**：**`/approval-mode-setup`**
+  - **机制说明**：轻量探针自动探测当前工作区的环境事实（依据 `package.json` / `Cargo.toml` / `pyproject.toml` / `requirements.txt` / `go.mod` 识别项目类型、Git 上游主机、常规本地开发端口如 3000/5173/8080），并注入 `### Current Workspace Profile` 段落到分类器提示词。帮助分类器识别本仓常规开发生命周期操作（重启卡死的 dev server、清理测试日志或构建缓存），不再误判为生产破坏。
+  - **安全边界**：指纹仅描述环境事实，不授予任何授权，也绝不弱化 HARD BLOCK 或 SOFT BLOCK 规则。
+  - **查看状态**：直接执行 `/approval-mode-setup`，回显当前探针指纹与你的覆写条目。
+  - **追加覆写**：`/approval-mode-setup set <text>` 追加一条覆写（≤200 字符，最多 10 条，持久化到 `.pi/workspace-profile-overrides.json`）。例如 `/approval-mode-setup set local port 9000 is a routine test server`。含注入标记（伪造授权/豁免声明）的条目会被拒绝。
+  - **清空覆写**：`/approval-mode-setup clear` 清空全部覆写条目，回退纯探针指纹。
+  - **信任闸**：覆写条目仅在**受信任**项目注入；不可信工作区中仅持久化、不注入。
 - `defaultMode` 设定启动模式；项目级 `.pi/approval-config.json` 按顶层键整体覆盖全局
   （且仅在**受信任**项目生效——见 §5.4）。
 
@@ -315,9 +323,10 @@ Stage 1 与 Stage 2 分类器支持独立配置模型思考模式（Reasoning / 
 ### 4.3 超时与优雅降级
 
 - Stage 1 受 `classifierTimeoutMs` 约束（默认 **1500 ms**）；模型慢就调大；
-- 分类器**不可用**（未配置、连不上、反复超时）时，`auto` 模式回落到**确定性启发式规则**——
-  破坏性 `rm`、`curl | sh`、force-push、凭据路径等高危模式依然拦截；
-- 因此启发式放行**不等于**分类器真的回答过——区分方法见 §5.2。
+- 分类器**无判决**时存在两种降级语义，弹窗降级标注会如实交代是哪一种：
+  - **真启发式研判**（分类器未配置、或熔断触顶）：`auto` 模式回落到**确定性启发式规则**——破坏性 `rm`、`curl | sh`、force-push、凭据路径等高危模式依然拦截。弹窗标注为"⚠️ 分类器无判决（降级为规则研判）"；
+  - **保守硬拦截**（超时、解析失败、上游错误）：**不做任何规则研判**，一律保守拦截待人工裁决。弹窗标注为"⚠️ 分类器无判决（保守拦截）"，明示"未做规则研判"——不得把保守拦截误认为规则引擎结论；
+- 因此放行**不等于**分类器真的回答过——区分方法见 §5.2。
 
 ### 4.4 Stage 1 健康感知与持续失效排查
 

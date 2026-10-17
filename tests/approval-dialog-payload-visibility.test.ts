@@ -10,7 +10,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import approvalModeExtension, {
@@ -22,12 +22,26 @@ interface SetupOptions {
 	terminalRows?: number;
 	mode?: "manual" | "auto" | "auto-edit";
 	toolName?: string;
-	input?: Record<string, any>;
+	input?: Record<string, any> | ((cwd: string) => Record<string, any>);
 	classifierResult?: any;
+	/** 分类器恒抛错 → stage2_exception 降级链（fallback 触发链专用） */
+	classifierThrows?: boolean;
+	/** 预置项目级规则（会话启动前写入 <cwd>/.pi/approval-rules.json） */
+	rules?: { ask?: string[]; allow?: string[]; deny?: string[]; default?: string[] };
 }
 
 async function setupDialogHarness(options: SetupOptions = {}) {
 	const terminalRows = options.terminalRows ?? 40;
+	const harnessCwd = mkdtempSync(join(tmpdir(), "pi-payload-visibility-"));
+	if (options.rules) {
+		mkdirSync(join(harnessCwd, ".pi"), { recursive: true });
+		writeFileSync(join(harnessCwd, ".pi", "settings.json"), "{}", "utf-8");
+		writeFileSync(
+			join(harnessCwd, ".pi", "approval-rules.json"),
+			JSON.stringify({ allow: [], ask: [], deny: [], default: [], ...options.rules }),
+			"utf-8",
+		);
+	}
 	let renderedComponent: any = null;
 	const handlers: Record<string, Function> = {};
 	const commands: Record<string, any> = {};
@@ -56,7 +70,12 @@ async function setupDialogHarness(options: SetupOptions = {}) {
 		find: () => null,
 		getAll: () => [ctxModel] as any[],
 		hasConfiguredAuth: () => true,
-		complete: async () => ({
+		complete:
+			options.classifierThrows === true
+				? async () => {
+						throw new Error("model timeout");
+					}
+				: async () => ({
 			content: [
 				{
 					type: "text",
@@ -101,7 +120,7 @@ async function setupDialogHarness(options: SetupOptions = {}) {
 			notify: () => {},
 			select: async () => null,
 		},
-		cwd: mkdtempSync(join(tmpdir(), "pi-payload-visibility-")),
+		cwd: harnessCwd,
 		isProjectTrusted: () => true,
 		sessionManager: { getBranch: () => [] },
 	};
@@ -111,8 +130,10 @@ async function setupDialogHarness(options: SetupOptions = {}) {
 		await commands["approval-mode"].handler(options.mode ?? "manual", mockExtensionContext);
 	}
 
+	const resolvedInput =
+		typeof options.input === "function" ? options.input(harnessCwd) : (options.input ?? { command: "echo hello" });
 	const promise = handlers["tool_call"](
-		{ toolName: options.toolName ?? "bash", input: options.input ?? { command: "echo hello" } },
+		{ toolName: options.toolName ?? "bash", input: resolvedInput },
 		mockExtensionContext,
 	);
 
@@ -335,4 +356,56 @@ test("按键语义诚实: 详情面板浏览态 Esc 不触发拒绝，代码折�
 	h.comp.handleInput("m");
 	h.comp.handleInput("\x1b");
 	assert.equal(h.getSubmittedAction(), "block", "代码折叠态 Esc 仍为拒绝");
+});
+
+// ============================================================
+// 5. 验收缺口补钉（ask 规则路径与 fallback 降级触发链的直测）
+// ============================================================
+
+test("事实载荷恒展示: ask 规则命中弹窗（auto-edit）可见修改载荷", async () => {
+	const h = await setupDialogHarness({
+		terminalRows: 40,
+		mode: "auto-edit",
+		toolName: "edit",
+		rules: { ask: ["Edit(demo.ts)"] },
+		input: (cwd) => ({
+			path: join(cwd, "demo.ts"),
+			edits: [{ oldText: "const askRuleOld = 1;", newText: "const askRuleNew = 2;" }],
+		}),
+	});
+	const text = h.comp.render(80).join("\n");
+	assert.ok(text.includes("Ask Rule"), "必须命中 ask 规则弹窗（而非普通人工审批弹窗）");
+	assert.ok(text.includes("命中规则"), "展示命中规则条目");
+	assert.ok(text.includes("修改载荷"), "ask 规则弹窗必须包含修改载荷条目");
+	assert.ok(text.includes("const askRuleOld = 1;"), "匹配文本必须可见");
+	assert.ok(text.includes("const askRuleNew = 2;"), "替换文本必须可见");
+});
+
+test("fallback 降级触发链: 分类器抛错 + 短命令，降级标注不吞没命令事实", async () => {
+	const h = await setupDialogHarness({
+		terminalRows: 40,
+		mode: "auto",
+		classifierThrows: true,
+		input: { command: "rm -rf /tmp/demo-target" },
+	});
+	const lines = h.comp.render(80);
+	const text = lines.join("\n");
+	assert.ok(text.includes("分类器无判决"), "降级标注必须可见（人审需知判决来源）");
+	assert.ok(text.includes("准备执行命令:"), "命令条目标签必须可见");
+	assert.ok(text.includes("rm -rf /tmp/demo-target"), "短命令内容必须在首屏可见（不被更长的降级文案挤出主体）");
+	// 命令是主体：标签行之后紧跟命令正文
+	const labelIdx = lines.findIndex((l: string) => l.includes("准备执行命令:"));
+	assert.ok(labelIdx >= 0 && labelIdx < lines.length - 1, "命令标签后必须有正文行");
+});
+
+test("fallback 降级触发链: 矮终端 H=12 命令事实仍内联可见且总高不超 H", async () => {
+	const h = await setupDialogHarness({
+		terminalRows: 12,
+		mode: "auto",
+		classifierThrows: true,
+		input: { command: "rm -rf /tmp/demo-target" },
+	});
+	const lines = h.comp.render(80);
+	assert.ok(lines.length <= 12, `H=12 总高 (${lines.length}) 必须 <= 12`);
+	assert.ok(lines.join("\n").includes("rm -rf /tmp/demo-target"), "矮终端下短命令仍以内联形态可见");
 });

@@ -7,7 +7,7 @@
  * 2. auto-edit - 自动批准文件编辑：edit/write 自动放行，仅 Shell 命令 (bash) 需审批确认。
  * 3. auto      - 智能两阶段分类器模式（Qwen Code Auto 模式架构）：
  *                - Layer 1: 工作区常规文件修改免审（自身配置与敏感凭据除外）
- *                - Layer 2: 工业级 Shell 只读状态机——仅 plan 模式作守卫与 auto 弹窗"静态结构特征"展示；auto 下不再据此免审
+ *                - Layer 2: 工业级 Shell 只读状态机——仅 plan 模式作守卫；其分析结果不再进入 auto 弹窗（静态白名单特征与拦截结论无因果关系，展示只会误导归因）
  *                - Layer 3: 【双阶段 LLM 安全分类器 (Two-Stage Classifier)】
  *                  • Stage 1 (Fast Path): ~300ms 快速研判 (带 1500ms 超时熔断)
  *                  • Stage 2 (Review Path): 仅当 Stage 1 标记可疑时触发深度推理，消除误报
@@ -126,6 +126,13 @@ import {
 import {
 	resolveEffectiveProjectTrust,
 } from "./approval-trust.ts";
+import {
+	buildWorkspaceProfile,
+	loadWorkspaceProfileOverrides,
+	resolveWorkspaceProfileOverrides,
+	saveWorkspaceProfileOverrides,
+	validateWorkspaceProfileOverride,
+} from "./workspace-profile.ts";
 
 let moduleEffectiveProjectTrust: boolean = false;
 
@@ -257,6 +264,25 @@ const LOOP_ABORT_OPTION: ApprovalOption = {
 	label: "拒绝并指示停止 (Block & Abort)",
 	description: "拒绝执行并命令模型停止当前死循环尝试，必须更换解决思路",
 };
+
+/**
+ * 降级态标注条目（分类器无判决时如实交代裁决来源）。
+ * outage 路径（超时/解析失败/上游错误）并未执行任何规则研判，只能表述为保守拦截；
+ * 唯有启发式兜底真正执行过研判时，才允许声明"已按启发式规则研判"——
+ * 文案不得谎报裁决来源（谎报会把用户误导为规则引擎结论，掩盖真实归因）。
+ */
+export function buildClassifierFallbackItem(decision: { stage?: string; outage?: boolean }): DialogDetailItem {
+	if (decision.outage === true) {
+		return {
+			label: "⚠️ 分类器无判决（保守拦截）",
+			content: "分类器本次未能给出判决，已按保守策略拦截（未做规则研判）；人工批准一次即恢复分类器判定（连续无判决将自动熔断）。",
+		};
+	}
+	return {
+		label: "⚠️ 分类器无判决（降级为规则研判）",
+		content: "分类器本次未能给出判决，已按启发式规则研判；人工批准一次即恢复分类器判定（连续无判决将自动熔断）。",
+	};
+}
 
 function formatDialogTitle(baseTitle: string, subType: string, loopCheck: LoopCheckResult): string {
 	if (!loopCheck.isLoop) {
@@ -707,6 +733,62 @@ export const CLASSIFIER_CLEAR_TARGET_DESCRIPTIONS: Record<ClassifierClearFlag, s
 };
 
 // ==========================================
+// /approval-mode-setup 参数解析、帮助纯逻辑（工作区环境指纹覆写）
+// ==========================================
+
+export type ApprovalModeSetupCommand =
+	| { kind: "status" }
+	| { kind: "set"; text: string }
+	| { kind: "clear" }
+	| { kind: "help" }
+	| { kind: "error"; message: string };
+
+export const APPROVAL_MODE_SETUP_USAGE =
+	"用法: /approval-mode-setup [set <text> | clear | help]";
+
+export const APPROVAL_MODE_SETUP_HELP_TEXT = `/approval-mode-setup — 查看/固化工作区环境指纹覆写条目
+
+  /approval-mode-setup                 查看当前工作区指纹与覆写状态
+  /approval-mode-setup set <text>      追加一条覆写（≤200 字符，最多 10 条，持久化到 .pi/workspace-profile-overrides.json）
+  /approval-mode-setup clear           清空全部覆写（回退纯探针指纹）
+  /approval-mode-setup help            显示本帮助
+
+示例:
+  /approval-mode-setup set local port 9000 is a routine test server
+  /approval-mode-setup set internal git host git.corp.internal is the routine upstream
+
+覆写条目仅为环境事实描述，禁止携带授权/豁免声明语义（注入标记会被拒绝）。`;
+
+/**
+ * 解析 /approval-mode-setup 参数（纯逻辑、可单测）。
+ * set 文本复用覆写校验：长度上限、空串、控制字符、注入标记均拒绝并给出原因。
+ */
+export function parseApprovalModeSetupCommand(input: string): ApprovalModeSetupCommand {
+	const trimmed = input.trim();
+	if (!trimmed) return { kind: "status" };
+
+	const spaceIdx = trimmed.indexOf(" ");
+	const sub = (spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx)).toLowerCase();
+	const rest = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx + 1).trim();
+
+	if (sub === "help") return { kind: "help" };
+	if (sub === "clear") return { kind: "clear" };
+
+	if (sub === "set") {
+		if (!rest) {
+			return { kind: "error", message: `set 需要覆写文本。\n${APPROVAL_MODE_SETUP_USAGE}` };
+		}
+		const check = validateWorkspaceProfileOverride(rest);
+		if (!check.ok) {
+			return { kind: "error", message: `${check.reason}\n${APPROVAL_MODE_SETUP_USAGE}` };
+		}
+		return { kind: "set", text: rest };
+	}
+
+	return { kind: "error", message: `未知子命令: ${sub}\n${APPROVAL_MODE_SETUP_USAGE}` };
+}
+
+// ==========================================
 // 配置冲突治理纯函数
 // ==========================================
 
@@ -1021,6 +1103,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 	// 全局与项目级自然语言审批策略缓存（session_start/reload 时加载，分类器调用时注入）
 	let cachedGlobalPolicy: string | undefined;
 	let cachedProjectPolicy: string | undefined;
+	let cachedWorkspaceProfile: string | undefined;
 	let cachedClassifierBasePrompt: string = CLASSIFIER_BASE_PROMPT;
 	const sessionTrustCache = new Map<string, boolean>();
 
@@ -1170,9 +1253,14 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 
 		cachedGlobalPolicy = loadedGlobalPolicy;
 		cachedProjectPolicy = loadedProjectPolicy;
+		cachedWorkspaceProfile = buildWorkspaceProfile(
+			ctx.cwd,
+			resolveWorkspaceProfileOverrides(ctx.cwd, isTrusted),
+		);
 		cachedClassifierBasePrompt = buildClassifierBasePrompt({
 			globalPolicy: cachedGlobalPolicy,
 			projectPolicy: cachedProjectPolicy,
+			workspaceProfile: cachedWorkspaceProfile,
 		});
 
 		if (globalPolicyTruncated) {
@@ -1798,6 +1886,65 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 
 		return null;
 	}
+
+	// 工作区环境指纹覆写：/approval-mode-setup
+	pi.registerCommand("approval-mode-setup", {
+		description: "查看/固化工作区环境指纹覆写条目（set/clear/help）",
+		handler: async (args, ctx) => {
+			const parsed = parseApprovalModeSetupCommand(args ?? "");
+
+			const rebuildProfile = () => {
+				cachedWorkspaceProfile = buildWorkspaceProfile(
+					ctx.cwd,
+					resolveWorkspaceProfileOverrides(ctx.cwd, moduleEffectiveProjectTrust),
+				);
+				cachedClassifierBasePrompt = buildClassifierBasePrompt({
+					globalPolicy: cachedGlobalPolicy,
+					projectPolicy: cachedProjectPolicy,
+					workspaceProfile: cachedWorkspaceProfile,
+				});
+			};
+
+			if (parsed.kind === "error") {
+				ctx.ui.notify(parsed.message, "error");
+				return;
+			}
+
+			if (parsed.kind === "help") {
+				ctx.ui.notify(APPROVAL_MODE_SETUP_HELP_TEXT, "info");
+				return;
+			}
+
+			if (parsed.kind === "status") {
+				const overrides = resolveWorkspaceProfileOverrides(ctx.cwd, moduleEffectiveProjectTrust);
+				const overrideList = overrides.length > 0
+					? overrides.map((o, i) => `  ${i + 1}. ${o}`).join("\n")
+					: "  (无)";
+				ctx.ui.notify(`${cachedWorkspaceProfile ?? "(工作区指纹未加载)"}\n\n覆写条目:\n${overrideList}`, "info");
+				return;
+			}
+
+			if (parsed.kind === "clear") {
+				saveWorkspaceProfileOverrides(ctx.cwd, []);
+				rebuildProfile();
+				ctx.ui.notify("已清空全部工作区指纹覆写，回退纯探针指纹。", "info");
+				return;
+			}
+
+			// kind === "set"
+			const current = loadWorkspaceProfileOverrides(ctx.cwd);
+			saveWorkspaceProfileOverrides(ctx.cwd, [...current, parsed.text]);
+			rebuildProfile();
+			if (!moduleEffectiveProjectTrust) {
+				ctx.ui.notify(
+					`已保存覆写条目: ${parsed.text}\n⚠️ 当前工作区不受信任，覆写已持久化但不会注入分类器（信任闸生效）。`,
+					"warning",
+				);
+				return;
+			}
+			ctx.ui.notify(`已保存并注入覆写条目: ${parsed.text}`, "info");
+		},
+	});
 
 	// 配置分类器模型：/classifier-model
 	pi.registerCommand("classifier-model", {
@@ -3473,10 +3620,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 				// 降级态的弹窗不是分类器结论——明示降级状态与自愈方式，
 				// 避免把启发式规则的判断误认为分类器研判（含上游 filter 场景）。
 				if (decision.stage === "fallback") {
-					classifierDialog.push({
-						label: "⚠️ 分类器无判决（降级为规则研判）",
-						content: "分类器本次未能给出判决，已按启发式规则研判；人工批准一次即恢复分类器判定（连续无判决将自动熔断）。",
-					});
+					classifierDialog.push(buildClassifierFallbackItem(decision));
 				}
 				classifierDialog.push({ label: "读取目标", content: label, primary: true });
 				classifierDialog.push({ label: "分类器研判风险", content: decision.reason });
@@ -3693,10 +3837,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 					dialogDetails.push({ label: "拦截原因", content: decision.reason });
 					// 降级态标注（与 read/bash 分支同款——非分类器结论）
 					if (decision.stage === "fallback") {
-						dialogDetails.push({
-							label: "⚠️ 分类器无判决（降级为规则研判）",
-							content: "分类器本次未能给出判决，已按启发式规则研判；人工批准一次即恢复分类器判定（连续无判决将自动熔断）。",
-						});
+						dialogDetails.push(buildClassifierFallbackItem(decision));
 					}
 					if ((decision as any).diagnosticHint) {
 						dialogDetails.push({ label: "🔧 排障建议", content: (decision as any).diagnosticHint });
@@ -3802,10 +3943,7 @@ export default function approvalModeExtension(pi: ExtensionAPI): void {
 				dialogDetails.push({ label: "拦截原因", content: decision.reason });
 				// 降级态标注（与 read 分支同款——非分类器结论）
 				if (decision.stage === "fallback") {
-					dialogDetails.push({
-						label: "⚠️ 分类器无判决（降级为规则研判）",
-						content: "分类器本次未能给出判决，已按启发式规则研判；人工批准一次即恢复分类器判定（连续无判决将自动熔断）。",
-					});
+					dialogDetails.push(buildClassifierFallbackItem(decision));
 				}
 				if ((decision as any).diagnosticHint) {
 					dialogDetails.push({ label: "🔧 排障建议", content: (decision as any).diagnosticHint });

@@ -147,8 +147,8 @@ describe("全局与项目级自然语言审批策略分层融合架构", () => {
 			"必须声明项目策略不可弱化硬拦截",
 		);
 		assert.ok(
-			prompt.includes("- Conflict Resolution: If a project policy conflicts with or appears more permissive than a global user preference or system rule, the stricter restriction MUST prevail (err on the side of blocking)."),
-			"必须声明冲突时严格优先仲裁原则",
+			prompt.includes("- Conflict Resolution: If a project policy conflicts with or appears more permissive than a global user preference or system rule, the stricter restriction MUST prevail (when in conflict, deny)."),
+			"必须声明冲突时严格优先仲裁原则（以 DENY 原语表达，不再用 blocking 决策动词）",
 		);
 	});
 

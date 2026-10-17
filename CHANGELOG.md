@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-10-18
+
+### ✨ Features & UX Improvements
+- **Workspace Environment Profile**: tool-call reviews now include a workspace profile (project type, upstream git host, routine local ports) so the classifier judges local lifecycle commands against real environment facts; the profile is advisory context only and never grants authorization. A new `/approval-mode-setup` command inspects, overrides, and clears profile fields with trust gating and strict per-field validation.
+
+### 🐛 Bug Fixes & Security Hardening
+- **Protected-Path Realpath Matching & Sandbox Network Isolation**: symlinked paths resolve to real paths before protected-path matching, closing symlink-traversal bypasses; the read-only sandbox now blocks network side effects in addition to file writes.
+- **Classifier Base Prompt Purification**: the classifier base prompt is rewritten to a neutral allow/deny contract with directional bias phrases removed, and conservative outage blocks no longer claim a heuristic evaluation occurred.
+
+### 📚 Documentation
+- **Classifier Best Practices & User Guides**: the best-practices guide records Stage 1 candidate re-evaluation, threshold-scan and two-stage combo-replay conclusions; user guides (English & Chinese) cover the workspace profile, `/approval-mode-setup`, sandbox network isolation, and symlink realpath semantics.
+
 ## [0.14.0] - 2026-10-15
 
 ### ✨ Features & UX Improvements

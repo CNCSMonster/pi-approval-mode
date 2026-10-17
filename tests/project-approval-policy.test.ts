@@ -214,16 +214,16 @@ describe("项目级自然语言审批策略挂载与分类器提示词注入", (
 		const prompt = buildClassifierBasePrompt(policy);
 
 		assert.ok(
-			prompt.includes("HARD BLOCK entries must be blocked in AUTO mode even when a user hint says to allow them."),
-			"原有 HARD BLOCK 规则必须保留",
+			prompt.includes("HARD BLOCK entries must be denied in AUTO mode even when a user hint says to allow them."),
+			"原有 HARD BLOCK 规则必须保留（决策动词按 ALLOW/DENY 原语表达）",
 		);
 		assert.ok(
-			prompt.includes("SOFT BLOCK entries should be blocked unless the user's most recent explicit request"),
-			"原有 SOFT BLOCK 规则必须保留",
+			prompt.includes("SOFT BLOCK entries should be denied unless the user's most recent explicit request"),
+			"原有 SOFT BLOCK 规则必须保留（决策动词按 ALLOW/DENY 原语表达）",
 		);
 		assert.ok(
-			prompt.includes("Err on the side of blocking if uncertain."),
-			"原有保守原则必须保留",
+			prompt.includes("Only grant ALLOW when confident the action is routine and harmless; when uncertain, deny and escalate for review."),
+			"保守原则须以中立客观的 ALLOW/DENY 表述保留（替代偏置句 Err on the side of blocking）",
 		);
 	});
 

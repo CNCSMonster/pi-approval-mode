@@ -159,7 +159,9 @@ export function getMetadataPriority(label: string): number {
 	// 否则短载荷 + 长转述时，命令/参数会被挤出首屏两行 meta 预览（事实失明）。
 	if (label.includes("死循环") || label.includes("致命") || label.includes("高危")) return 0;
 	if (label.includes("拦截原因")) return 1;
-	if (label.includes("降级") || label.includes("熔断")) return 2;
+	// 降级标注的措辞变体（保守拦截 / 降级为规则研判）同属 P2 降级说明——
+	// 标签措辞演进时不得因关键词漂移被挤出首屏 meta 预览
+	if (label.includes("降级") || label.includes("熔断") || label.includes("分类器无判决")) return 2;
 	if (
 		label.includes("准备执行命令") ||
 		label.includes("调用参数") ||

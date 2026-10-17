@@ -29,7 +29,7 @@
  *    以及 Session 规则做并集 (Union) 合并，Deny 规则绝对优先。
  */
 
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, normalize, relative } from "node:path";
 import { logClassifierError } from "./logger.ts";
@@ -323,9 +323,84 @@ function matchesSingleCommandPattern(subCmd: string, rawPat: string): boolean {
 }
 
 /**
- * 匹配路径通配符 (支持 //, ~/, /, ./ 作用域前缀及 Glob)
+ * 安全解析真实物理路径，若路径不存在或解析失败则返回 null
  */
-export function matchesPathPattern(targetPath: string, pattern: string, cwd: string): boolean {
+function realpathOrNull(p: string): string | null {
+	try {
+		return normalize(realpathSync(p)).replace(/\\/g, "/");
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * 安全解析真实物理路径；若文件不存在则向上递归解析其已存在的最近祖先目录真实路径以支持深层新建文件。
+ * 若目标本身或中间路径存在断开的死链（broken symlink）或完全无法解析则返回 null。
+ */
+function resolvePathRealpath(absTarget: string): { realAbs: string | null; isBrokenSymlink: boolean } {
+	// 1. 若目标本身已存在，直接做 realpath 解析
+	try {
+		const real = normalize(realpathSync(absTarget)).replace(/\\/g, "/");
+		return { realAbs: real, isBrokenSymlink: false };
+	} catch (err: any) {
+		if (err?.code !== "ENOENT") {
+			return { realAbs: null, isBrokenSymlink: true };
+		}
+	}
+
+	// 2. 目标报 ENOENT，检查目标本身是否为断开的符号链接（死链）
+	try {
+		const st = lstatSync(absTarget);
+		if (st.isSymbolicLink()) {
+			return { realAbs: null, isBrokenSymlink: true };
+		}
+	} catch {
+		// lstat 也报 ENOENT 说明路径实体尚不存在
+	}
+
+	// 3. 目标尚待创建：向上逐级寻找第一个物理存在的祖先目录，并解析其 realpath
+	let current = absTarget;
+	const parts: string[] = [];
+	while (true) {
+		const parent = dirname(current);
+		if (parent === current) {
+			break;
+		}
+		const name = current.split("/").pop() || "";
+		parts.unshift(name);
+		try {
+			const realParent = normalize(realpathSync(parent)).replace(/\\/g, "/");
+			const realAbs = `${realParent}/${parts.join("/")}`;
+			return { realAbs, isBrokenSymlink: false };
+		} catch (err: any) {
+			if (err?.code !== "ENOENT") {
+				return { realAbs: null, isBrokenSymlink: true };
+			}
+			try {
+				const st = lstatSync(parent);
+				if (st.isSymbolicLink()) {
+					return { realAbs: null, isBrokenSymlink: true };
+				}
+			} catch {
+				// 继续向上寻找
+			}
+			current = parent;
+		}
+	}
+
+	return { realAbs: null, isBrokenSymlink: false };
+}
+
+/**
+ * 匹配路径通配符 (支持 //, ~/, /, ./ 作用域前缀及 Glob)
+ * @param options.forAllow 当进行 Allow 规则校验时启用保守 realpath 防御
+ */
+export function matchesPathPattern(
+	targetPath: string,
+	pattern: string,
+	cwd: string,
+	options?: { forAllow?: boolean },
+): boolean {
 	const normTarget = normalize(targetPath).replace(/\\/g, "/");
 	const normPattern = pattern.trim().replace(/\\/g, "/");
 	const home = homedir().replace(/\\/g, "/");
@@ -340,9 +415,27 @@ export function matchesPathPattern(targetPath: string, pattern: string, cwd: str
 		absTarget = normalize(join(cwd, expandedTarget)).replace(/\\/g, "/");
 	}
 
+	// 针对路径做真实物理路径解析 (与 getToolDefaultPermission 同口径)
+	// 防符号链接从工作区内逃逸到工作区外敏感目录，同时支持新文件创建与断链阻断
+	const { realAbs, isBrokenSymlink } = resolvePathRealpath(absTarget);
+	if (options?.forAllow) {
+		// 严密防御：断链或完全无法确定物理归属时，保守降级，绝不词法放行！
+		if (isBrokenSymlink || realAbs === null) {
+			return false;
+		}
+		// 若真实路径存在，以真实物理路径作为匹配绝对路径
+		absTarget = realAbs;
+	} else if (realAbs !== null) {
+		// 非 allow 规则 (如 deny/ask)，如果真实路径存在，优先用真实路径检测
+		absTarget = realAbs;
+	}
+
 	// 目标文件相对于工作区根目录的相对路径 (如 src/index.ts)
 	let relTarget = relative(projectRoot, absTarget).replace(/\\/g, "/");
 	if (relTarget.startsWith("./")) relTarget = relTarget.slice(2);
+
+	// 如果逃逸出工作区根目录，对于要求在工作区内的相对路径匹配，不得放行
+	const isEscaped = relTarget.startsWith("..") || isAbsolute(relTarget);
 
 	// 2. 解析 pattern 作用域并比对
 	// 作用域 A: //... (文件系统绝对根，如 //etc/**)
@@ -361,6 +454,8 @@ export function matchesPathPattern(targetPath: string, pattern: string, cwd: str
 
 	// 作用域 C: /... (相对于项目工作区根目录，如 /src/**, /package.json)
 	if (normPattern.startsWith("/")) {
+		// 如果真实路径已经逃逸出工作区，绝不匹配工作区内规则
+		if (isEscaped) return false;
 		const patternRel = normPattern.slice(1); // 变为 src/**
 		const reg = globToRegex(patternRel);
 		// 同时测试相对路径与带斜杠相对路径
@@ -372,11 +467,24 @@ export function matchesPathPattern(targetPath: string, pattern: string, cwd: str
 	if (cleanPattern.startsWith("./")) cleanPattern = cleanPattern.slice(2);
 
 	const reg = globToRegex(cleanPattern);
-	// 1) 直接匹配相对工作区路径 (src/index.ts)
-	if (reg.test(relTarget)) return true;
+	// 1) 直接匹配相对工作区路径 (src/index.ts 或 ../outside/secret.txt)
+	if (reg.test(relTarget)) {
+		// 若已逃逸出工作区：如果是 allow 检查且规则不是显式以 ".." 开头的跨目录规则，则绝不放行
+		if (options?.forAllow && isEscaped && !cleanPattern.startsWith("..")) {
+			return false;
+		}
+		return true;
+	}
+
 	// 2) 匹配纯文件名 (例如规则为 ".env*" 时匹配任意目录下的 ".env.local")
 	const fileName = absTarget.split("/").pop() || "";
-	if (reg.test(fileName)) return true;
+	if (reg.test(fileName)) {
+		// 纯文件名通配在 allow 规则下绝不允许放行逃逸到工作区外的文件
+		if (options?.forAllow && isEscaped) {
+			return false;
+		}
+		return true;
+	}
 
 	return false;
 }
@@ -414,7 +522,7 @@ export function matchesParsedRule(
 	if (rule.specifierKind === "path") {
 		const pathStr = (ctx.input.path || ctx.input.file_path || "").trim();
 		if (!pathStr) return false;
-		return matchesPathPattern(pathStr, spec, ctx.cwd);
+		return matchesPathPattern(pathStr, spec, ctx.cwd, { forAllow: mode === "all" });
 	}
 
 	// 3. 通用模式
@@ -1040,19 +1148,6 @@ export function buildReadDslRule(targetPath: string): string {
 	if (raw.startsWith("~/") || raw.startsWith("~\\")) return `Read(${raw})`;
 	if (isAbsolute(raw)) return `Read(//${raw.replace(/^[\\/]+/, "")})`;
 	return `Read(${raw})`;
-}
-
-/**
- * 解析真实路径（跟随符号链接与内核 `..` 语义）；解析失败（路径不存在等）返回 null。
- * 拍板：白名单匹配必须同时防 `../` 穿越与符号链接逃逸——能解析的按真实位置判，
- * 无法解析的路径读取必然失败，回退词法匹配维持既有行为。
- */
-function realpathOrNull(p: string): string | null {
-	try {
-		return normalize(realpathSync(p)).replace(/\\/g, "/");
-	} catch {
-		return null;
-	}
 }
 
 /**

@@ -395,6 +395,15 @@ export function stripLeadingEnvVars(words: string[]): { envVars: string[]; comma
 /**
  * 校验单一简单命令语句的安全性与只读属性
  */
+// shell 内建命令天然不适用"只读二进制白名单"比对，判词须中性——
+// 否则"未在只读白名单中"会伪装成白名单裁决，诱导用户误归因（如误以为 cd 的目标路径触发了拦截）
+const SHELL_BUILTIN_COMMANDS = new Set([
+	"cd", "export", "alias", "unalias", "source", ".", ":", "set", "unset", "eval", "read", "ulimit", "umask",
+	"times", "trap", "wait", "jobs", "fg", "bg", "history", "let", "local", "return", "shift", "type", "hash",
+	"help", "builtin", "caller", "command", "declare", "dirs", "disown", "enable", "mapfile", "popd", "pushd",
+	"readonly", "shopt", "suspend", "getopts", "bind", "compgen", "complete", "compopt",
+]);
+
 function checkSingleCommandSafety(words: string[]): { isReadOnly: boolean; reason?: string; binary: string } {
 	const { commandWords } = stripLeadingEnvVars(words);
 	if (commandWords.length === 0) {
@@ -408,7 +417,9 @@ function checkSingleCommandSafety(words: string[]): { isReadOnly: boolean; reaso
 	if (!SAFE_READ_ONLY_BINARIES.has(binary)) {
 		return {
 			isReadOnly: false,
-			reason: `命令 "${binary}" 未在只读白名单中`,
+			reason: SHELL_BUILTIN_COMMANDS.has(binary)
+				? `shell 内建命令 "${binary}"，不适用只读白名单判定`
+				: `命令 "${binary}" 未在只读白名单中`,
 			binary,
 		};
 	}

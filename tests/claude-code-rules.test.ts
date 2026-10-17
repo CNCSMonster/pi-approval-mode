@@ -6,6 +6,7 @@ import {
 	CLASSIFIER_BASE_PROMPT,
 	SECURITY_POLICY_RULES,
 } from "../extensions/heuristic-guard.ts";
+import { STAGE1_SUFFIX, STAGE2_SUFFIX } from "../extensions/approval-mode.ts";
 
 describe("Claude Code 工业级安全规则吸收验证", () => {
 	it("带租约 force 推送 (--force-with-lease) 应免除高危正则拦截，而裸 force (--force / -f) 必须拦截", () => {
@@ -50,10 +51,14 @@ describe("Claude Code 工业级安全规则吸收验证", () => {
 		assert.equal(isProtectedPath("README.md"), false);
 	});
 
-	it("提示词中必须包含紧凑判词契约 (Reason ≤ 60 字符 / ≤ 15 词) 以及带租约 force 原则", () => {
+	it("阶段后缀声明紧凑判词契约 (Reason ≤ 60 字符 / ≤ 15 词)，基础提示词保留带租约 force 原则", () => {
 		assert.ok(
-			CLASSIFIER_BASE_PROMPT.includes("strictly under 15 words or 60 characters"),
-			"Prompt 必须包含紧凑判词字符数与单词数约束",
+			STAGE1_SUFFIX.includes("strictly under 15 words or 60 characters"),
+			"Stage 1 后缀必须包含紧凑判词字符数与单词数约束（输出 schema 归各阶段后缀声明）",
+		);
+		assert.ok(
+			STAGE2_SUFFIX.includes("strictly under 15 words or 60 characters"),
+			"Stage 2 后缀必须包含紧凑判词字符数与单词数约束（输出 schema 归各阶段后缀声明）",
 		);
 		assert.ok(
 			CLASSIFIER_BASE_PROMPT.includes("git push --force-with-lease"),

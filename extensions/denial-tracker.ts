@@ -355,7 +355,7 @@ export const DENIAL_MESSAGES = {
 		`[Circuit Breaker] Headless session circuit is open (${loopType}: ${streak} consecutive blocked attempts). Every further tool call in this session is now denied without classification — there is no model-side path to continue, and retrying only adds to the denial count. Human intervention is required: re-approve the action in an interactive session, or restart with an explicit allow rule. Do not retry.`,
 
 	singleUnavailable: (reason: string): string =>
-		`Auto mode could not classify this action (${reason}). Falling back to heuristic checks. Consider switching to default mode if manual review is needed.`,
+		`Auto mode could not classify this action (${reason}). This block is conservative and was NOT rule-evaluated. Consider switching to default mode if manual review is needed.`,
 
 	classifierContentFilter: (toolName: string): string =>
 		`Classifier request was rejected by the upstream content filter — this is NOT a verdict on the action. Falling back for human review of ${toolName}; approving once restores classifier verdicts.`,

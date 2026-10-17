@@ -264,6 +264,11 @@ export function evaluateTier1StaticReadonlyGate(command: string): { isSafe: bool
 		return { isSafe: false, reason: "Output redirection (>, >>) attempts to write files" };
 	}
 
+	// 1.5) 下载并执行管道 (例如 curl ... | sh, wget ... | bash) 绝不放行
+	if (/(?:curl|wget)\b.*\|\s*(?:sh|bash|zsh|python|perl|node)/.test(trimmed)) {
+		return { isSafe: false, reason: "Piping download tools to a shell or interpreter is forbidden in read-only mode" };
+	}
+
 	// 2) 按复合操作符切分，逐段静态分析
 	const segments = trimmed
 		.split(/(?:&&|\|\||;|\||\r?\n)/)
@@ -293,8 +298,12 @@ export function evaluateTier1StaticReadonlyGate(command: string): { isSafe: bool
 			continue;
 		}
 
-		// 2.3 curl / wget: 仅放行 GET 类读取，拦截上传与非 GET 方法
+		// 2.3 curl / wget: 仅放行 GET 类读取，拦截上传、非 GET 方法与命令替换外传
 		if (bin === "curl" || bin === "wget") {
+			const hasCommandSub = /\$\([^)]+\)|`[^`]+`/.test(seg);
+			if (hasCommandSub) {
+				return { isSafe: false, reason: `${bin} with command substitution in arguments risks data exfiltration and is forbidden in read-only mode` };
+			}
 			const mutates = args.some(
 				(a) =>
 					a === "-d" || a.startsWith("-d") || a.startsWith("--data") ||
@@ -307,6 +316,25 @@ export function evaluateTier1StaticReadonlyGate(command: string): { isSafe: bool
 				return { isSafe: false, reason: `${bin} with upload/non-GET method is forbidden in read-only mode` };
 			}
 			continue;
+		}
+
+		// 2.3.1 常见网络数据传输与反弹 shell 工具
+		if (["nc", "netcat", "ncat", "socat"].includes(bin)) {
+			return { isSafe: false, reason: `${bin} (network data transfer/relay) is forbidden in read-only mode` };
+		}
+
+		// 2.3.2 解释器内联执行网络请求
+		if (["python", "python3", "python2"].includes(bin)) {
+			const hasInline = args.includes("-c");
+			if (hasInline && args.some((a) => /urllib|requests|http\.client|socket|aiohttp|httpx/.test(a))) {
+				return { isSafe: false, reason: "python inline code contains network operations and is forbidden in read-only mode" };
+			}
+		}
+		if (["node", "nodejs"].includes(bin)) {
+			const hasInline = args.includes("-e") || args.includes("--eval");
+			if (hasInline && args.some((a) => /fetch|http|https|net|dgram|axios/.test(a))) {
+				return { isSafe: false, reason: "node inline code contains network operations and is forbidden in read-only mode" };
+			}
 		}
 
 		// 2.4 原地编辑与归档写入的参数级拦截
@@ -593,7 +621,7 @@ export function wrapReadOnlyBashCommand(
 	// 2. Tier 1: Linux Bubblewrap
 	if (capability.tier === "tier1_bwrap") {
 		const escaped = trimmed.replace(/'/g, "'\\''");
-		const wrapped = `bwrap --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp --tmpfs /run /bin/sh -c '${escaped}'`;
+		const wrapped = `bwrap --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp --tmpfs /run --unshare-net --unshare-ipc /bin/sh -c '${escaped}'`;
 		return {
 			command: wrapped,
 			sandboxed: true,
